@@ -120,7 +120,7 @@ with `--models` or `enabledModels` once you know which models your account actua
 | Agent | For | Tools |
 |-------|-----|-------|
 | `general-purpose` | Anything open-ended: investigate, then act | full |
-| `scout` | Fast recon, returns compressed findings | read, grep, find, ls, bash |
+| `scout` | Fast recon, returns compressed findings | read, grep, find, ls |
 
 Neither pins a model, so both follow the session.
 
@@ -130,10 +130,13 @@ conversation, which is exactly what an isolated context does not have, so the di
 agent should plan for itself. `scout` is kept because being restricted and cheap is the point
 of it, and it pairs with the guideline below.
 
-`scout` has `bash`, so it can reach any search tool on the box. pi's built-in `grep` is
-ripgrep already, so plain text search needs no shell at all; `ast-grep` is worth shelling out
-for when the query is structural. Note that `sg` is not an alias for it on Linux — that name
-belongs to util-linux — so the agent prompt names `ast-grep` explicitly.
+`scout` deliberately has no shell. Its whole value is being cheap and unable to change
+anything, and a `bash` in the list would make the restriction decorative — the guideline below
+steers read-only work to it on exactly that promise. pi's built-in `grep` is ripgrep, so
+ordinary search needs no shell anyway. Structural search with `ast-grep` does, which is one
+more reason it belongs to `general-purpose`: a task that needs it is not a quick recon. That
+prompt names `ast-grep` explicitly, because `sg` on Linux is util-linux's setgid utility and
+calling it does something unrelated instead of failing.
 
 ## Nudging the caller
 

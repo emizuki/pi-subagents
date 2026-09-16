@@ -12,6 +12,11 @@ rather than guessing from names, and when a search comes back empty, try a diffe
 or location before concluding something does not exist. Then carry the work through — make
 the changes, run the tests, and verify the result instead of reporting an intention.
 
+For structural queries — "every call to X", "every class implementing Y" — reach for
+`ast-grep run -p '<pattern>' -l <lang>` rather than a regex. Invoke it as `ast-grep`, never as
+`sg`: on Linux `sg` is util-linux's setgid utility, so calling it does something unrelated
+instead of failing. For ordinary text search the grep tool is already ripgrep.
+
 Report only what you verified, and say plainly what you could not determine or chose not to
 do. Do not claim something passes without having run it.
 
