@@ -312,6 +312,7 @@ interface ModelLike {
 	id: string;
 	reasoning?: boolean;
 	thinkingLevelMap?: Partial<Record<ThinkingLevel, string | null>>;
+	cost?: { input: number };
 }
 
 /**
@@ -578,6 +579,28 @@ function thinkingSchema(choices: ModelLike[]) {
 	});
 }
 
+/**
+ * Without a nudge the model leaves `model` unset, because omitting it is the documented default.
+ * Name the cheapest offered model explicitly so mechanical work has somewhere obvious to go.
+ * Guidelines are appended flat to the prompt with no tool prefix, so each one names the tool.
+ */
+function buildGuidelines(choices: ModelLike[], current: string | undefined): string[] {
+	const priced = choices.filter((m) => (m.cost?.input ?? 0) > 0).sort((a, b) => a.cost!.input - b.cost!.input);
+	const cheapest = priced[0];
+	if (!cheapest || modelKey(cheapest) === current) return [];
+
+	const currentCost = choices.find((m) => modelKey(m) === current)?.cost?.input;
+	const cheaper =
+		currentCost && currentCost > cheapest.cost!.input
+			? ` (about ${Math.round(currentCost / cheapest.cost!.input)}x cheaper per input token)`
+			: "";
+
+	return [
+		`Pass model: "${modelKey(cheapest)}" to the subagent tool for mechanical work such as searching, listing, reading files or summarising${cheaper}.`,
+		"Leave the subagent tool's model unset for work that needs judgement, such as planning, review or writing code; it then inherits the session's model.",
+	];
+}
+
 function makeSubagentParams(choices: ModelLike[], current: string | undefined) {
 	const model = Type.Optional(modelSchema(choices, current));
 	const thinking = Type.Optional(thinkingSchema(choices));
@@ -615,7 +638,9 @@ function makeSubagentParams(choices: ModelLike[], current: string | undefined) {
 
 function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 	const current = ctx.model ? modelKey(ctx.model) : undefined;
-	const SubagentParams = makeSubagentParams(modelChoices(ctx), current);
+	const choices = modelChoices(ctx);
+	const SubagentParams = makeSubagentParams(choices, current);
+	const promptGuidelines = buildGuidelines(choices, current);
 
 	pi.registerTool({
 		name: "subagent",
@@ -626,6 +651,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
 			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
 		].join(" "),
+		promptGuidelines,
 		parameters: SubagentParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {

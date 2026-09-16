@@ -117,6 +117,33 @@ Error: Codex error: The 'gpt-5.4-mini' model is not supported when using Codex w
 Nothing local can predict that, so the provider's error is surfaced as-is. Narrow the enum
 with `--models` or `enabledModels` once you know which models your account actually accepts.
 
+## Sample agents
+
+| Agent | For |
+|-------|-----|
+| `general-purpose` | Open-ended research and multi-step work; read-only tools |
+| `scout` | Fast recon, returns compressed findings |
+| `planner` | Turns a request into an implementation plan |
+| `reviewer` | Reviews a change |
+| `worker` | Executes a known task end to end; full tools |
+
+None of them pin a model, so all of them follow the session.
+
+## Nudging the model to pick
+
+Omitting `model` is the documented default, so the model will almost always inherit unless
+something tells it otherwise. The extension therefore emits `promptGuidelines` naming the
+cheapest model currently on offer:
+
+```
+Pass model: "openai-codex/gpt-5.6-luna" to the subagent tool for mechanical work such as
+searching, listing, reading files or summarising (about 25x cheaper per input token).
+```
+
+The name and the multiplier are computed from the catalogue at registration time, so they
+follow the active provider. Nothing is emitted when the session is already on the cheapest
+model, or when no model carries a price.
+
 ## Agent definitions
 
 Markdown with YAML frontmatter, in `~/.pi/agent/agents/*.md` (user level, always loaded) or
