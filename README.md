@@ -27,6 +27,9 @@ mkdir -p ~/.pi/agent/agents
 cp agents/*.md ~/.pi/agent/agents/
 ```
 
+The samples ship without a `model:` pin, so they inherit whatever the session is on.
+Add a pin only when a specific agent should deviate.
+
 ## Usage
 
 ```
@@ -97,6 +100,18 @@ unsupported pair fails with the list of levels that model does accept, rather th
 clamped silently by pi.
 
 The map differs per provider for the same model id, so validation is keyed on `provider/id`.
+
+### What the enum cannot know
+
+The catalogue lists what a provider publishes, not what your account is entitled to use. A
+model can be offered and still be rejected at run time, for example:
+
+```
+Error: Codex error: The 'gpt-5.4-mini' model is not supported when using Codex with a ChatGPT account.
+```
+
+Nothing local can predict that, so the provider's error is surfaced as-is. Narrow the enum
+with `--models` or `enabledModels` once you know which models your account actually accepts.
 
 ## Agent definitions
 

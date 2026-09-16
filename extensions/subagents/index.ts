@@ -191,6 +191,17 @@ function getResultOutput(result: SingleResult): string {
 	return getFinalOutput(result.messages) || "(no output)";
 }
 
+/**
+ * Why a result failed, for the collapsed views. A spawn failure (unknown agent, bad model id,
+ * unsupported thinking level) only sets `stderr`, so rendering `errorMessage` alone leaves the
+ * user staring at "(no output)" with no idea what went wrong.
+ */
+function getFailureText(result: SingleResult): string | undefined {
+	if (!isFailedResult(result)) return undefined;
+	const text = result.errorMessage || result.stderr?.trim();
+	return text ? text.split("\n").slice(0, 3).join("\n") : undefined;
+}
+
 function truncateParallelOutput(output: string): string {
 	const byteLength = Buffer.byteLength(output, "utf8");
 	if (byteLength <= PER_TASK_OUTPUT_CAP) return output;
@@ -945,8 +956,8 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
 					if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 					container.addChild(new Text(header, 0, 0));
-					if (isError && r.errorMessage)
-						container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0));
+					const failure = getFailureText(r);
+					if (failure) container.addChild(new Text(theme.fg("error", `Error: ${failure}`), 0, 0));
 					container.addChild(new Spacer(1));
 					container.addChild(new Text(theme.fg("muted", "─── Task ───"), 0, 0));
 					container.addChild(new Text(theme.fg("dim", r.task), 0, 0));
@@ -980,7 +991,8 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 
 				let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
 				if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
-				if (isError && r.errorMessage) text += `\n${theme.fg("error", `Error: ${r.errorMessage}`)}`;
+				const failureText = getFailureText(r);
+				if (failureText) text += `\n${theme.fg("error", `Error: ${failureText}`)}`;
 				else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
 				else {
 					text += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT)}`;
@@ -1077,7 +1089,9 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
 					const displayItems = getDisplayItems(r.messages);
 					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
-					if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
+					const stepFailure = getFailureText(r);
+					if (stepFailure) text += `\n${theme.fg("error", `Error: ${stepFailure}`)}`;
+					else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
 					else text += `\n${renderDisplayItems(displayItems, 5)}`;
 				}
 				const usageStr = formatUsageStats(aggregateUsage(details.results));
@@ -1163,7 +1177,9 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 								: theme.fg("success", "✓");
 					const displayItems = getDisplayItems(r.messages);
 					text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}`;
-					if (displayItems.length === 0)
+					const taskFailure = getFailureText(r);
+					if (taskFailure) text += `\n${theme.fg("error", `Error: ${taskFailure}`)}`;
+					else if (displayItems.length === 0)
 						text += `\n${theme.fg("muted", r.exitCode === -1 ? "(running...)" : "(no output)")}`;
 					else text += `\n${renderDisplayItems(displayItems, 5)}`;
 				}
