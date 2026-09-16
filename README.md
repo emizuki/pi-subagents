@@ -147,16 +147,16 @@ searching, listing, reading or summarising. Reserve the full-tool agents for wor
 actually change something.
 
 For that read-only work, also pass a cheaper model to the subagent tool: its model parameter
-lists models cheapest first. The cheapest on offer costs about 25x less per input token than
-the session's model.
+lists models cheapest first.
 ```
 
-No model is named on purpose. A name becomes the only model the caller ever reaches for, and
-a catalogue entry is not proof the account may use it. Instead the `model` enum is ordered
-cheapest first and the guideline says so, which leaves the caller free to fall back when one
-model is refused. The ratio, the ordering and the agent names are all computed at registration
-time, so they follow the active provider and the agents actually on disk. Nothing is emitted
-when the session is already on the cheapest model, or when no model carries a price.
+No model is named, and no price ratio is quoted. Both pin the caller to one model, and a
+catalogue entry is not proof the account may use it. Catalogue prices are list prices in any
+case, which a subscription account may not be paying. Instead the `model` enum is ordered
+cheapest first and the guideline says only that, which leaves the caller free to fall back when
+one model is refused. The ordering and the agent names are computed at registration time, so
+they follow the active provider and the agents actually on disk. Nothing is emitted when the
+session is already on the cheapest model, or when no model carries a price.
 
 ## Depth limit
 

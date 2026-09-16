@@ -613,18 +613,13 @@ function buildGuidelines(choices: ModelLike[], current: string | undefined, agen
 		);
 	}
 
-	// Deliberately nameless: a named model becomes the only one the caller ever reaches for, and
-	// a catalogue entry is not proof the account may use it. Give the ratio, let it pick.
+	// Deliberately nameless, and deliberately without a price ratio: both pin the caller to one
+	// model. Catalogue prices are list prices anyway, which a subscription account may not pay.
 	const priced = choices.filter((m) => (m.cost?.input ?? 0) > 0);
 	const cheapest = priced[0];
 	if (cheapest && modelKey(cheapest) !== current) {
-		const currentCost = choices.find((m) => modelKey(m) === current)?.cost?.input;
-		const ratio =
-			currentCost && currentCost > cheapest.cost!.input
-				? ` The cheapest on offer costs about ${Math.round(currentCost / cheapest.cost!.input)}x less per input token than the session's model.`
-				: "";
 		guidelines.push(
-			`For that read-only work, also pass a cheaper model to the subagent tool: its model parameter lists models cheapest first.${ratio}`,
+			"For that read-only work, also pass a cheaper model to the subagent tool: its model parameter lists models cheapest first.",
 			"Leave the subagent tool's model unset for work that needs judgement, such as planning, review or writing code; it then inherits the session's model.",
 		);
 	}
