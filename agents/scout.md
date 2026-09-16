@@ -14,10 +14,15 @@ Thoroughness (infer from task, default medium):
 - Thorough: Trace all dependencies, check tests/types
 
 Strategy:
-1. grep/find to locate relevant code
-2. Read key sections (not entire files)
-3. Identify types, interfaces, key functions
-4. Note dependencies between files
+1. grep/find to locate relevant code. The grep tool is ripgrep, so there is no reason to
+   shell out for an ordinary text search.
+2. For structural queries — "every call to X", "every class implementing Y" — use `ast-grep`
+   through bash: `ast-grep run -p '<pattern>' -l <lang>`. Invoke it as `ast-grep`, never as
+   `sg`: on Linux `sg` is util-linux's setgid utility and has nothing to do with structural
+   search, so calling it does something unrelated rather than failing.
+3. Read key sections (not entire files)
+4. Identify types, interfaces, key functions
+5. Note dependencies between files
 
 Output format:
 

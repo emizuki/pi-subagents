@@ -39,10 +39,8 @@ only when a specific agent should deviate.
 ```
 Use scout to find all authentication code
 Run 2 scouts in parallel: one for models, one for providers
-Use a chain: scout finds the read tool, then planner suggests improvements
+Use a chain: scout finds the auth code, then general-purpose adds a test for it
 ```
-
-Workflow prompts: `/implement`, `/scout-and-plan`, `/implement-and-review`.
 
 ## Tool modes
 
@@ -69,10 +67,10 @@ session's thinking level — but a per-call `thinking` still overrides everythin
 
 ```markdown
 ---
-name: planner
-description: Creates implementation plans
-tools: read, grep, find, ls
-model: claude-sonnet-5:high
+name: scout
+description: Fast codebase recon
+tools: read, grep, find, ls, bash
+model: gpt-5.6-luna:low
 ---
 ```
 
@@ -119,15 +117,23 @@ with `--models` or `enabledModels` once you know which models your account actua
 
 ## Sample agents
 
-| Agent | For |
-|-------|-----|
-| `general-purpose` | Anything open-ended: investigate, then act; full tools |
-| `scout` | Fast recon, returns compressed findings |
-| `planner` | Turns a request into an implementation plan |
-| `reviewer` | Reviews a change |
-| `worker` | Executes a known task end to end; full tools |
+| Agent | For | Tools |
+|-------|-----|-------|
+| `general-purpose` | Anything open-ended: investigate, then act | full |
+| `scout` | Fast recon, returns compressed findings | read, grep, find, ls, bash |
 
-None of them pin a model, so all of them follow the session.
+Neither pins a model, so both follow the session.
+
+Two agents, not five. A subagent earns its place when the task is self-contained given a
+description — gathering facts, or doing a delimited job. Planning is not: it wants the whole
+conversation, which is exactly what an isolated context does not have, so the dispatching
+agent should plan for itself. `scout` is kept because being restricted and cheap is the point
+of it, and it pairs with the guideline below.
+
+`scout` has `bash`, so it can reach any search tool on the box. pi's built-in `grep` is
+ripgrep already, so plain text search needs no shell at all; `ast-grep` is worth shelling out
+for when the query is structural. Note that `sg` is not an alias for it on Linux — that name
+belongs to util-linux — so the agent prompt names `ast-grep` explicitly.
 
 ## Nudging the model to pick
 

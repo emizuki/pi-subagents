@@ -3,11 +3,14 @@
   "version": "0.1.0",
   "description": "Delegate tasks to subagents with isolated context, choosing the model and thinking level per call.",
   "private": true,
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "license": "MIT",
   "pi": {
-    "extensions": ["./extensions"],
-    "prompts": ["./prompts"]
+    "extensions": [
+      "./extensions"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",
