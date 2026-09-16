@@ -37,9 +37,9 @@ only when a specific agent should deviate.
 ## Usage
 
 ```
-Use scout to find all authentication code
-Run 2 scouts in parallel: one for models, one for providers
-Use a chain: scout finds the auth code, then general-purpose adds a test for it
+Use recon to find all authentication code
+Run 2 recon agents in parallel: one for models, one for providers
+Use a chain: recon finds the auth code, then general-purpose adds a test for it
 ```
 
 ## Tool modes
@@ -67,10 +67,11 @@ session's thinking level — but a per-call `thinking` still overrides everythin
 
 ```markdown
 ---
-name: scout
+name: recon
+aliases: scout
 description: Fast codebase recon
-tools: read, grep, find, ls, bash
-model: gpt-5.6-luna:low
+tools: read, grep, find, ls
+thinking: low
 ---
 ```
 
@@ -120,17 +121,17 @@ with `--models` or `enabledModels` once you know which models your account actua
 | Agent | For | Tools |
 |-------|-----|-------|
 | `general-purpose` | Anything open-ended: investigate, then act | full |
-| `scout` | Fast recon, returns compressed findings | read, grep, find, ls |
+| `recon` | Fast codebase recon, returns compressed findings | read, grep, find, ls |
 
 Neither pins a model, so both follow the session.
 
 Two agents, not five. A subagent earns its place when the task is self-contained given a
 description — gathering facts, or doing a delimited job. Planning is not: it wants the whole
 conversation, which is exactly what an isolated context does not have, so the dispatching
-agent should plan for itself. `scout` is kept because being restricted and cheap is the point
+agent should plan for itself. `recon` is kept because being restricted and cheap is the point
 of it, and it pairs with the guideline below.
 
-`scout` deliberately has no shell. Its whole value is being cheap and unable to change
+`recon` deliberately has no shell. Its whole value is being cheap and unable to change
 anything, and a `bash` in the list would make the restriction decorative — the guideline below
 steers read-only work to it on exactly that promise. pi's built-in `grep` is ripgrep, so
 ordinary search needs no shell anyway. Structural search with `ast-grep` does, which is one
@@ -145,7 +146,7 @@ reach for, so left alone the caller will use the expensive agent on the expensiv
 for a read-only look around. The extension emits `promptGuidelines` covering both choices:
 
 ```
-Call the subagent tool with agent: "scout" whenever the task is read-only investigation —
+Call the subagent tool with agent: "recon" whenever the task is read-only investigation —
 searching, listing, reading or summarising. Reserve the full-tool agents for work that must
 actually change something.
 
@@ -218,10 +219,11 @@ Markdown with YAML frontmatter, in `~/.pi/agent/agents/*.md` (user level, always
 
 ```markdown
 ---
-name: scout
+name: recon
+aliases: scout
 description: Fast codebase recon
-tools: read, grep, find, ls, bash
-model: gpt-5.6-sol
+tools: read, grep, find, ls
+thinking: low
 ---
 
 System prompt for the agent goes here.
