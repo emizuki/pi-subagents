@@ -299,6 +299,7 @@ const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "ma
 interface TaskOverrides {
 	model?: string;
 	thinking?: ThinkingLevel;
+	context?: ForkContext;
 }
 
 /**
@@ -359,37 +360,85 @@ function describeAgent(agent: AgentConfig): string {
 	return agent.aliases.length > 0 ? `${agent.name} (aka ${agent.aliases.join(", ")})` : agent.name;
 }
 
+type ForkContext = "fresh" | "fork";
+
 interface SubagentSettings {
 	defaultThinking?: ThinkingLevel;
 	maxThinking?: ThinkingLevel;
+	defaultContext?: ForkContext;
 }
 
-function readSettingsFile(file: string): Record<string, unknown> | undefined {
-	try {
-		return JSON.parse(fs.readFileSync(file, "utf8"));
-	} catch {
-		return undefined;
-	}
+/**
+ * Copy a session transcript for forking, dropping provider-private reasoning blocks.
+ *
+ * A `thinkingSignature` names a reasoning item belonging to the response chain that produced it —
+ * `rs_…` on OpenAI, a signed blob on Anthropic. Replayed from a branch it refers to something the
+ * new chain never emitted, which providers reject. The child keeps its own thinking level and
+ * reasons from its first turn, so removing the inherited blocks costs nothing.
+ */
+function isReasoningBlock(value: unknown): boolean {
+	const type = (value as { type?: unknown } | null)?.type;
+	return type === "thinking" || type === "redacted_thinking";
 }
 
-/** `subagents` settings, project overriding user, read fresh so edits apply without a restart. */
-function readSubagentSettings(cwd: string): SubagentSettings {
-	const files = [
-		path.join(getAgentDir(), "settings.json"),
-		path.join(cwd, CONFIG_DIR_NAME, "settings.json"),
-	];
-	const merged: SubagentSettings = {};
-	for (const file of files) {
-		const raw = readSettingsFile(file)?.subagents as Record<string, unknown> | undefined;
-		if (!raw) continue;
-		for (const key of ["defaultThinking", "maxThinking"] as const) {
-			const value = raw[key];
-			if (typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value)) {
-				merged[key] = value as ThinkingLevel;
+/**
+ * Strip reasoning in place, anywhere it appears. Blocks do not only sit on `message.content`:
+ * this tool stores each child's transcript under `message.details`, so a session that dispatched
+ * subagents carries nested copies too. Walking the whole entry is the only way to be sure.
+ */
+function stripReasoning(node: unknown): number {
+	let stripped = 0;
+	if (Array.isArray(node)) {
+		for (let i = node.length - 1; i >= 0; i--) {
+			if (isReasoningBlock(node[i])) {
+				node.splice(i, 1);
+				stripped++;
+			} else {
+				stripped += stripReasoning(node[i]);
 			}
 		}
+		return stripped;
 	}
-	return merged;
+	if (node && typeof node === "object") {
+		const record = node as Record<string, unknown>;
+		if ("thinkingSignature" in record) {
+			delete record.thinkingSignature;
+			stripped++;
+		}
+		for (const value of Object.values(record)) stripped += stripReasoning(value);
+	}
+	return stripped;
+}
+
+/**
+ * Copy a session transcript for forking, dropping provider-private reasoning.
+ *
+ * A `thinkingSignature` names a reasoning item belonging to the response chain that produced it —
+ * `rs_…` on OpenAI, a signed blob on Anthropic. Replayed from a branch it refers to something the
+ * new chain never emitted, which providers reject. The child keeps its own thinking level and
+ * reasons from its first turn, so removing the inherited reasoning costs nothing.
+ */
+function sanitizeSessionForFork(sourceFile: string, destFile: string): number {
+	const lines = fs.readFileSync(sourceFile, "utf8").split("\n");
+	let stripped = 0;
+	const out: string[] = [];
+	for (const line of lines) {
+		if (!line.trim()) continue;
+		let entry: unknown;
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			// A half-written trailing line is normal for a session still being appended to.
+			continue;
+		}
+		stripped += stripReasoning(entry);
+		// An assistant turn whose only content was reasoning would replay as an empty message.
+		const content = (entry as { message?: { content?: unknown } })?.message?.content;
+		if (Array.isArray(content) && content.length === 0) continue;
+		out.push(JSON.stringify(entry));
+	}
+	fs.writeFileSync(destFile, `${out.join("\n")}\n`, "utf8");
+	return stripped;
 }
 
 /** Index into THINKING_LEVELS, which is ordered least to most thinking. */
@@ -440,7 +489,7 @@ async function runSingleAgent(
 		};
 	}
 
-	const args: string[] = ["--mode", "json", "-p", "--no-session"];
+	const args: string[] = ["--mode", "json", "-p"];
 	// Precedence: per-call override > agent frontmatter > dispatching session.
 	const explicitSpec = overrides.model ?? agent.model;
 	const explicit = explicitSpec ? splitThinkingSuffix(explicitSpec) : undefined;
@@ -492,8 +541,33 @@ async function runSingleAgent(
 	if (!agent.inheritSkills) args.push("--no-skills");
 	if (!agent.inheritProjectContext) args.push("--no-context-files");
 
+	// An explicit `context: "fork"` is a requirement and fails when it cannot be met. A fork coming
+	// from frontmatter or settings is a preference and quietly runs fresh instead, so a missing
+	// parent session never turns a configured default into a failed dispatch.
+	const requestedContext = overrides.context;
+	const effectiveContext = requestedContext ?? agent.defaultContext ?? settings.defaultContext ?? "fresh";
+	const parentSession = process.env.PI_SESSION_FILE;
+	const canFork = Boolean(parentSession && fs.existsSync(parentSession));
+	if (effectiveContext === "fork" && !canFork && requestedContext === "fork") {
+		return {
+			agent: agentName,
+			agentSource: agent.source,
+			task,
+			exitCode: 1,
+			messages: [],
+			stderr: parentSession
+				? `context: "fork" needs the parent session file, but ${parentSession} is missing.`
+				: 'context: "fork" needs a persisted parent session; this one is ephemeral.',
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			model,
+			step,
+		};
+	}
+	const forking = effectiveContext === "fork" && canFork;
+
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
+	let tmpSessionDir: string | null = null;
 
 	const currentResult: SingleResult = {
 		agent: agentName,
@@ -517,6 +591,17 @@ async function runSingleAgent(
 	};
 
 	try {
+		if (forking && parentSession) {
+			// Fork from a sanitized copy, and keep the branch in a scratch session dir so delegated
+			// runs never show up in the operator's session list.
+			tmpSessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-fork-"));
+			const source = path.join(tmpSessionDir, "parent.jsonl");
+			sanitizeSessionForFork(parentSession, source);
+			args.push("--fork", source, "--session-dir", tmpSessionDir);
+		} else {
+			args.push("--no-session");
+		}
+
 		if (agent.systemPrompt.trim()) {
 			const tmp = await writePromptToTempFile(agent.name, agent.systemPrompt);
 			tmpPromptDir = tmp.dir;
@@ -623,6 +708,12 @@ async function runSingleAgent(
 			} catch {
 				/* ignore */
 			}
+		if (tmpSessionDir)
+			try {
+				fs.rmSync(tmpSessionDir, { recursive: true, force: true });
+			} catch {
+				/* ignore */
+			}
 	}
 }
 
@@ -707,6 +798,12 @@ function buildGuidelines(choices: ModelLike[], current: string | undefined, agen
 function makeSubagentParams(choices: ModelLike[], current: string | undefined) {
 	const model = Type.Optional(modelSchema(choices, current));
 	const thinking = Type.Optional(thinkingSchema(choices));
+	const context = Type.Optional(
+		StringEnum(["fresh", "fork"] as const, {
+			description:
+				'Child context. "fresh" (default) starts from the task alone; "fork" branches this session\'s transcript, which costs its input tokens on every turn.',
+		}),
+	);
 
 	const TaskItem = Type.Object({
 		agent: Type.String({ description: "Name of the agent to invoke" }),
@@ -714,6 +811,7 @@ function makeSubagentParams(choices: ModelLike[], current: string | undefined) {
 		cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 		model,
 		thinking,
+		context,
 	});
 
 	const ChainItem = Type.Object({
@@ -722,6 +820,7 @@ function makeSubagentParams(choices: ModelLike[], current: string | undefined) {
 		cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 		model,
 		thinking,
+		context,
 	});
 
 	return Type.Object({
@@ -736,6 +835,7 @@ function makeSubagentParams(choices: ModelLike[], current: string | undefined) {
 		cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
 		model,
 		thinking,
+		context,
 	});
 }
 
@@ -867,7 +967,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 						step.agent,
 						taskWithContext,
 						step.cwd,
-						{ model: step.model, thinking: step.thinking },
+						{ model: step.model, thinking: step.thinking, context: step.context },
 						i + 1,
 						signal,
 						chainUpdate,
@@ -941,7 +1041,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 						t.agent,
 						t.task,
 						t.cwd,
-						{ model: t.model, thinking: t.thinking },
+						{ model: t.model, thinking: t.thinking, context: t.context },
 						undefined,
 						signal,
 						// Per-task update callback
@@ -985,7 +1085,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					params.agent,
 					params.task,
 					params.cwd,
-					{ model: params.model, thinking: params.thinking },
+					{ model: params.model, thinking: params.thinking, context: params.context },
 					undefined,
 					signal,
 					onUpdate,

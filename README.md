@@ -162,6 +162,32 @@ one model is refused. The ordering and the agent names are computed at registrat
 they follow the active provider and the agents actually on disk. Nothing is emitted when the
 session is already on the cheapest model, or when no model carries a price.
 
+## Context: fresh or fork
+
+A child starts `fresh` by default — it gets the task text and nothing else. Passing
+`context: "fork"` branches the dispatching session's transcript instead, so the child already
+knows what the conversation has established.
+
+Fork is expensive and the default is not an accident. A working session here measured 11.2 MB
+of transcript; forking hands every child a copy of that to pay for on every turn. Reach for it
+when the task is meaningless without the conversation, not to save yourself writing a task
+description.
+
+An explicit `context: "fork"` is a requirement: it fails when the parent session is ephemeral
+or its file is gone. A fork coming from an agent's `defaultContext` or from
+`subagents.defaultContext` is a preference, and runs fresh instead of failing.
+
+The branch is taken from a sanitized copy. Reasoning blocks are stripped first, everywhere they
+appear — a `thinkingSignature` names a reasoning item belonging to the response chain that
+produced it (`rs_…` on OpenAI, a signed blob on Anthropic), and replayed from a branch it points
+at something the new chain never emitted. They are not only on `message.content` either: this
+tool stores each child transcript under `message.details`, so a session that has dispatched
+subagents carries nested copies. On that 11.2 MB session the sweep removed 445 reasoning blocks
+and left every `text` and `toolCall` block untouched.
+
+Forked children write into a scratch session directory, so delegated runs never appear in the
+operator's session list.
+
 ## Depth limit
 
 A subagent inherits this process's environment, so it loads the same packages and would

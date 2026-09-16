@@ -22,6 +22,8 @@ export interface AgentConfig {
 	/** Let the child load AGENTS.md / CLAUDE.md from its cwd. On by default: repository conventions
 	 * are usually exactly what a delegated task needs to respect. */
 	inheritProjectContext: boolean;
+	/** Preference only: when the parent has no persisted session, a fork preference runs fresh. */
+	defaultContext?: "fresh" | "fork";
 	systemPrompt: string;
 	source: "user" | "project";
 	filePath: string;
@@ -49,6 +51,7 @@ type AgentFrontmatter = {
 	thinking?: unknown;
 	inheritSkills?: unknown;
 	inheritProjectContext?: unknown;
+	defaultContext?: unknown;
 };
 
 /**
@@ -113,6 +116,10 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			thinking: typeof frontmatter.thinking === "string" ? frontmatter.thinking : undefined,
 			inheritSkills: frontmatter.inheritSkills === true,
 			inheritProjectContext: frontmatter.inheritProjectContext !== false,
+			defaultContext:
+				frontmatter.defaultContext === "fork" || frontmatter.defaultContext === "fresh"
+					? frontmatter.defaultContext
+					: undefined,
 			systemPrompt: body,
 			source,
 			filePath,
