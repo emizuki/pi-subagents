@@ -285,6 +285,8 @@ interface DispatchDefaults {
 	model?: string;
 	thinkingLevel?: ThinkingLevel;
 	lookupModel?: (key: string) => ModelLike | undefined;
+	/** The parent's session file, or undefined when this session is ephemeral. */
+	parentSessionFile?: string;
 	/** Answers the child's supervisor requests; absent when the parent cannot reach an operator. */
 	supervise?: SupervisorHandler;
 }
@@ -771,7 +773,10 @@ async function runSingleAgent(
 	// parent session never turns a configured default into a failed dispatch.
 	const requestedContext = overrides.context;
 	const effectiveContext = requestedContext ?? agent.defaultContext ?? settings.defaultContext ?? "fresh";
-	const parentSession = process.env.PI_SESSION_FILE;
+	// From the session manager, not the environment: PI_SESSION_FILE is injected into the commands
+	// the bash tool runs, and is not set on pi's own process, so reading it here always found
+	// nothing and made every explicit fork fail as "ephemeral".
+	const parentSession = dispatchDefaults.parentSessionFile;
 	const canFork = Boolean(parentSession && fs.existsSync(parentSession));
 	if (effectiveContext === "fork" && !canFork && requestedContext === "fork") {
 		return {
@@ -1259,6 +1264,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 			const dispatchDefaults: DispatchDefaults = {
 				model: ctx.model ? modelKey(ctx.model) : undefined,
 				thinkingLevel: ctx.thinkingLevel,
+				parentSessionFile: ctx.sessionManager.getSessionFile(),
 				lookupModel: (key) => {
 					const parts = splitModelKey(key);
 					return parts ? ctx.modelRegistry.find(parts.provider, parts.id) : undefined;
@@ -1295,13 +1301,19 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 			}
 
 			if (params.action === "runs") {
-				const runs = [...retainedRuns.values()];
-				if (runs.length === 0) {
-					return { content: [{ type: "text", text: "No retained runs in this session." }] };
-				}
-				const lines = runs.map(
+				// A retained record only appears once the child exits, so an in-flight detached run
+				// would otherwise be invisible here while `status` reports it running — two views of
+				// the same run disagreeing, which reads as "that run does not exist".
+				const lines = [...retainedRuns.values()].map(
 					(r) => `${r.id}  ${r.agent}  ${r.resumable ? "resumable" : "not resumable"}${r.model ? `  ${r.model}` : ""}`,
 				);
+				for (const run of asyncRuns.values()) {
+					if (run.state !== "running" || retainedRuns.has(run.id)) continue;
+					lines.push(`${run.id}  ${run.agent}  still running, not resumable yet`);
+				}
+				if (lines.length === 0) {
+					return { content: [{ type: "text", text: "No runs in this session yet." }] };
+				}
 				return { content: [{ type: "text", text: lines.join("\n") }] };
 			}
 
