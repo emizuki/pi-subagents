@@ -217,6 +217,31 @@ When the parent has no UI, the channel is not offered at all, rather than handin
 question that could only time out. A request that goes unanswered for ten minutes returns an
 instruction to proceed and state the assumption, which is also what an unreachable operator gets.
 
+## Detached runs
+
+`async: true` on a single dispatch starts the child and returns a run id straight away:
+
+```
+{ agent: "general-purpose", task: "...", async: true }
+  -> Started 4f2a9c31 (general-purpose), detached.
+
+{ action: "status" }                      // every run this session
+{ action: "status", id: "4f2a9c31" }      // one run, with its output once finished
+{ action: "stop",   id: "4f2a9c31" }
+```
+
+A detached run gets its own `AbortController` rather than the dispatching tool call's signal,
+which fires the moment that call returns — for a detached run, immediately. `stop` aborts that
+controller, and so does session shutdown: children are separate processes, and without that they
+survive `/new`, `/resume`, `/fork` and exit, still spending tokens against a session nobody is
+watching.
+
+Parallel and chain stay synchronous. They already run concurrently, and the reason to detach is
+to stop waiting, which is not the same problem.
+
+`resume` is not implemented. Reviving a finished child means keeping its session, and children
+run `--no-session` on purpose; retention is a separate decision rather than an oversight.
+
 ## Depth limit
 
 A subagent inherits this process's environment, so it loads the same packages and would

@@ -470,6 +470,49 @@ function thinkingRank(level: ThinkingLevel): number {
 
 type SupervisorHandler = (request: SupervisorRequest) => Promise<string>;
 
+type AsyncRunState = "running" | "complete" | "failed" | "stopped";
+
+interface AsyncRun {
+	id: string;
+	agent: string;
+	task: string;
+	state: AsyncRunState;
+	startedAt: number;
+	finishedAt?: number;
+	controller: AbortController;
+	result?: SingleResult;
+	error?: string;
+}
+
+/**
+ * Detached runs for this session. Module state, which lives as long as the extension does, so a
+ * run started in one tool call is still addressable from the next.
+ */
+const asyncRuns = new Map<string, AsyncRun>();
+
+function describeAsyncRun(run: AsyncRun): string {
+	const seconds = Math.round(((run.finishedAt ?? Date.now()) - run.startedAt) / 1000);
+	const usage = run.result ? formatUsageStats(run.result.usage, run.result.model) : "";
+	const head = `${run.id}  ${run.state}  ${run.agent}  ${seconds}s${usage ? `  ${usage}` : ""}`;
+	const task = run.task.length > 80 ? `${run.task.slice(0, 80)}…` : run.task;
+	if (run.state === "running") return `${head}\n  task: ${task}`;
+	const body = run.error ?? (run.result ? getResultOutput(run.result) : "(no output)");
+	return `${head}\n  task: ${task}\n  ${body.split("\n").join("\n  ")}`;
+}
+
+/** Stop every live run. Children are separate processes and outlive the session otherwise. */
+function abortAllAsyncRuns(): number {
+	let stopped = 0;
+	for (const run of asyncRuns.values()) {
+		if (run.state !== "running") continue;
+		run.controller.abort();
+		run.state = "stopped";
+		run.finishedAt = Date.now();
+		stopped++;
+	}
+	return stopped;
+}
+
 /**
  * Parent-facing half: answer any requests the child has written, once.
  *
@@ -926,6 +969,18 @@ function makeSubagentParams(choices: ModelLike[], current: string | undefined) {
 		model,
 		thinking,
 		context,
+		async: Type.Optional(
+			Type.Boolean({
+				description:
+					"Single mode only: start the run detached and return a run id immediately, instead of waiting for it.",
+			}),
+		),
+		action: Type.Optional(
+			StringEnum(["status", "stop"] as const, {
+				description: 'Inspect detached runs ("status", optionally with id) or end one ("stop", with id).',
+			}),
+		),
+		id: Type.Optional(Type.String({ description: "Run id, for status or stop" })),
 	});
 }
 
@@ -1054,6 +1109,31 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
+
+			if (params.action === "status") {
+				const runs = params.id
+					? [asyncRuns.get(params.id)].filter((r): r is AsyncRun => Boolean(r))
+					: [...asyncRuns.values()];
+				if (runs.length === 0) {
+					const text = params.id ? `No run with id "${params.id}".` : "No detached runs in this session.";
+					return { content: [{ type: "text", text }], isError: Boolean(params.id) };
+				}
+				return { content: [{ type: "text", text: runs.map(describeAsyncRun).join("\n\n") }] };
+			}
+
+			if (params.action === "stop") {
+				const run = params.id ? asyncRuns.get(params.id) : undefined;
+				if (!run) {
+					return { content: [{ type: "text", text: `No run with id "${params.id ?? ""}".` }], isError: true };
+				}
+				if (run.state !== "running") {
+					return { content: [{ type: "text", text: `Run ${run.id} already ${run.state}.` }] };
+				}
+				run.controller.abort();
+				run.state = "stopped";
+				run.finishedAt = Date.now();
+				return { content: [{ type: "text", text: `Stopped ${run.id}.` }] };
+			}
 
 			const hasChain = (params.chain?.length ?? 0) > 0;
 			const hasTasks = (params.tasks?.length ?? 0) > 0;
@@ -1251,6 +1331,59 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 						},
 					],
 					details: makeDetails("parallel")(results),
+				};
+			}
+
+			if (params.agent && params.task && params.async) {
+				const id = randomUUID().slice(0, 8);
+				// Its own controller, never the tool call\'s: that signal fires the moment this call
+				// returns, which for a detached run is immediately.
+				const controller = new AbortController();
+				const run: AsyncRun = {
+					id,
+					agent: params.agent,
+					task: params.task,
+					state: "running",
+					startedAt: Date.now(),
+					controller,
+				};
+				asyncRuns.set(id, run);
+
+				void runSingleAgent(
+					ctx.cwd,
+					dispatchDefaults,
+					agents,
+					params.agent,
+					params.task,
+					params.cwd,
+					{ model: params.model, thinking: params.thinking, context: params.context },
+					undefined,
+					controller.signal,
+					// No live rendering: this tool call is already over by the time output arrives.
+					undefined,
+					makeDetails("single"),
+				)
+					.then((result) => {
+						if (run.state === "stopped") return;
+						run.result = result;
+						run.state = isFailedResult(result) ? "failed" : "complete";
+					})
+					.catch((error: unknown) => {
+						if (run.state === "stopped") return;
+						run.state = "failed";
+						run.error = error instanceof Error ? error.message : String(error);
+					})
+					.finally(() => {
+						run.finishedAt ??= Date.now();
+					});
+
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Started ${id} (${params.agent}), detached. Check it with { action: "status", id: "${id}" }.`,
+						},
+					],
 				};
 			}
 
@@ -1626,4 +1759,13 @@ export default function (pi: ExtensionAPI) {
 	// can change: session start (also fires for /new, /resume and /fork) and model selection.
 	pi.on("session_start", (_event, ctx) => register(ctx));
 	pi.on("model_select", (_event, ctx) => register(ctx));
+
+	// Detached children are separate processes: without this they survive /new, /resume, /fork and
+	// exit, still burning tokens against a session nobody is watching any more.
+	pi.on("session_shutdown", (_event, ctx) => {
+		const stopped = abortAllAsyncRuns();
+		if (stopped > 0 && ctx.hasUI) {
+			ctx.ui.notify(`Stopped ${stopped} detached subagent run${stopped === 1 ? "" : "s"}.`, "info");
+		}
+	});
 }
