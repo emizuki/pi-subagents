@@ -135,20 +135,36 @@ ripgrep already, so plain text search needs no shell at all; `ast-grep` is worth
 for when the query is structural. Note that `sg` is not an alias for it on Linux — that name
 belongs to util-linux — so the agent prompt names `ast-grep` explicitly.
 
-## Nudging the model to pick
+## Nudging the caller
 
-Omitting `model` is the documented default, so the model will almost always inherit unless
-something tells it otherwise. The extension therefore emits `promptGuidelines` naming the
-cheapest model currently on offer:
+Omitting `model` is the documented default, and a full-tool agent is the obvious thing to
+reach for, so left alone the caller will use the expensive agent on the expensive model even
+for a read-only look around. The extension emits `promptGuidelines` covering both choices:
 
 ```
-Pass model: "openai-codex/gpt-5.6-luna" to the subagent tool for mechanical work such as
-searching, listing, reading files or summarising (about 25x cheaper per input token).
+Call the subagent tool with agent: "scout" whenever the task is read-only investigation —
+searching, listing, reading or summarising. Reserve the full-tool agents for work that must
+actually change something.
+
+For that read-only work, also pass a cheaper model to the subagent tool: its model parameter
+lists models cheapest first. The cheapest on offer costs about 25x less per input token than
+the session's model.
 ```
 
-The name and the multiplier are computed from the catalogue at registration time, so they
-follow the active provider. Nothing is emitted when the session is already on the cheapest
-model, or when no model carries a price.
+No model is named on purpose. A name becomes the only model the caller ever reaches for, and
+a catalogue entry is not proof the account may use it. Instead the `model` enum is ordered
+cheapest first and the guideline says so, which leaves the caller free to fall back when one
+model is refused. The ratio, the ordering and the agent names are all computed at registration
+time, so they follow the active provider and the agents actually on disk. Nothing is emitted
+when the session is already on the cheapest model, or when no model carries a price.
+
+## Depth limit
+
+A subagent inherits this process's environment, so it loads the same packages and would
+otherwise be offered the tool again — subagents spawning subagents, multiplying cost with
+nothing in the transcript to explain it. Each spawn sets `PI_SUBAGENT_DEPTH`, and the tool
+is not registered at all once that reaches `MAX_SUBAGENT_DEPTH` (1). One level of delegation
+is useful; a tree of it is a bill.
 
 ## Agent definitions
 

@@ -282,6 +282,18 @@ interface DispatchDefaults {
 	lookupModel?: (key: string) => ModelLike | undefined;
 }
 
+/**
+ * The child inherits this process's environment, so it also loads this extension and can call
+ * the tool again. One level of delegation is useful; a tree of them multiplies cost silently.
+ */
+const DEPTH_ENV_VAR = "PI_SUBAGENT_DEPTH";
+const MAX_SUBAGENT_DEPTH = 1;
+
+function currentDepth(): number {
+	const raw = Number.parseInt(process.env[DEPTH_ENV_VAR] ?? "0", 10);
+	return Number.isFinite(raw) && raw > 0 ? raw : 0;
+}
+
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 interface TaskOverrides {
@@ -444,6 +456,7 @@ async function runSingleAgent(
 				cwd: cwd ?? defaultCwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
+				env: { ...process.env, [DEPTH_ENV_VAR]: String(currentDepth() + 1) },
 			});
 			let buffer = "";
 
@@ -551,11 +564,14 @@ function modelChoices(ctx: ExtensionContext): ModelLike[] {
 	const pool =
 		scoped.length > 0 ? scoped : ctx.modelRegistry.getAvailable().filter((m) => m.provider === ctx.model?.provider);
 	const seen = new Set<string>();
-	return pool.filter((m) => !seen.has(modelKey(m)) && seen.add(modelKey(m)));
+	const unique = pool.filter((m) => !seen.has(modelKey(m)) && seen.add(modelKey(m)));
+	// Cheapest first, unpriced last: the order is the only pricing signal the model gets, and
+	// naming one model in a guideline would pin it to a choice its account may not even allow.
+	return unique.sort((a, b) => (a.cost?.input ?? Number.POSITIVE_INFINITY) - (b.cost?.input ?? Number.POSITIVE_INFINITY));
 }
 
 function modelSchema(choices: ModelLike[], current: string | undefined) {
-	const description = `Model for the subagent. Omit to inherit the dispatching session's model${
+	const description = `Model for the subagent, ordered cheapest first. Omit to inherit the dispatching session's model${
 		current ? ` (${current})` : ""
 	}.`;
 	const keys = choices.map(modelKey);
@@ -584,21 +600,36 @@ function thinkingSchema(choices: ModelLike[]) {
  * Name the cheapest offered model explicitly so mechanical work has somewhere obvious to go.
  * Guidelines are appended flat to the prompt with no tool prefix, so each one names the tool.
  */
-function buildGuidelines(choices: ModelLike[], current: string | undefined): string[] {
-	const priced = choices.filter((m) => (m.cost?.input ?? 0) > 0).sort((a, b) => a.cost!.input - b.cost!.input);
+function buildGuidelines(choices: ModelLike[], current: string | undefined, agents: AgentConfig[]): string[] {
+	const guidelines: string[] = [];
+
+	// Steering the agent choice matters more than the model: a full-tool agent on a read-only
+	// task costs more and can write files the task never asked it to touch.
+	const restricted = agents.filter((a) => a.tools?.length && !a.tools.some((t) => t === "write" || t === "edit"));
+	if (restricted.length > 0 && agents.length > restricted.length) {
+		const names = restricted.map((a) => `"${a.name}"`).join(" or ");
+		guidelines.push(
+			`Call the subagent tool with agent: ${names} whenever the task is read-only investigation — searching, listing, reading or summarising. Reserve the full-tool agents for work that must actually change something.`,
+		);
+	}
+
+	// Deliberately nameless: a named model becomes the only one the caller ever reaches for, and
+	// a catalogue entry is not proof the account may use it. Give the ratio, let it pick.
+	const priced = choices.filter((m) => (m.cost?.input ?? 0) > 0);
 	const cheapest = priced[0];
-	if (!cheapest || modelKey(cheapest) === current) return [];
+	if (cheapest && modelKey(cheapest) !== current) {
+		const currentCost = choices.find((m) => modelKey(m) === current)?.cost?.input;
+		const ratio =
+			currentCost && currentCost > cheapest.cost!.input
+				? ` The cheapest on offer costs about ${Math.round(currentCost / cheapest.cost!.input)}x less per input token than the session's model.`
+				: "";
+		guidelines.push(
+			`For that read-only work, also pass a cheaper model to the subagent tool: its model parameter lists models cheapest first.${ratio}`,
+			"Leave the subagent tool's model unset for work that needs judgement, such as planning, review or writing code; it then inherits the session's model.",
+		);
+	}
 
-	const currentCost = choices.find((m) => modelKey(m) === current)?.cost?.input;
-	const cheaper =
-		currentCost && currentCost > cheapest.cost!.input
-			? ` (about ${Math.round(currentCost / cheapest.cost!.input)}x cheaper per input token)`
-			: "";
-
-	return [
-		`Pass model: "${modelKey(cheapest)}" to the subagent tool for mechanical work such as searching, listing, reading files or summarising${cheaper}.`,
-		"Leave the subagent tool's model unset for work that needs judgement, such as planning, review or writing code; it then inherits the session's model.",
-	];
+	return guidelines;
 }
 
 function makeSubagentParams(choices: ModelLike[], current: string | undefined) {
@@ -637,10 +668,14 @@ function makeSubagentParams(choices: ModelLike[], current: string | undefined) {
 }
 
 function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
+	// Running inside a spawned subagent: do not offer the tool again.
+	if (currentDepth() >= MAX_SUBAGENT_DEPTH) return;
+
 	const current = ctx.model ? modelKey(ctx.model) : undefined;
 	const choices = modelChoices(ctx);
+	const agents = discoverAgents(ctx.cwd, "user").agents;
 	const SubagentParams = makeSubagentParams(choices, current);
-	const promptGuidelines = buildGuidelines(choices, current);
+	const promptGuidelines = buildGuidelines(choices, current, agents);
 
 	pi.registerTool({
 		name: "subagent",
@@ -648,6 +683,9 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+			agents.length > 0
+				? `Available agents: ${agents.map((a) => a.name).join(", ")}.`
+				: `No agents found in ${path.join(getAgentDir(), "agents")}.`,
 			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
 			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
 		].join(" "),
