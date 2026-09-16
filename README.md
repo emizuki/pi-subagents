@@ -24,11 +24,15 @@ Agent definitions are not a pi resource type, so copy the samples yourself:
 
 ```bash
 mkdir -p ~/.pi/agent/agents
-cp agents/*.md ~/.pi/agent/agents/
+for f in agents/*.md; do ln -sf "$PWD/$f" ~/.pi/agent/agents/; done
 ```
 
-The samples ship without a `model:` pin, so they inherit whatever the session is on.
-Add a pin only when a specific agent should deviate.
+Symlink rather than copy: `pi install` references a local package in place, so the extension
+tracks the repo, and linking the agents keeps them in step too. Copies go stale the first time
+you edit an agent here and forget that the installed one is a different file.
+
+The samples ship without a `model:` pin, so they inherit whatever the session is on. Add a pin
+only when a specific agent should deviate.
 
 ## Usage
 
