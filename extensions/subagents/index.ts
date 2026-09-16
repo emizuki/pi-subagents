@@ -185,7 +185,16 @@ function getFinalOutput(messages: Message[]): string {
 	return "";
 }
 
+/** In flight: the live result object is published while the child runs, and carries -1 until close. */
+function isRunningResult(result: SingleResult): boolean {
+	return result.exitCode === -1;
+}
+
 function isFailedResult(result: SingleResult): boolean {
+	// A run still going is not a failed run. It was rendered as one after the live object started
+	// at -1 to stop parallel counting an unfinished task as done: every dispatch then drew ✗ and a
+	// [toolUse] tag while it worked, and flipped to ✓ at the end.
+	if (isRunningResult(result)) return false;
 	return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
 }
 
@@ -1646,7 +1655,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 
 				const emitParallelUpdate = () => {
 					if (onUpdate) {
-						const running = allResults.filter((r) => r.exitCode === -1).length;
+						const running = allResults.filter(isRunningResult).length;
 						const done = allResults.filter((r) => r.exitCode !== -1).length;
 						onUpdate({
 							content: [
@@ -1940,7 +1949,11 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 			if (details.mode === "single" && details.results.length === 1) {
 				const r = details.results[0];
 				const isError = isFailedResult(r);
-				const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+				const icon = isRunningResult(r)
+					? theme.fg("warning", "⏳")
+					: isError
+						? theme.fg("error", "✗")
+						: theme.fg("success", "✓");
 				const displayItems = getDisplayItems(r.messages);
 				const finalOutput = getFinalOutput(r.messages);
 
@@ -2027,7 +2040,11 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					);
 
 					for (const r of details.results) {
-						const rIcon = isFailedResult(r) ? theme.fg("error", "✗") : theme.fg("success", "✓");
+						const rIcon = isRunningResult(r)
+							? theme.fg("warning", "⏳")
+							: isFailedResult(r)
+								? theme.fg("error", "✗")
+								: theme.fg("success", "✓");
 						const displayItems = getDisplayItems(r.messages);
 						const finalOutput = getFinalOutput(r.messages);
 						// A spawn failure has neither tool calls nor output, so without this the
@@ -2083,7 +2100,11 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					theme.fg("toolTitle", theme.bold("chain ")) +
 					theme.fg("accent", `${successCount}/${details.results.length} steps`);
 				for (const r of details.results) {
-					const rIcon = isFailedResult(r) ? theme.fg("error", "✗") : theme.fg("success", "✓");
+					const rIcon = isRunningResult(r)
+						? theme.fg("warning", "⏳")
+						: isFailedResult(r)
+							? theme.fg("error", "✗")
+							: theme.fg("success", "✓");
 					const displayItems = getDisplayItems(r.messages);
 					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
 					const stepFailure = getFailureText(r);
@@ -2098,7 +2119,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 			}
 
 			if (details.mode === "parallel") {
-				const running = details.results.filter((r) => r.exitCode === -1).length;
+				const running = details.results.filter(isRunningResult).length;
 				const successCount = details.results.filter((r) => r.exitCode !== -1 && !isFailedResult(r)).length;
 				const failCount = details.results.filter((r) => r.exitCode !== -1 && isFailedResult(r)).length;
 				const isRunning = running > 0;
@@ -2122,7 +2143,11 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					);
 
 					for (const r of details.results) {
-						const rIcon = isFailedResult(r) ? theme.fg("error", "✗") : theme.fg("success", "✓");
+						const rIcon = isRunningResult(r)
+							? theme.fg("warning", "⏳")
+							: isFailedResult(r)
+								? theme.fg("error", "✗")
+								: theme.fg("success", "✓");
 						const displayItems = getDisplayItems(r.messages);
 						const finalOutput = getFinalOutput(r.messages);
 						// A spawn failure has neither tool calls nor output, so without this the
@@ -2171,7 +2196,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 				let text = `${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`;
 				for (const r of details.results) {
 					const rIcon =
-						r.exitCode === -1
+						isRunningResult(r)
 							? theme.fg("warning", "⏳")
 							: isFailedResult(r)
 								? theme.fg("error", "✗")
@@ -2181,7 +2206,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					const taskFailure = getFailureText(r);
 					if (taskFailure) text += `\n${theme.fg("error", `Error: ${taskFailure}`)}`;
 					else if (displayItems.length === 0)
-						text += `\n${theme.fg("muted", r.exitCode === -1 ? "(running...)" : "(no output)")}`;
+						text += `\n${theme.fg("muted", isRunningResult(r) ? "(running...)" : "(no output)")}`;
 					else text += `\n${renderDisplayItems(displayItems, 5)}`;
 				}
 				if (!isRunning) {
