@@ -1,5 +1,6 @@
 ---
 name: general-purpose
+aliases: general, delegate, worker
 description: Open-ended work in an isolated context - investigate, then act. Full tools. Use when the task is not narrow enough for a specialised agent
 ---
 

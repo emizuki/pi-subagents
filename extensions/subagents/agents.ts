@@ -10,9 +10,18 @@ export type AgentScope = "user" | "project" | "both";
 
 export interface AgentConfig {
 	name: string;
+	/** Extra names this agent answers to, so a caller reaching for a habitual name still lands. */
+	aliases: string[];
 	description: string;
 	tools?: string[];
 	model?: string;
+	thinking?: string;
+	/** Let the child discover skills. Off by default: a child reloading the skill catalogue pays
+	 * for it on every dispatch, and the task it was given is usually narrower than the catalogue. */
+	inheritSkills: boolean;
+	/** Let the child load AGENTS.md / CLAUDE.md from its cwd. On by default: repository conventions
+	 * are usually exactly what a delegated task needs to respect. */
+	inheritProjectContext: boolean;
 	systemPrompt: string;
 	source: "user" | "project";
 	filePath: string;
@@ -33,9 +42,13 @@ export interface AgentDiscoveryResult {
  */
 type AgentFrontmatter = {
 	name?: unknown;
+	aliases?: unknown;
 	description?: unknown;
 	tools?: unknown;
 	model?: unknown;
+	thinking?: unknown;
+	inheritSkills?: unknown;
+	inheritProjectContext?: unknown;
 };
 
 /**
@@ -93,9 +106,13 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 
 		agents.push({
 			name: frontmatter.name,
+			aliases: parseToolList(frontmatter.aliases) ?? [],
 			description: frontmatter.description,
 			tools: parseToolList(frontmatter.tools),
 			model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
+			thinking: typeof frontmatter.thinking === "string" ? frontmatter.thinking : undefined,
+			inheritSkills: frontmatter.inheritSkills === true,
+			inheritProjectContext: frontmatter.inheritProjectContext !== false,
 			systemPrompt: body,
 			source,
 			filePath,

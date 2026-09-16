@@ -342,6 +342,65 @@ function supportedThinking(model: ModelLike): ThinkingLevel[] {
 	});
 }
 
+/**
+ * Resolve an agent by name or alias, case-insensitively. Callers reach for habitual names —
+ * "general", "explorer", "Explore" — and an exact-match-only lookup turns that into a failed
+ * dispatch instead of the agent the caller obviously meant.
+ */
+function findAgent(agents: AgentConfig[], wanted: string): AgentConfig | undefined {
+	const needle = wanted.trim().toLowerCase();
+	return (
+		agents.find((a) => a.name.toLowerCase() === needle) ??
+		agents.find((a) => a.aliases.some((alias) => alias.toLowerCase() === needle))
+	);
+}
+
+function describeAgent(agent: AgentConfig): string {
+	return agent.aliases.length > 0 ? `${agent.name} (aka ${agent.aliases.join(", ")})` : agent.name;
+}
+
+interface SubagentSettings {
+	defaultThinking?: ThinkingLevel;
+	maxThinking?: ThinkingLevel;
+}
+
+function readSettingsFile(file: string): Record<string, unknown> | undefined {
+	try {
+		return JSON.parse(fs.readFileSync(file, "utf8"));
+	} catch {
+		return undefined;
+	}
+}
+
+/** `subagents` settings, project overriding user, read fresh so edits apply without a restart. */
+function readSubagentSettings(cwd: string): SubagentSettings {
+	const files = [
+		path.join(getAgentDir(), "settings.json"),
+		path.join(cwd, CONFIG_DIR_NAME, "settings.json"),
+	];
+	const merged: SubagentSettings = {};
+	for (const file of files) {
+		const raw = readSettingsFile(file)?.subagents as Record<string, unknown> | undefined;
+		if (!raw) continue;
+		for (const key of ["defaultThinking", "maxThinking"] as const) {
+			const value = raw[key];
+			if (typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value)) {
+				merged[key] = value as ThinkingLevel;
+			}
+		}
+	}
+	return merged;
+}
+
+/** Index into THINKING_LEVELS, which is ordered least to most thinking. */
+function isThinkingLevel(value: unknown): value is ThinkingLevel {
+	return typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value);
+}
+
+function thinkingRank(level: ThinkingLevel): number {
+	return THINKING_LEVELS.indexOf(level);
+}
+
 function modelKey(model: ModelLike): string {
 	return `${model.provider}/${model.id}`;
 }
@@ -365,10 +424,10 @@ async function runSingleAgent(
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 ): Promise<SingleResult> {
-	const agent = agents.find((a) => a.name === agentName);
+	const agent = findAgent(agents, agentName);
 
 	if (!agent) {
-		const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
+		const available = agents.map((a) => `"${describeAgent(a)}"`).join(", ") || "none";
 		return {
 			agent: agentName,
 			agentSource: "unknown",
@@ -386,10 +445,23 @@ async function runSingleAgent(
 	const explicitSpec = overrides.model ?? agent.model;
 	const explicit = explicitSpec ? splitThinkingSuffix(explicitSpec) : undefined;
 	const model = explicit?.model ?? dispatchDefaults.model;
-	// An explicit model does not inherit the session's thinking level, but a per-call `thinking`
-	// still wins over a `:<level>` suffix baked into the model spec.
-	const thinking =
-		overrides.thinking ?? explicit?.thinking ?? (explicit ? undefined : dispatchDefaults.thinkingLevel);
+
+	const settings = readSubagentSettings(cwd ?? defaultCwd);
+	const frontmatterThinking = isThinkingLevel(agent.thinking) ? agent.thinking : undefined;
+	// An explicit model does not inherit the session's thinking level, but a per-call `thinking`,
+	// the agent's own `thinking:`, and a configured default all still apply.
+	let thinking =
+		overrides.thinking ??
+		frontmatterThinking ??
+		explicit?.thinking ??
+		settings.defaultThinking ??
+		(explicit ? undefined : dispatchDefaults.thinkingLevel);
+
+	// A ceiling is a budget control, so clamp rather than fail: the caller asked for work, not for
+	// a particular amount of deliberation, and refusing the whole dispatch helps nobody.
+	if (thinking && settings.maxThinking && thinkingRank(thinking) > thinkingRank(settings.maxThinking)) {
+		thinking = settings.maxThinking;
+	}
 	// pi clamps an unsupported thinking level silently, which is indistinguishable from the model
 	// simply not thinking. Fail loudly instead so the caller can pick a level the model accepts.
 	if (thinking && model) {
@@ -414,6 +486,11 @@ async function runSingleAgent(
 	if (model) args.push("--model", model);
 	if (thinking) args.push("--thinking", thinking);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
+	// A child that rediscovers the whole skill catalogue pays for it on every dispatch, and the
+	// task it was handed is narrower than the catalogue. Repository context is the opposite: a
+	// delegated edit should respect the conventions of the repo it runs in.
+	if (!agent.inheritSkills) args.push("--no-skills");
+	if (!agent.inheritProjectContext) args.push("--no-context-files");
 
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
@@ -679,7 +756,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
 			agents.length > 0
-				? `Available agents: ${agents.map((a) => a.name).join(", ")}.`
+				? `Available agents: ${agents.map(describeAgent).join(", ")}.`
 				: `No agents found in ${path.join(getAgentDir(), "agents")}.`,
 			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
 			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
@@ -740,7 +817,9 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 				if (params.agent) requestedAgentNames.add(params.agent);
 
 				const projectAgentsRequested = Array.from(requestedAgentNames)
-					.map((name) => agents.find((a) => a.name === name))
+					// Must resolve aliases: this list drives the project-agent confirmation, and an
+					// alias that failed to resolve here would run a repo-controlled prompt unprompted.
+					.map((name) => findAgent(agents, name))
 					.filter((a): a is AgentConfig => a?.source === "project");
 
 				if (projectAgentsRequested.length > 0) {

@@ -1,5 +1,6 @@
 ---
 name: scout
+aliases: recon, explorer, Explore, researcher
 description: Fast codebase recon that returns compressed context for handoff to other agents
 tools: read, grep, find, ls
 ---

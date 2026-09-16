@@ -169,6 +169,48 @@ nothing in the transcript to explain it. Each spawn sets `PI_SUBAGENT_DEPTH`, an
 is not registered at all once that reaches `MAX_SUBAGENT_DEPTH` (1). One level of delegation
 is useful; a tree of it is a bill.
 
+## Frontmatter
+
+| Field | Default | Effect |
+|-------|---------|--------|
+| `name` | — | Canonical name |
+| `aliases` | none | Other names this agent answers to, matched case-insensitively |
+| `description` | — | Shown to the dispatching model |
+| `tools` | all | Tool allowlist |
+| `model` | inherit | Model, optionally with a `:<level>` thinking suffix |
+| `thinking` | inherit | Thinking level, independent of the model spec |
+| `inheritSkills` | `false` | Whether the child rediscovers pi's skill catalogue |
+| `inheritProjectContext` | `true` | Whether the child loads `AGENTS.md` / `CLAUDE.md` from its cwd |
+
+`aliases` exists because callers reach for habitual names. Superpowers, for instance, hardcodes
+`Subagent (general-purpose):` in its dispatch templates, and models improvise around it with
+`general`, `explorer` or `Explore`. Answering to those costs one line of YAML; failing the
+dispatch and retrying costs a turn.
+
+`inheritSkills` defaults to off deliberately. A child that rediscovers the skill catalogue pays
+for it on every single dispatch, and the task it was handed is narrower than the catalogue.
+`inheritProjectContext` defaults to on for the opposite reason: a delegated edit should respect
+the conventions of the repository it runs in.
+
+Aliases also resolve in the project-agent confirmation path, so an alias cannot be used to run
+a repo-controlled prompt without the prompt that a canonical name would have triggered.
+
+## Settings
+
+```json
+{
+  "subagents": {
+    "defaultThinking": "low",
+    "maxThinking": "high"
+  }
+}
+```
+
+`defaultThinking` applies to agents that specify no thinking level of their own, independent of
+the parent session's level. `maxThinking` is a ceiling: a request above it is clamped, not
+rejected, because the caller asked for work rather than for a particular amount of deliberation.
+Both are read fresh on each dispatch, project settings overriding user settings.
+
 ## Agent definitions
 
 Markdown with YAML frontmatter, in `~/.pi/agent/agents/*.md` (user level, always loaded) or
