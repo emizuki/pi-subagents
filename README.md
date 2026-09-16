@@ -257,7 +257,13 @@ finished child can be revived instead:
 { resume: "4f2a9c31", task: "The review found X. Fix it." }
 ```
 
-`async: true` works with `resume` as well, detaching the revived child.
+`async: true` works with `resume` as well, detaching the revived child. `model`, `thinking` and
+`context` are rejected on a resume rather than ignored: a revived child keeps the contract it was
+launched with, so silently dropping them would have been worse than refusing.
+
+A run that is still in flight cannot be resumed — two children appending to one transcript
+corrupts it — and a run whose session file has since disappeared reports `not resumable` rather
+than launching against a path that is gone.
 
 `resume` and `agent` are mutually exclusive. A revived child keeps its stored agent, model,
 thinking level and tool allowlist rather than re-deriving them, and its system prompt is not
@@ -359,3 +365,10 @@ confirmation unless `confirmProjectAgents: false` is set.
 - Parallel model-visible output is capped at 50 KB per task.
 - Agents are rediscovered on each invocation, so they can be edited mid-session.
 - Parallel mode is limited to 8 tasks, 4 concurrent.
+
+## Checks
+
+`./check.sh` type-checks for unresolved identifiers. It exists because `bun build` only
+transpiles: it will happily emit a call to a function that does not exist, which is exactly how a
+deleted helper reached main here. The peer dependencies are not installed, so module-resolution
+errors are expected and ignored; only `TS2304`/`TS2551`/`TS2552` fail the run.

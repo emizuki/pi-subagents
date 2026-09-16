@@ -167,7 +167,33 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
 		for (const agent of projectAgents) agentMap.set(agent.name, agent);
 	}
 
-	return { agents: Array.from(agentMap.values()), projectAgentsDir };
+	return { agents: resolveAliasCollisions(Array.from(agentMap.values())), projectAgentsDir };
+}
+
+/**
+ * Drop aliases that cannot resolve to one agent.
+ *
+ * Agents are de-duplicated by name, so two of them may still claim the same alias, and an alias
+ * may shadow another agent's real name. Either way a lookup would silently pick whichever was
+ * discovered first and dispatch the wrong agent. Canonical names always win, and an alias two
+ * agents claim is dropped from both: refusing to guess turns a silent mis-dispatch into an
+ * ordinary "unknown agent" message that names what is available.
+ */
+function resolveAliasCollisions(agents: AgentConfig[]): AgentConfig[] {
+	const names = new Set(agents.map((a) => a.name.toLowerCase()));
+	const claims = new Map<string, number>();
+	for (const agent of agents) {
+		for (const alias of new Set(agent.aliases.map((a) => a.toLowerCase()))) {
+			claims.set(alias, (claims.get(alias) ?? 0) + 1);
+		}
+	}
+	return agents.map((agent) => ({
+		...agent,
+		aliases: agent.aliases.filter((alias) => {
+			const key = alias.toLowerCase();
+			return !names.has(key) && claims.get(key) === 1;
+		}),
+	}));
 }
 
 export function formatAgentList(agents: AgentConfig[], maxItems: number): { text: string; remaining: number } {

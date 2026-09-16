@@ -464,6 +464,34 @@ function sanitizeSessionForFork(sourceFile: string, destFile: string): number {
 }
 
 /** Index into THINKING_LEVELS, which is ordered least to most thinking. */
+function readSettingsFile(file: string): Record<string, unknown> | undefined {
+	try {
+		return JSON.parse(fs.readFileSync(file, "utf8"));
+	} catch {
+		return undefined;
+	}
+}
+
+/** `subagents` settings, project overriding user, read fresh so edits apply without a restart. */
+function readSubagentSettings(cwd: string): SubagentSettings {
+	const files = [path.join(getAgentDir(), "settings.json"), path.join(cwd, CONFIG_DIR_NAME, "settings.json")];
+	const merged: SubagentSettings = {};
+	for (const file of files) {
+		const raw = readSettingsFile(file)?.subagents as Record<string, unknown> | undefined;
+		if (!raw) continue;
+		for (const key of ["defaultThinking", "maxThinking"] as const) {
+			const value = raw[key];
+			if (typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value)) {
+				merged[key] = value as ThinkingLevel;
+			}
+		}
+		if (raw.defaultContext === "fork" || raw.defaultContext === "fresh") {
+			merged.defaultContext = raw.defaultContext;
+		}
+	}
+	return merged;
+}
+
 function isThinkingLevel(value: unknown): value is ThinkingLevel {
 	return typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value);
 }
@@ -512,8 +540,12 @@ function findSessionFile(runDir: string): string | undefined {
 			const full = path.join(dir, entry.name);
 			if (entry.isDirectory()) stack.push(full);
 			else if (entry.name.endsWith(".jsonl")) {
-				const mtime = fs.statSync(full).mtimeMs;
-				if (!newest || mtime > newest.mtime) newest = { file: full, mtime };
+				try {
+					const mtime = fs.statSync(full).mtimeMs;
+					if (!newest || mtime > newest.mtime) newest = { file: full, mtime };
+				} catch {
+					// Vanished between readdir and stat; not a reason to discard a finished run.
+				}
 			}
 		}
 	}
@@ -604,11 +636,21 @@ async function drainSupervisorRequests(dir: string, handle: SupervisorHandler): 
 		} catch {
 			continue;
 		}
-		const answer = await handle(request);
+		let answer: string;
+		try {
+			answer = await handle(request);
+		} catch {
+			// A cancelled prompt is not a reason to stop answering the others.
+			continue;
+		}
 		if (request.reason === "progress_update") continue;
 		const replyPath = path.join(dir, `${request.id}.res.json`);
-		fs.writeFileSync(`${replyPath}.partial`, JSON.stringify({ message: answer }), "utf8");
-		fs.renameSync(`${replyPath}.partial`, replyPath);
+		try {
+			fs.writeFileSync(`${replyPath}.partial`, JSON.stringify({ message: answer }), "utf8");
+			fs.renameSync(`${replyPath}.partial`, replyPath);
+		} catch {
+			// The child timed out and its directory is gone; nothing left to answer.
+		}
 	}
 }
 
@@ -664,9 +706,13 @@ async function runSingleAgent(
 	const frontmatterThinking = isThinkingLevel(agent.thinking) ? agent.thinking : undefined;
 	// An explicit model does not inherit the session's thinking level, but a per-call `thinking`,
 	// the agent's own `thinking:`, and a configured default all still apply.
+	// A `:level` suffix on a per-call model is itself a per-call request, so it outranks the
+	// agent's frontmatter; the same suffix written in frontmatter does not.
+	const callSuffixThinking = overrides.model ? explicit?.thinking : undefined;
+	const requestedThinking = overrides.thinking ?? callSuffixThinking;
 	let thinking = resuming
 		? resuming.thinking
-		: (overrides.thinking ??
+		: (requestedThinking ??
 			frontmatterThinking ??
 			explicit?.thinking ??
 			settings.defaultThinking ??
@@ -683,7 +729,14 @@ async function runSingleAgent(
 		const resolved = dispatchDefaults.lookupModel?.(model);
 		if (resolved) {
 			const allowed = supportedThinking(resolved);
-			if (!allowed.includes(thinking)) {
+			if (!allowed.includes(thinking) && thinking !== requestedThinking) {
+				// Inherited from frontmatter, settings or the session: clamp to the closest level the
+				// model accepts, the same way maxThinking clamps, rather than failing a dispatch over
+				// a value the caller never chose.
+				const below = allowed.filter((level) => thinkingRank(level) <= thinkingRank(thinking as ThinkingLevel));
+				thinking = below.length > 0 ? below[below.length - 1] : allowed[0];
+			}
+			if (thinking && !allowed.includes(thinking)) {
 				return {
 					agent: agentName,
 					agentSource: agent.source,
@@ -780,7 +833,10 @@ async function runSingleAgent(
 			const runDir = path.join(retentionRoot, retain.id);
 			fs.mkdirSync(runDir, { recursive: true });
 			if (forking && parentSession) {
-				const source = path.join(runDir, "parent.jsonl");
+				// Outside runDir: findSessionFile scans runDir for the child's own transcript, and a
+				// child that died before writing one would otherwise have this copy retained as if it
+				// were its session — a file the finally block then deletes.
+				const source = path.join(retentionRoot, `${retain.id}.fork-source.jsonl`);
 				sanitizeSessionForFork(parentSession, source);
 				args.push("--fork", source);
 				// pi reads this once at startup; the branch it writes is what gets retained.
@@ -809,7 +865,9 @@ async function runSingleAgent(
 					...process.env,
 					[DEPTH_ENV_VAR]: String(currentDepth() + 1),
 					PI_SUBAGENT_AGENT: agent.name,
-					...(ipcDir ? { [IPC_ENV_VAR]: ipcDir } : {}),
+					// Explicitly cleared when not supervising: an inherited stale value would point the
+					// child at a directory nobody polls, where it would wait out the full timeout.
+					[IPC_ENV_VAR]: ipcDir ?? "",
 				},
 			});
 			if (ipcDir && dispatchDefaults.supervise) {
@@ -820,9 +878,14 @@ async function runSingleAgent(
 					// A reply can sit on a human for minutes; never start a second sweep over it.
 					if (draining) return;
 					draining = true;
-					void drainSupervisorRequests(dir, handle).finally(() => {
-						draining = false;
-					});
+					void drainSupervisorRequests(dir, handle)
+						.catch(() => {
+							// The scratch directory is removed as soon as the child exits, so a reply
+							// that lands after a timeout fails here. That is expected, not fatal.
+						})
+						.finally(() => {
+							draining = false;
+						});
 				}, SUPERVISOR_POLL_MS);
 			}
 
@@ -881,7 +944,9 @@ async function runSingleAgent(
 				resolve(code ?? 0);
 			});
 
-			proc.on("error", () => {
+			proc.on("error", (error) => {
+				// Without this the caller sees "Agent failed: (no output)" when `pi` is not on PATH.
+				currentResult.stderr += `${currentResult.stderr ? "\n" : ""}Failed to start "${invocation.command}": ${error.message}`;
 				resolve(1);
 			});
 
@@ -889,9 +954,13 @@ async function runSingleAgent(
 				const killProc = () => {
 					wasAborted = true;
 					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
+					// `killed` only means a signal was delivered, not that the process is gone, so it is
+					// always true here and would make the escalation dead code. Exit state is the test.
+					const escalate = setTimeout(() => {
+						if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL");
 					}, SIGKILL_GRACE_MS);
+					escalate.unref?.();
+					proc.once("exit", () => clearTimeout(escalate));
 				};
 				if (signal.aborted) killProc();
 				else signal.addEventListener("abort", killProc, { once: true });
@@ -1300,13 +1369,13 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 						},
 					],
 					details: makeDetails("single")([]),
+					isError: true,
 				};
 			}
 
 			if (
 				(agentScope === "project" || agentScope === "both") &&
 				confirmProjectAgents &&
-				ctx.hasUI &&
 				!ctx.isProjectTrusted()
 			) {
 				const requestedAgentNames = new Set<string>();
@@ -1323,6 +1392,20 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 				if (projectAgentsRequested.length > 0) {
 					const names = projectAgentsRequested.map((a) => a.name).join(", ");
 					const dir = discovery.projectAgentsDir ?? "(unknown)";
+					// A confirmation that cannot be asked has to deny. Previously the whole gate was
+					// conditional on having a UI, so a headless session ran repo-controlled prompts
+					// from an untrusted project with nothing asked and nothing said.
+					if (!ctx.hasUI)
+						return {
+							content: [
+								{
+									type: "text",
+									text: `Refused: ${names} come from ${dir} in a project that is not trusted, and this session cannot ask for confirmation. Trust the project, or pass confirmProjectAgents: false to accept that risk deliberately.`,
+								},
+							],
+							details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+							isError: true,
+						};
 					const ok = await ctx.ui.confirm(
 						"Run project-local agents?",
 						`Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
@@ -1331,6 +1414,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 						return {
 							content: [{ type: "text", text: "Canceled: project-local agents not approved." }],
 							details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+							isError: true,
 						};
 				}
 			}
@@ -1341,7 +1425,9 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 
 				for (let i = 0; i < params.chain.length; i++) {
 					const step = params.chain[i];
-					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+					// A function replacement, so `$&`, `$1` and friends in the previous output are inserted
+					// literally instead of being expanded by String.replace.
+					const taskWithContext = step.task.replace(/\{previous\}/g, () => previousOutput);
 
 					// Create update callback that includes all previous results
 					const chainUpdate: OnUpdateCallback | undefined = onUpdate
@@ -1508,12 +1594,39 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 						isError: true,
 					};
 				}
-				if (!target.resumable || !target.sessionFile) {
+				if (asyncRuns.get(target.id)?.state === "running") {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Run ${target.id} is still running. Two children appending to one session corrupts it; wait for it, or stop it first.`,
+							},
+						],
+						isError: true,
+					};
+				}
+				if (!target.resumable || !target.sessionFile || !fs.existsSync(target.sessionFile)) {
 					return {
 						content: [
 							{
 								type: "text",
 								text: `Run ${target.id} is not resumable: no session was retained for it. Start a fresh ${target.agent} instead, and say that it is a fallback.`,
+							},
+						],
+						isError: true,
+					};
+				}
+				const ignored = [
+					params.model ? "model" : undefined,
+					params.thinking ? "thinking" : undefined,
+					params.context ? "context" : undefined,
+				].filter(Boolean);
+				if (ignored.length > 0) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `A resumed child keeps the contract it was launched with, so ${ignored.join(", ")} cannot be changed here. Drop ${ignored.length === 1 ? "it" : "them"}, or start a new child instead of resuming.`,
 							},
 						],
 						isError: true,
@@ -1570,7 +1683,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					content: [
 						{
 							type: "text",
-							text: `Started ${id} (${params.agent}), detached. Check it with { action: "status", id: "${id}" }.`,
+							text: `Started ${id} (${run.agent}), detached. Check it with { action: "status", id: "${id}" }.`,
 						},
 					],
 				};
@@ -1615,6 +1728,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 			const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 			return {
 				content: [{ type: "text", text: `Invalid parameters. Available agents: ${available}` }],
+				isError: true,
 				details: makeDetails("single")([]),
 			};
 		},
@@ -1965,7 +2079,12 @@ export default function (pi: ExtensionAPI) {
 		}
 		// A killed child has up to SIGKILL_GRACE_MS left and is still writing its session into the
 		// retention root. Deleting it out from under a dying process only manufactures errors.
+		// A killed child keeps writing into the retention root for up to SIGKILL_GRACE_MS, so
+		// deleting it immediately manufactures errors in a dying process. But an unref'd timer does
+		// not survive process exit, which leaked the root whenever anything was aborted, so clear
+		// synchronously too: the delayed sweep is best-effort tidying, not the guarantee.
 		if (stopped > 0) setTimeout(clearRetainedRuns, SIGKILL_GRACE_MS + 1_000).unref?.();
-		else clearRetainedRuns();
+		clearRetainedRuns();
+		asyncRuns.clear();
 	});
 }
