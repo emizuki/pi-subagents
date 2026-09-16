@@ -1255,6 +1255,32 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 			const hasSingle = Boolean((params.agent || params.resume) && params.task);
 			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
 
+			// These have to be rejected before the chain and parallel branches run, or those branches
+			// answer first and the flag is silently dropped.
+			if (params.async && (hasChain || hasTasks)) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `async only applies to a single dispatch; ${hasChain ? "chain" : "parallel"} runs to completion in this call. To detach this work, start each task with its own async single dispatch and collect them with { action: "status" }.`,
+						},
+					],
+					isError: true,
+				};
+			}
+
+			if (params.resume && (hasChain || hasTasks)) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `resume reviews one retained child, so it cannot be combined with ${hasChain ? "chain" : "parallel"}. Resume the run on its own, then continue.`,
+						},
+					],
+					isError: true,
+				};
+			}
+
 			const makeDetails =
 				(mode: "single" | "parallel" | "chain") =>
 				(results: SingleResult[]): SubagentDetails => ({

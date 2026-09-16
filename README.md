@@ -236,8 +236,14 @@ controller, and so does session shutdown: children are separate processes, and w
 survive `/new`, `/resume`, `/fork` and exit, still spending tokens against a session nobody is
 watching.
 
-Parallel and chain stay synchronous. They already run concurrently, and the reason to detach is
-to stop waiting, which is not the same problem.
+Parallel and chain stay synchronous, and passing `async` with either is rejected rather than
+ignored. Both keep something detaching would cost: chain exists so that `{previous}` reaches the
+next step inside one call, and parallel streams `2/3 done, 1 running` as the work lands, which a
+detached run cannot do because the tool call is already over. To detach that work, start each
+task as its own async single dispatch and collect them with `{ action: "status" }`.
+
+What that costs is real: a slow fan-out blocks the turn, there is no per-run timeout inside one,
+and a wedged child wedges the whole call until it is aborted.
 
 ## Resuming a child
 
