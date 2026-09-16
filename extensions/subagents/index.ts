@@ -554,6 +554,36 @@ function findSessionFile(runDir: string): string | undefined {
 	return newest?.file;
 }
 
+const STALE_TEMP_AGE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Remove scratch directories left by earlier runs.
+ *
+ * Every temp directory here is cleaned in a `finally`, which does not run when the process is
+ * killed outright — an aborted session, a crash, a machine going down mid-dispatch. Each orphan
+ * is small, but they accumulate in /tmp forever. Only sweep what is old enough that it cannot
+ * belong to a session still running.
+ */
+function sweepStaleTempDirs(): void {
+	const cutoff = Date.now() - STALE_TEMP_AGE_MS;
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(os.tmpdir(), { withFileTypes: true });
+	} catch {
+		return;
+	}
+	for (const entry of entries) {
+		if (!entry.isDirectory() || !entry.name.startsWith("pi-subagent-")) continue;
+		const full = path.join(os.tmpdir(), entry.name);
+		try {
+			if (fs.statSync(full).mtimeMs > cutoff) continue;
+			fs.rmSync(full, { recursive: true, force: true });
+		} catch {
+			// Another session's directory, or one being removed right now; leave it alone.
+		}
+	}
+}
+
 function newRunId(): string {
 	return randomUUID().slice(0, 8);
 }
@@ -2079,7 +2109,10 @@ export default function (pi: ExtensionAPI) {
 	};
 	// The model enum is baked into the tool schema, so rebuild it whenever the catalogue behind it
 	// can change: session start (also fires for /new, /resume and /fork) and model selection.
-	pi.on("session_start", (_event, ctx) => register(ctx));
+	pi.on("session_start", (_event, ctx) => {
+		sweepStaleTempDirs();
+		register(ctx);
+	});
 	pi.on("model_select", (_event, ctx) => register(ctx));
 
 	// Detached children are separate processes: without this they survive /new, /resume, /fork and
