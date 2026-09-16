@@ -76,12 +76,14 @@ type AgentFrontmatter = {
  * bad file must not take down every other agent in the same directory.
  */
 function parseToolList(value: unknown): string[] | undefined {
+	// Omitted means "use pi's defaults". An explicitly empty or malformed allowlist must remain
+	// empty, otherwise a typo such as `tools: {}` silently grants bash/edit/write.
+	if (value === undefined || value === null) return undefined;
 	const raw = Array.isArray(value) ? value : typeof value === "string" ? value.split(",") : [];
-	const tools = raw
+	return raw
 		.filter((t): t is string => typeof t === "string")
 		.map((t) => t.trim())
 		.filter(Boolean);
-	return tools.length > 0 ? tools : undefined;
 }
 
 function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig[] {
@@ -110,7 +112,14 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			continue;
 		}
 
-		const { frontmatter, body } = parseFrontmatter<AgentFrontmatter>(content);
+		let parsed: ReturnType<typeof parseFrontmatter<AgentFrontmatter>>;
+		try {
+			parsed = parseFrontmatter<AgentFrontmatter>(content);
+		} catch {
+			// A single malformed YAML document must not hide every valid agent in the directory.
+			continue;
+		}
+		const { frontmatter, body } = parsed;
 
 		if (typeof frontmatter.name !== "string" || typeof frontmatter.description !== "string") {
 			continue;

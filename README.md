@@ -61,8 +61,10 @@ Precedence, highest first:
 2. the agent's frontmatter `model:`
 3. the dispatching session's model
 
-The same order applies to `thinking`. An agent that pins a model does **not** inherit the
-session's thinking level — but a per-call `thinking` still overrides everything.
+Thinking precedence is: per-call `thinking`, a suffix on the per-call model, agent
+`thinking:`, a suffix on the agent model, the selected scoped model's pinned thinking level,
+`defaultThinking`, then the dispatching session's level. An agent that pins a model does **not**
+inherit the session's thinking level, but a scoped model pin still follows that model.
 
 `--model` accepts an optional `:<level>` suffix, so frontmatter can pin both at once:
 
@@ -83,7 +85,9 @@ contain a colon (`llama3:8b`) are left alone.
 
 The `model` enum is built at registration time from `ctx.scopedModels` when session scoping
 is configured (`--models`, or `enabledModels` in settings), and otherwise from the current
-provider's catalogue. Scoping is the intended way to keep expensive models out of reach:
+provider's catalogue. A non-empty scope is also enforced at execution time, so an agent's
+frontmatter cannot bypass it by pinning a model that the enum does not offer. Scoping is the
+intended way to keep expensive models out of reach:
 
 ```bash
 pi --models "gpt-5.6-*"
@@ -269,9 +273,12 @@ A run that is still in flight cannot be resumed — two children appending to on
 corrupts it — and a run whose session file has since disappeared reports `not resumable` rather
 than launching against a path that is gone.
 
-`resume` and `agent` are mutually exclusive. A revived child keeps its stored agent, model,
-thinking level and tool allowlist rather than re-deriving them, and its system prompt is not
-appended again — the session already carries it.
+`resume` and `agent` are mutually exclusive. A revived child keeps its stored agent source,
+model, thinking level, tool allowlist, cwd, skill-inheritance and project-context settings rather
+than re-deriving them. This still works if the original agent definition is edited or removed.
+Its retained system prompt is supplied again on every resumed process because pi session JSON
+stores the transcript but not `--append-system-prompt`. A retained project agent remains subject
+to the project-agent trust confirmation even if resumed with the default user scope.
 
 Every dispatch reports its run id — a single run appends `(run 4f2a9c31)`, parallel tags each
 task heading, and a chain lists `step N: run …` at the end — because three parallel tasks running
@@ -301,7 +308,7 @@ is useful; a tree of it is a bill.
 | `name` | — | Canonical name |
 | `aliases` | none | Other names this agent answers to, matched case-insensitively |
 | `description` | — | Shown to the dispatching model |
-| `tools` | all | Tool allowlist |
+| `tools` | all | Tool allowlist. An explicit `[]` grants only the automatically added `contact_supervisor` channel, never pi's default tool set |
 | `model` | inherit | Model, optionally with a `:<level>` thinking suffix |
 | `thinking` | inherit | Thinking level, independent of the model spec |
 | `inheritSkills` | `false` | Whether the child rediscovers pi's skill catalogue |
@@ -337,9 +344,12 @@ a repo-controlled prompt without the prompt that a canonical name would have tri
 `defaultThinking` applies to agents that specify no thinking level of their own, independent of
 the parent session's level. `maxThinking` is a ceiling: a request above it is clamped, not
 rejected, because the caller asked for work rather than for a particular amount of deliberation.
-Both are read fresh on each dispatch, project settings overriding user settings. The project
-file is found by walking up from the working directory, the same way project agents are, so
-running pi from a subdirectory still picks up the repository's settings.
+Both are read fresh on each dispatch. User settings always apply. Project settings override
+them only after pi has marked the parent project trusted, and only for child working directories
+inside that trusted project's canonical root. This prevents an untrusted `.pi/settings.json` —
+or an unrelated per-task `cwd` — from silently forcing context forking or changing budgets.
+Within a trusted project the file is found by walking upward, so running pi from a subdirectory
+still picks up the repository's settings.
 
 ## Agent definitions
 
@@ -358,7 +368,9 @@ thinking: low
 System prompt for the agent goes here.
 ```
 
-Omit `model` to inherit the dispatching session's model and thinking level.
+Omit `model` to inherit the dispatching session's model and thinking level. A malformed YAML
+frontmatter document is skipped without preventing other valid agents in the directory from
+being discovered.
 
 ## Security
 
@@ -366,18 +378,18 @@ Each call runs a separate `pi` subprocess with a delegated system prompt and too
 configuration. Project-local agents are repo-controlled prompts that can instruct the model
 to read files and run commands, so only user-level agents load by default. Pass
 `agentScope: "both"` for repositories you trust; untrusted projects additionally prompt for
-confirmation unless `confirmProjectAgents: false` is set.
+confirmation unless `confirmProjectAgents: false` is set. Project `.pi/settings.json` is also
+repo-controlled and is ignored until pi reports the project trusted.
 
 ## Limitations
 
 - Collapsed view shows the last 10 items in single mode, 5 per step or task in chain and parallel; Ctrl+O expands.
-- Parallel model-visible output is capped at 50 KB per task.
+- Every final tool result is capped globally at pi's 50 KB / 2,000-line limits, including the aggregate from parallel tasks. Full text remains in tool `details`, and truncation notices preserve resumable run ids.
 - Agents are rediscovered on each invocation, so they can be edited mid-session.
 - Parallel mode is limited to 8 tasks, 4 concurrent.
 
 ## Checks
 
-`./check.sh` type-checks for unresolved identifiers. It exists because `bun build` only
-transpiles: it will happily emit a call to a function that does not exist, which is exactly how a
-deleted helper reached main here. The peer dependencies are not installed, so module-resolution
-errors are expected and ignored; only `TS2304`/`TS2551`/`TS2552` fail the run.
+Install dependencies with `npm install`, then run `./check.sh` (or `npm run check`). The check
+runs strict TypeScript validation against pinned development copies of pi's peer dependencies,
+then executes the Node integration/regression suite.

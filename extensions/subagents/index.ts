@@ -22,10 +22,14 @@ import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
 	CONFIG_DIR_NAME,
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
 	type ExtensionAPI,
 	type ExtensionContext,
+	formatSize,
 	getAgentDir,
 	getMarkdownTheme,
+	truncateHead,
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
@@ -37,7 +41,7 @@ const MAX_CONCURRENCY = 4;
 /** How long a child gets to exit on SIGTERM before SIGKILL. */
 const SIGKILL_GRACE_MS = 5_000;
 const COLLAPSED_ITEM_COUNT = 10;
-const PER_TASK_OUTPUT_CAP = 50 * 1024;
+const OUTPUT_NOTICE_RESERVE_BYTES = 1024;
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -173,14 +177,144 @@ interface SubagentDetails {
 	results: SingleResult[];
 }
 
+const TOOL_RESULT_META_KEY = "__piSubagents";
+
+interface ToolResultMetadata {
+	failed?: true;
+	/** Full model-visible text when the returned content had to be truncated. */
+	fullOutput?: string;
+}
+
+interface ToolResultDraft<T = unknown> {
+	content: Array<{ type: "text"; text: string }>;
+	details?: T;
+	usage?: AgentToolResult<T>["usage"];
+	addedToolNames?: string[];
+	terminate?: boolean;
+	/** Internal flag consumed by finalizeToolResult; never returned as a fake AgentToolResult field. */
+	failed?: boolean;
+}
+
+type DetailsWithMetadata<T> = T & { [TOOL_RESULT_META_KEY]?: ToolResultMetadata };
+type MetadataOnlyDetails = { [TOOL_RESULT_META_KEY]: ToolResultMetadata };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function utf8Prefix(text: string, maxBytes: number): string {
+	const bytes = Buffer.from(text, "utf8");
+	if (bytes.length <= maxBytes) return text;
+	let end = maxBytes;
+	// A UTF-8 continuation byte cannot begin the remainder. Back up to the code-point boundary
+	// instead of letting Buffer.toString manufacture U+FFFD at the cut.
+	while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--;
+	return bytes.subarray(0, end).toString("utf8");
+}
+
+function truncateWithLongLineFallback(text: string, maxBytes: number, maxLines: number) {
+	const truncated = truncateHead(text, { maxBytes, maxLines });
+	if (!truncated.truncated || truncated.content || !text) return truncated;
+	// Pi's line-preserving helper intentionally emits no content when the first line alone exceeds
+	// maxBytes. Model output often contains minified JSON or generated blobs, where a byte-safe
+	// prefix is much more useful than an empty response.
+	const content = utf8Prefix(text, maxBytes);
+	return {
+		...truncated,
+		content,
+		outputBytes: Buffer.byteLength(content, "utf8"),
+		outputLines: content ? content.split("\n").length : 0,
+	};
+}
+
+function resumableRunSummary(details: unknown): string | undefined {
+	if (!isRecord(details) || !Array.isArray(details.results)) return undefined;
+	const runIds = details.results.flatMap((value: unknown) =>
+		isRecord(value) && typeof value.runId === "string" ? [value.runId] : [],
+	);
+	if (runIds.length === 0) return undefined;
+	const shown = runIds.slice(0, 8).map((id) => `run ${id}`);
+	if (runIds.length > shown.length) shown.push(`+${runIds.length - shown.length} more; use { action: "runs" }`);
+	return shown.join(", ");
+}
+
+function textLineCount(text: string): number {
+	return text ? text.split("\n").length : 0;
+}
+
+function truncateModelText(text: string, details: unknown): { text: string; fullOutput?: string } {
+	const probe = truncateWithLongLineFallback(text, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES);
+	if (!probe.truncated) return { text };
+
+	// Keep run ids model-visible because they are needed to resume a child and normally appear at
+	// the tail that head truncation removes. The summary is bounded independently of agent names.
+	const runs = resumableRunSummary(details);
+	let payloadBytes = DEFAULT_MAX_BYTES - OUTPUT_NOTICE_RESERVE_BYTES;
+	let payloadLines = DEFAULT_MAX_LINES - 2;
+	let lastNotice = "";
+	for (let attempt = 0; attempt < 4; attempt++) {
+		const truncated = truncateWithLongLineFallback(text, Math.max(1, payloadBytes), Math.max(1, payloadLines));
+		lastNotice = `[Output truncated: showing ${truncated.outputLines} of ${truncated.totalLines} lines (${formatSize(truncated.outputBytes)} of ${formatSize(truncated.totalBytes)}). Full output preserved in tool details.${runs ? ` Resumable: ${runs}.` : ""}]`;
+		const separator = truncated.content ? "\n\n" : "";
+		const output = `${truncated.content}${separator}${lastNotice}`;
+		const excessBytes = Math.max(0, Buffer.byteLength(output, "utf8") - DEFAULT_MAX_BYTES);
+		const excessLines = Math.max(0, textLineCount(output) - DEFAULT_MAX_LINES);
+		if (excessBytes === 0 && excessLines === 0) return { text: output, fullOutput: text };
+		payloadBytes = Math.max(1, payloadBytes - excessBytes);
+		payloadLines = Math.max(1, payloadLines - excessLines);
+	}
+
+	// Defensive final fallback. The bounded, single-line notice itself is far below both limits,
+	// even if a future formatting change makes the iterative payload budget fail to converge.
+	return {
+		text: utf8Prefix(lastNotice.replace(/\n/g, " "), DEFAULT_MAX_BYTES),
+		fullOutput: text,
+	};
+}
+
+/**
+ * Normalize every custom-tool return through the actual AgentToolResult contract.
+ *
+ * Pi deliberately ignores an `isError` property returned by execute(); the tool_result bridge
+ * below reads our details marker and sets the real event flag while preserving rich details.
+ */
+function finalizeToolResult<T>(draft: ToolResultDraft<T>): AgentToolResult<DetailsWithMetadata<T> | MetadataOnlyDetails | undefined> {
+	const originalText = draft.content.map((part) => part.text).join("\n");
+	const bounded = truncateModelText(originalText, draft.details);
+	const metadata: ToolResultMetadata = {
+		...(draft.failed ? { failed: true as const } : {}),
+		...(bounded.fullOutput === undefined ? {} : { fullOutput: bounded.fullOutput }),
+	};
+	const hasMetadata = Object.keys(metadata).length > 0;
+	let details: DetailsWithMetadata<T> | MetadataOnlyDetails | undefined = draft.details as DetailsWithMetadata<T> | undefined;
+	if (hasMetadata) {
+		details = isRecord(draft.details)
+			? ({ ...draft.details, [TOOL_RESULT_META_KEY]: metadata } as DetailsWithMetadata<T>)
+			: { [TOOL_RESULT_META_KEY]: metadata };
+	}
+	return {
+		content: [{ type: "text", text: bounded.text }],
+		details,
+		...(draft.usage === undefined ? {} : { usage: draft.usage }),
+		...(draft.addedToolNames === undefined ? {} : { addedToolNames: draft.addedToolNames }),
+		...(draft.terminate === undefined ? {} : { terminate: draft.terminate }),
+	};
+}
+
+function toolResultMetadata(details: unknown): ToolResultMetadata | undefined {
+	if (!isRecord(details)) return undefined;
+	const metadata = details[TOOL_RESULT_META_KEY];
+	return isRecord(metadata) ? (metadata as ToolResultMetadata) : undefined;
+}
+
 function getFinalOutput(messages: Message[]): string {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const msg = messages[i];
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") return part.text;
-			}
-		}
+		if (msg.role !== "assistant") continue;
+		return msg.content
+			.filter((part): part is Extract<(typeof msg.content)[number], { type: "text" }> => part.type === "text")
+			.map((part) => part.text)
+			.join("");
 	}
 	return "";
 }
@@ -214,17 +348,6 @@ function getFailureText(result: SingleResult): string | undefined {
 	if (!isFailedResult(result)) return undefined;
 	const text = result.errorMessage || result.stderr?.trim();
 	return text ? text.split("\n").slice(0, 3).join("\n") : undefined;
-}
-
-function truncateParallelOutput(output: string): string {
-	const byteLength = Buffer.byteLength(output, "utf8");
-	if (byteLength <= PER_TASK_OUTPUT_CAP) return output;
-
-	let truncated = output.slice(0, PER_TASK_OUTPUT_CAP);
-	while (Buffer.byteLength(truncated, "utf8") > PER_TASK_OUTPUT_CAP) {
-		truncated = truncated.slice(0, -1);
-	}
-	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted. Full output preserved in tool details.]`;
 }
 
 type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, any> };
@@ -262,10 +385,11 @@ async function mapWithConcurrencyLimit<TIn, TOut>(
 	return results;
 }
 
-async function writePromptToTempFile(agentName: string, prompt: string): Promise<{ dir: string; filePath: string }> {
+async function writePromptToTempFile(prompt: string): Promise<{ dir: string; filePath: string }> {
 	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
-	const safeName = agentName.replace(/[^\w.-]+/g, "_");
-	const filePath = path.join(tmpDir, `prompt-${safeName}.md`);
+	// The directory is unique already. Keeping the untrusted agent name out of the file name also
+	// avoids NAME_MAX failures for a valid but unusually long frontmatter name.
+	const filePath = path.join(tmpDir, "prompt.md");
 	await withFileMutationQueue(filePath, async () => {
 		await fs.promises.writeFile(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
 	});
@@ -294,6 +418,10 @@ interface DispatchDefaults {
 	model?: string;
 	thinkingLevel?: ThinkingLevel;
 	lookupModel?: (key: string) => ModelLike | undefined;
+	/** Non-empty only when the parent configured --models/enabledModels. */
+	scopedModels?: Array<{ model: ModelLike; thinkingLevel?: ThinkingLevel }>;
+	/** Project settings already authorized by the parent session's trust decision. */
+	trustedProjectSettings?: { file: string; root: string };
 	/** The parent's session file, or undefined when this session is ephemeral. */
 	parentSessionFile?: string;
 	/** Answers the child's supervisor requests; absent when the parent cannot reach an operator. */
@@ -483,7 +611,6 @@ function readSettingsFile(file: string): Record<string, unknown> | undefined {
 	}
 }
 
-/** `subagents` settings, project overriding user, read fresh so edits apply without a restart. */
 /** Walk up for the project settings file, the way project agents are already discovered. */
 function findProjectSettings(cwd: string): string | undefined {
 	let dir = path.resolve(cwd);
@@ -496,10 +623,31 @@ function findProjectSettings(cwd: string): string | undefined {
 	}
 }
 
-function readSubagentSettings(cwd: string): SubagentSettings {
-	const files = [path.join(getAgentDir(), "settings.json"), findProjectSettings(cwd)].filter(
-		(file): file is string => Boolean(file),
-	);
+function canonicalPath(value: string): string {
+	try {
+		return fs.realpathSync(value);
+	} catch {
+		return path.resolve(value);
+	}
+}
+
+function isWithinProject(cwd: string, root: string): boolean {
+	const relative = path.relative(canonicalPath(root), canonicalPath(cwd));
+	return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+function trustedProjectSettings(cwd: string): { file: string; root: string } | undefined {
+	const file = findProjectSettings(cwd);
+	return file ? { file, root: path.dirname(path.dirname(file)) } : undefined;
+}
+
+/** `subagents` settings, project overriding user only after Pi approved that project. */
+function readSubagentSettings(
+	cwd: string,
+	trustedProject: { file: string; root: string } | undefined,
+): SubagentSettings {
+	const files = [path.join(getAgentDir(), "settings.json")];
+	if (trustedProject && isWithinProject(cwd, trustedProject.root)) files.push(trustedProject.file);
 	const merged: SubagentSettings = {};
 	for (const file of files) {
 		const raw = readSettingsFile(file)?.subagents as Record<string, unknown> | undefined;
@@ -537,11 +685,17 @@ const retentionRoot = path.join(os.tmpdir(), `pi-subagent-runs-${process.pid}`);
 interface RetainedRun {
 	id: string;
 	agent: string;
+	agentSource: "user" | "project";
+	agentFilePath: string;
 	/** The resolved launch contract. A resumed child keeps it rather than re-deriving it. */
 	model?: string;
 	thinking?: ThinkingLevel;
 	tools?: string[];
-	cwd?: string;
+	inheritSkills: boolean;
+	inheritProjectContext: boolean;
+	defaultContext?: ForkContext;
+	systemPrompt: string;
+	cwd: string;
 	runDir: string;
 	sessionFile?: string;
 	resumable: boolean;
@@ -750,6 +904,31 @@ function splitModelKey(key: string): { provider: string; id: string } | undefine
 	return i === -1 ? undefined : { provider: key.slice(0, i), id: key.slice(i + 1) };
 }
 
+function normalizeModelReference(spec: string): string {
+	const trimmed = spec.trim();
+	const slash = trimmed.indexOf("/");
+	if (slash === -1) return trimmed.toLowerCase();
+	return `${trimmed.slice(0, slash).trim()}/${trimmed.slice(slash + 1).trim()}`.toLowerCase();
+}
+
+function findScopedModel(
+	scopedModels: Array<{ model: ModelLike; thinkingLevel?: ThinkingLevel }> | undefined,
+	spec: string,
+): { model: ModelLike; thinkingLevel?: ThinkingLevel } | undefined {
+	if (!scopedModels?.length) return undefined;
+	const normalized = normalizeModelReference(spec);
+	const exact = scopedModels.find((entry) => normalizeModelReference(modelKey(entry.model)) === normalized);
+	if (exact) return exact;
+	const byId = scopedModels.filter((entry) => entry.model.id.toLowerCase() === normalized);
+	return byId.length === 1 ? byId[0] : undefined;
+}
+
+function signalExitCode(signal: NodeJS.Signals | null): number {
+	if (!signal) return 1;
+	const number = os.constants.signals[signal];
+	return typeof number === "number" ? 128 + number : 1;
+}
+
 async function runSingleAgent(
 	defaultCwd: string,
 	dispatchDefaults: DispatchDefaults,
@@ -766,7 +945,24 @@ async function runSingleAgent(
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 ): Promise<SingleResult> {
 	const resuming = retain?.resume;
-	const agent = resuming ? findAgent(agents, resuming.agent) : findAgent(agents, agentName);
+	const discoveredAgent = resuming ? undefined : findAgent(agents, agentName);
+	const agent: AgentConfig | undefined = resuming
+		? {
+				name: resuming.agent,
+				aliases: [],
+				description: "Retained subagent run",
+				tools: resuming.tools,
+				model: resuming.model,
+				thinking: resuming.thinking,
+				inheritSkills: resuming.inheritSkills,
+				inheritProjectContext: resuming.inheritProjectContext,
+				defaultContext: resuming.defaultContext,
+				suggest: false,
+				systemPrompt: resuming.systemPrompt,
+				source: resuming.agentSource,
+				filePath: resuming.agentFilePath,
+			}
+		: discoveredAgent;
 
 	if (!agent) {
 		const available = agents.map((a) => `"${describeAgent(a)}"`).join(", ") || "none";
@@ -783,12 +979,38 @@ async function runSingleAgent(
 	}
 
 	const args: string[] = ["--mode", "json", "-p"];
-	// Precedence: per-call override > agent frontmatter > dispatching session.
-	const explicitSpec = overrides.model ?? agent.model;
-	const explicit = explicitSpec ? splitThinkingSuffix(explicitSpec) : undefined;
-	const model = resuming ? resuming.model : (explicit?.model ?? dispatchDefaults.model);
+	// Precedence: per-call override > agent frontmatter > dispatching session. Resolve an exact
+	// model id before interpreting a trailing `:high`-style thinking suffix, because colons are
+	// also legal inside model ids.
+	const explicitSpec = resuming ? undefined : (overrides.model ?? agent.model);
+	const exactScoped = explicitSpec ? findScopedModel(dispatchDefaults.scopedModels, explicitSpec) : undefined;
+	const exactRegistered = explicitSpec ? dispatchDefaults.lookupModel?.(explicitSpec) : undefined;
+	const explicit = explicitSpec
+		? exactScoped
+			? { model: modelKey(exactScoped.model) }
+			: exactRegistered
+				? { model: modelKey(exactRegistered) }
+				: splitThinkingSuffix(explicitSpec)
+		: undefined;
+	const scopedSelection = explicit?.model ? findScopedModel(dispatchDefaults.scopedModels, explicit.model) : undefined;
+	if (!resuming && explicit && dispatchDefaults.scopedModels?.length && !scopedSelection) {
+		return {
+			agent: agent.name,
+			agentSource: agent.source,
+			task,
+			exitCode: 1,
+			messages: [],
+			stderr: `Model "${explicit.model}" is outside the configured model scope. Available: ${dispatchDefaults.scopedModels.map((entry) => modelKey(entry.model)).join(", ")}.`,
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			model: explicit.model,
+			step,
+		};
+	}
+	const model = resuming
+		? resuming.model
+		: (scopedSelection ? modelKey(scopedSelection.model) : (explicit?.model ?? dispatchDefaults.model));
 
-	const settings = readSubagentSettings(cwd ?? defaultCwd);
+	const settings = readSubagentSettings(cwd ?? defaultCwd, dispatchDefaults.trustedProjectSettings);
 	const frontmatterThinking = isThinkingLevel(agent.thinking) ? agent.thinking : undefined;
 	// An explicit model does not inherit the session's thinking level, but a per-call `thinking`,
 	// the agent's own `thinking:`, and a configured default all still apply.
@@ -801,17 +1023,18 @@ async function runSingleAgent(
 		: (requestedThinking ??
 			frontmatterThinking ??
 			explicit?.thinking ??
+			scopedSelection?.thinkingLevel ??
 			settings.defaultThinking ??
 			(explicit ? undefined : dispatchDefaults.thinkingLevel));
 
 	// A ceiling is a budget control, so clamp rather than fail: the caller asked for work, not for
 	// a particular amount of deliberation, and refusing the whole dispatch helps nobody.
-	if (thinking && settings.maxThinking && thinkingRank(thinking) > thinkingRank(settings.maxThinking)) {
+	if (!resuming && thinking && settings.maxThinking && thinkingRank(thinking) > thinkingRank(settings.maxThinking)) {
 		thinking = settings.maxThinking;
 	}
 	// pi clamps an unsupported thinking level silently, which is indistinguishable from the model
 	// simply not thinking. Fail loudly instead so the caller can pick a level the model accepts.
-	if (thinking && model) {
+	if (!resuming && thinking && model) {
 		const resolved = dispatchDefaults.lookupModel?.(model);
 		if (resolved) {
 			const allowed = supportedThinking(resolved);
@@ -842,10 +1065,10 @@ async function runSingleAgent(
 	// An agent with an explicit allowlist would otherwise be unable to reach the channel at all.
 	const childTools = resuming
 		? resuming.tools
-		: agent.tools && agent.tools.length > 0
+		: agent.tools !== undefined
 			? [...new Set([...agent.tools, SUPERVISOR_TOOL])]
 			: undefined;
-	if (childTools) args.push("--tools", childTools.join(","));
+	if (childTools !== undefined) args.push("--tools", childTools.join(","));
 	// A child that rediscovers the whole skill catalogue pays for it on every dispatch, and the
 	// task it was handed is narrower than the catalogue. Repository context is the opposite: a
 	// delegated edit should respect the conventions of the repo it runs in.
@@ -937,8 +1160,10 @@ async function runSingleAgent(
 			args.push("--session-dir", runDir);
 		}
 
-		if (!resuming && agent.systemPrompt.trim()) {
-			const tmp = await writePromptToTempFile(agent.name, agent.systemPrompt);
+		// Session JSON stores messages and model state, not CLI append-system-prompt input, so the
+		// retained prompt must be supplied again on every resumed process.
+		if (agent.systemPrompt.trim()) {
+			const tmp = await writePromptToTempFile(agent.systemPrompt);
 			tmpPromptDir = tmp.dir;
 			tmpPromptPath = tmp.filePath;
 			args.push("--append-system-prompt", tmpPromptPath);
@@ -1020,20 +1245,26 @@ async function runSingleAgent(
 				}
 			};
 
-			proc.stdout.on("data", (data) => {
-				buffer += data.toString();
+			// StringDecoder inside setEncoding carries incomplete multi-byte sequences across chunks.
+			proc.stdout.setEncoding("utf8");
+			proc.stderr.setEncoding("utf8");
+			proc.stdout.on("data", (data: string) => {
+				buffer += data;
 				const lines = buffer.split("\n");
 				buffer = lines.pop() || "";
 				for (const line of lines) processLine(line);
 			});
 
-			proc.stderr.on("data", (data) => {
-				currentResult.stderr += data.toString();
+			proc.stderr.on("data", (data: string) => {
+				currentResult.stderr += data;
 			});
 
-			proc.on("close", (code) => {
+			proc.on("close", (code, signalCode) => {
 				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
+				if (signalCode && !wasAborted) {
+					currentResult.errorMessage = `Child process terminated by ${signalCode}.`;
+				}
+				resolve(code ?? signalExitCode(signalCode));
 			});
 
 			proc.on("error", (error) => {
@@ -1060,16 +1291,27 @@ async function runSingleAgent(
 		});
 
 		currentResult.exitCode = exitCode;
+		if (wasAborted) {
+			currentResult.stopReason = "aborted";
+			currentResult.errorMessage = "Subagent was aborted.";
+			if (currentResult.exitCode === 0) currentResult.exitCode = signalExitCode("SIGTERM");
+		}
 		if (retain) {
 			const runDir = resuming ? resuming.runDir : path.join(retentionRoot, retain.id);
 			const sessionFile = findSessionFile(runDir);
 			retainedRuns.set(retain.id, {
 				id: retain.id,
 				agent: agent.name,
+				agentSource: agent.source,
+				agentFilePath: agent.filePath,
 				model,
 				thinking,
 				tools: childTools,
-				cwd,
+				inheritSkills: agent.inheritSkills,
+				inheritProjectContext: agent.inheritProjectContext,
+				defaultContext: agent.defaultContext,
+				systemPrompt: agent.systemPrompt,
+				cwd: cwd ?? defaultCwd,
 				runDir,
 				sessionFile,
 				// Without a session file there is nothing to revive, so say so rather than letting a
@@ -1077,7 +1319,6 @@ async function runSingleAgent(
 				resumable: Boolean(sessionFile),
 			});
 		}
-		if (wasAborted) throw new Error("Subagent was aborted");
 		return currentResult;
 	} finally {
 		if (tmpPromptPath)
@@ -1279,10 +1520,10 @@ function registerContactSupervisorTool(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal) {
 			const dir = process.env[IPC_ENV_VAR];
 			if (!dir) {
-				return {
+				return finalizeToolResult({
 					content: [{ type: "text", text: "No supervisor channel is available. Proceed on your own judgement and say what you assumed." }],
-					isError: true,
-				};
+					failed: true,
+				});
 			}
 
 			const id = randomUUID();
@@ -1300,29 +1541,32 @@ function registerContactSupervisorTool(pi: ExtensionAPI) {
 			fs.renameSync(stagingPath, finalPath);
 
 			if (request.reason === "progress_update") {
-				return { content: [{ type: "text", text: "Update delivered to the supervisor." }] };
+				return finalizeToolResult({ content: [{ type: "text", text: "Update delivered to the supervisor." }] });
 			}
 
 			const replyPath = path.join(dir, `${id}.res.json`);
 			const deadline = Date.now() + SUPERVISOR_TIMEOUT_MS;
 			while (Date.now() < deadline) {
 				if (signal?.aborted) {
-					return { content: [{ type: "text", text: "Aborted while waiting for the supervisor." }], isError: true };
+					return finalizeToolResult({
+						content: [{ type: "text", text: "Aborted while waiting for the supervisor." }],
+						failed: true,
+					});
 				}
 				if (fs.existsSync(replyPath)) {
 					try {
 						const reply = JSON.parse(fs.readFileSync(replyPath, "utf8")) as { message?: string };
-						return { content: [{ type: "text", text: reply.message || "(empty reply)" }] };
+						return finalizeToolResult({ content: [{ type: "text", text: reply.message || "(empty reply)" }] });
 					} catch {
 						// Fall through and retry: the parent may still be writing.
 					}
 				}
 				await new Promise((resolve) => setTimeout(resolve, SUPERVISOR_POLL_MS));
 			}
-			return {
+			return finalizeToolResult({
 				content: [{ type: "text", text: "The supervisor did not answer in time. Proceed on your own judgement and state the assumption you made." }],
-				isError: true,
-			};
+				failed: true,
+			});
 		},
 	});
 }
@@ -1350,10 +1594,17 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 		parameters: SubagentParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			return finalizeToolResult(
+				await (async (): Promise<ToolResultDraft<unknown>> => {
 			const agentScope: AgentScope = params.agentScope ?? "user";
 			const dispatchDefaults: DispatchDefaults = {
 				model: ctx.model ? modelKey(ctx.model) : undefined,
 				thinkingLevel: ctx.thinkingLevel,
+				scopedModels:
+					ctx.scopedModels.length > 0
+						? ctx.scopedModels.map(({ model, thinkingLevel }) => ({ model, thinkingLevel }))
+						: undefined,
+				trustedProjectSettings: ctx.isProjectTrusted() ? trustedProjectSettings(ctx.cwd) : undefined,
 				parentSessionFile: ctx.sessionManager.getSessionFile(),
 				lookupModel: (key) => {
 					const parts = splitModelKey(key);
@@ -1394,7 +1645,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 								text: `action: "${params.action}" inspects runs and dispatches nothing, so ${dispatchKeys.join(", ")} would be ignored. Make the dispatch in its own call.`,
 							},
 						],
-						isError: true,
+						failed: true,
 					};
 				}
 			}
@@ -1405,14 +1656,17 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					: [...asyncRuns.values()];
 				if (runs.length === 0) {
 					const text = params.id ? `No run with id "${params.id}".` : "No detached runs in this session.";
-					return { content: [{ type: "text", text }], isError: Boolean(params.id) };
+					return { content: [{ type: "text", text }], failed: Boolean(params.id) };
 				}
 				// One run by id prints in full; the whole list is a summary, or a long session drops
 				// every finished transcript into context at once.
 				const rendered = params.id
 					? runs.map((r) => describeAsyncRun(r))
 					: runs.map((r) => truncateForListing(describeAsyncRun(r)));
-				return { content: [{ type: "text", text: rendered.join("\n\n") }] };
+				return {
+					content: [{ type: "text", text: rendered.join("\n\n") }],
+					failed: Boolean(params.id && runs[0].state === "failed"),
+				};
 			}
 
 			if (params.action === "runs") {
@@ -1440,7 +1694,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 			if (params.action === "stop") {
 				const run = params.id ? asyncRuns.get(params.id) : undefined;
 				if (!run) {
-					return { content: [{ type: "text", text: `No run with id "${params.id ?? ""}".` }], isError: true };
+					return { content: [{ type: "text", text: `No run with id "${params.id ?? ""}".` }], failed: true };
 				}
 				if (run.state !== "running") {
 					return { content: [{ type: "text", text: `Run ${run.id} already ${run.state}.` }] };
@@ -1466,7 +1720,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 							text: `async only applies to a single dispatch; ${hasChain ? "chain" : "parallel"} runs to completion in this call. To detach this work, start each task with its own async single dispatch and collect them with { action: "status" }.`,
 						},
 					],
-					isError: true,
+					failed: true,
 				};
 			}
 
@@ -1478,7 +1732,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 							text: `resume reviews one retained child, so it cannot be combined with ${hasChain ? "chain" : "parallel"}. Resume the run on its own, then continue.`,
 						},
 					],
-					isError: true,
+					failed: true,
 				};
 			}
 
@@ -1501,7 +1755,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 						},
 					],
 					details: makeDetails("single")([]),
-					isError: true,
+					failed: true,
 				};
 			}
 
@@ -1536,7 +1790,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 								},
 							],
 							details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
-							isError: true,
+							failed: true,
 						};
 					const ok = await ctx.ui.confirm(
 						"Run project-local agents?",
@@ -1546,7 +1800,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 						return {
 							content: [{ type: "text", text: "Canceled: project-local agents not approved." }],
 							details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
-							isError: true,
+							failed: true,
 						};
 				}
 			}
@@ -1602,7 +1856,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 						return {
 							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
 							details: makeDetails("chain")(results),
-							isError: true,
+							failed: true,
 						};
 					}
 					previousOutput = getFinalOutput(result.messages);
@@ -1632,9 +1886,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 							},
 						],
 						details: makeDetails("parallel")([]),
-						// Every neighbouring guard marks itself an error; without it a caller that
-						// miscounts a batch reads a rejection as a success that returned no results.
-						isError: true,
+						failed: true,
 					};
 
 				// Track all results for streaming updates
@@ -1698,7 +1950,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 
 				const successCount = results.filter((r) => !isFailedResult(r)).length;
 				const summaries = results.map((r) => {
-					const output = truncateParallelOutput(getResultOutput(r));
+					const output = getResultOutput(r);
 					const status = isFailedResult(r)
 						? `failed${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
 						: "completed";
@@ -1715,6 +1967,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 						},
 					],
 					details: makeDetails("parallel")(results),
+					failed: successCount !== results.length,
 				};
 			}
 
@@ -1723,7 +1976,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					content: [
 						{ type: "text", text: "Pass either resume or agent, not both: a revived child keeps its own contract." },
 					],
-					isError: true,
+					failed: true,
 				};
 			}
 
@@ -1734,7 +1987,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					const known = [...retainedRuns.keys()].join(", ") || "none";
 					return {
 						content: [{ type: "text", text: `No retained run "${params.resume}". Known runs: ${known}.` }],
-						isError: true,
+						failed: true,
 					};
 				}
 				if (runsInFlight.has(target.id)) {
@@ -1745,7 +1998,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 								text: `Run ${target.id} is still running. Two children appending to one session corrupts it; wait for it, or stop it first.`,
 							},
 						],
-						isError: true,
+						failed: true,
 					};
 				}
 				if (!target.resumable || !target.sessionFile || !fs.existsSync(target.sessionFile)) {
@@ -1756,7 +2009,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 								text: `Run ${target.id} is not resumable: no session was retained for it. Start a fresh ${target.agent} instead, and say that it is a fallback.`,
 							},
 						],
-						isError: true,
+						failed: true,
 					};
 				}
 				const ignored = [
@@ -1773,10 +2026,39 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 								text: `A resumed child keeps the contract it was launched with, so ${ignored.join(", ")} cannot be changed here. Drop ${ignored.length === 1 ? "it" : "them"}, or start a new child instead of resuming.`,
 							},
 						],
-						isError: true,
+						failed: true,
 					};
 				}
 				resumeTarget = target;
+			}
+
+			// Resume is source-based, not discovery-scope-based: a retained project prompt stays
+			// project-controlled even when the caller omits agentScope or the source file was removed.
+			if (resumeTarget?.agentSource === "project" && confirmProjectAgents && !ctx.isProjectTrusted()) {
+				const dir = path.dirname(resumeTarget.agentFilePath);
+				if (!ctx.hasUI) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Refused: retained run ${resumeTarget.id} uses project agent ${resumeTarget.agent} from ${dir}, and this session cannot ask for confirmation. Trust the project, or pass confirmProjectAgents: false to accept that risk deliberately.`,
+							},
+						],
+						details: makeDetails("single")([]),
+						failed: true,
+					};
+				}
+				const ok = await ctx.ui.confirm(
+					"Resume project-local agent?",
+					`Agent: ${resumeTarget.agent}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
+				);
+				if (!ok) {
+					return {
+						content: [{ type: "text", text: "Canceled: project-local agent resume not approved." }],
+						details: makeDetails("single")([]),
+						failed: true,
+					};
+				}
 			}
 
 			if ((params.agent || resumeTarget) && params.task && params.async) {
@@ -1855,7 +2137,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					return {
 						content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
 						details: makeDetails("single")([result]),
-						isError: true,
+						failed: true,
 					};
 				}
 				return {
@@ -1872,9 +2154,11 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 			const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 			return {
 				content: [{ type: "text", text: `Invalid parameters. Available agents: ${available}` }],
-				isError: true,
+				failed: true,
 				details: makeDetails("single")([]),
 			};
+				})(),
+			);
 		},
 
 		renderCall(args, theme, _context) {
@@ -1922,7 +2206,8 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 		},
 
 		renderResult(result, { expanded }, theme, _context) {
-			const details = result.details as SubagentDetails | undefined;
+			const candidate = result.details as Partial<SubagentDetails> | undefined;
+			const details = candidate && Array.isArray(candidate.results) ? (candidate as SubagentDetails) : undefined;
 			if (!details || details.results.length === 0) {
 				const text = result.content[0];
 				return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
@@ -2224,6 +2509,13 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 }
 
 export default function (pi: ExtensionAPI) {
+	// execute() cannot set AgentToolResult.isError because that field does not exist in Pi's API.
+	// Bridge our private details marker onto the mutable tool_result event instead.
+	pi.on("tool_result", (event) => {
+		if (event.toolName !== "subagent" && event.toolName !== SUPERVISOR_TOOL) return;
+		if (toolResultMetadata(event.details)?.failed) return { isError: true };
+	});
+
 	// Inside a spawned child the tool to offer is the one pointing back up, not the one pointing
 	// further down: delegation stops at one level, but asking the operator does not.
 	const register = (ctx: ExtensionContext) => {
