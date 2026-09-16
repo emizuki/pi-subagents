@@ -257,9 +257,16 @@ finished child can be revived instead:
 { resume: "4f2a9c31", task: "The review found X. Fix it." }
 ```
 
+`async: true` works with `resume` as well, detaching the revived child.
+
 `resume` and `agent` are mutually exclusive. A revived child keeps its stored agent, model,
 thinking level and tool allowlist rather than re-deriving them, and its system prompt is not
 appended again — the session already carries it.
+
+Every dispatch reports its run id — a single run appends `(run 4f2a9c31)`, parallel tags each
+task heading, and a chain lists `step N: run …` at the end — because three parallel tasks running
+the same agent are otherwise indistinguishable, and resuming the second of them is exactly the
+case this exists for.
 
 `{ action: "runs" }` lists retained runs and says `resumable` or `not resumable` for each, which
 is worth checking before building a plan around reviving one. A run with no retained session file

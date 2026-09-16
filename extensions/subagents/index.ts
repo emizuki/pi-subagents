@@ -34,6 +34,8 @@ import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
+/** How long a child gets to exit on SIGTERM before SIGKILL. */
+const SIGKILL_GRACE_MS = 5_000;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
 
@@ -149,6 +151,8 @@ interface UsageStats {
 }
 
 interface SingleResult {
+	/** Retained-run id, so a caller can resume this particular step or task later. */
+	runId?: string;
 	agent: string;
 	agentSource: "user" | "project" | "unknown";
 	task: string;
@@ -735,11 +739,12 @@ async function runSingleAgent(
 
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
-	let tmpSessionDir: string | null = null;
 	let ipcDir: string | null = null;
+	let forkSource: string | null = null;
 	let supervisorTimer: ReturnType<typeof setInterval> | null = null;
 
 	const currentResult: SingleResult = {
+		runId: retain?.id,
 		agent: agentName,
 		agentSource: agent.source,
 		task,
@@ -778,15 +783,10 @@ async function runSingleAgent(
 				const source = path.join(runDir, "parent.jsonl");
 				sanitizeSessionForFork(parentSession, source);
 				args.push("--fork", source);
+				// pi reads this once at startup; the branch it writes is what gets retained.
+				forkSource = source;
 			}
 			args.push("--session-dir", runDir);
-		} else if (forking && parentSession) {
-			tmpSessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-fork-"));
-			const source = path.join(tmpSessionDir, "parent.jsonl");
-			sanitizeSessionForFork(parentSession, source);
-			args.push("--fork", source, "--session-dir", tmpSessionDir);
-		} else {
-			args.push("--no-session");
 		}
 
 		if (!resuming && agent.systemPrompt.trim()) {
@@ -891,7 +891,7 @@ async function runSingleAgent(
 					proc.kill("SIGTERM");
 					setTimeout(() => {
 						if (!proc.killed) proc.kill("SIGKILL");
-					}, 5000);
+					}, SIGKILL_GRACE_MS);
 				};
 				if (signal.aborted) killProc();
 				else signal.addEventListener("abort", killProc, { once: true });
@@ -932,9 +932,9 @@ async function runSingleAgent(
 				/* ignore */
 			}
 		if (supervisorTimer) clearInterval(supervisorTimer);
-		if (tmpSessionDir)
+		if (forkSource)
 			try {
-				fs.rmSync(tmpSessionDir, { recursive: true, force: true });
+				fs.unlinkSync(forkSource);
 			} catch {
 				/* ignore */
 			}
@@ -1385,8 +1385,17 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					}
 					previousOutput = getFinalOutput(result.messages);
 				}
+				const chainIds = results
+					.map((r) => (r.runId ? `step ${r.step}: run ${r.runId} (${r.agent})` : undefined))
+					.filter(Boolean)
+					.join("\n");
 				return {
-					content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
+					content: [
+						{
+							type: "text",
+							text: `${getFinalOutput(results[results.length - 1].messages) || "(no output)"}${chainIds ? `\n\nResumable runs:\n${chainIds}` : ""}`,
+						},
+					],
 					details: makeDetails("chain")(results),
 				};
 			}
@@ -1464,7 +1473,10 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					const status = isFailedResult(r)
 						? `failed${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
 						: "completed";
-					return `### [${r.agent}] ${status}\n\n${output}`;
+					// Without the id a caller cannot resume one of several identical-looking tasks,
+					// which is the whole point of retaining them.
+					const id = r.runId ? ` run ${r.runId}` : "";
+					return `### [${r.agent}]${id} ${status}\n\n${output}`;
 				});
 				return {
 					content: [
@@ -1510,14 +1522,14 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 				resumeTarget = target;
 			}
 
-			if (params.agent && params.task && params.async) {
-				const id = newRunId();
-				// Its own controller, never the tool call\'s: that signal fires the moment this call
+			if ((params.agent || resumeTarget) && params.task && params.async) {
+				const id = resumeTarget ? resumeTarget.id : newRunId();
+				// Its own controller, never the tool call's: that signal fires the moment this call
 				// returns, which for a detached run is immediately.
 				const controller = new AbortController();
 				const run: AsyncRun = {
 					id,
-					agent: params.agent,
+					agent: params.agent ?? (resumeTarget?.agent as string),
 					task: params.task,
 					state: "running",
 					startedAt: Date.now(),
@@ -1529,12 +1541,12 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					ctx.cwd,
 					dispatchDefaults,
 					agents,
-					params.agent,
+					params.agent ?? resumeTarget?.agent ?? "",
 					params.task,
-					params.cwd,
+					params.cwd ?? resumeTarget?.cwd,
 					{ model: params.model, thinking: params.thinking, context: params.context },
 					undefined,
-					{ id },
+					{ id, resume: resumeTarget },
 					controller.signal,
 					// No live rendering: this tool call is already over by the time output arrives.
 					undefined,
@@ -1590,7 +1602,12 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					};
 				}
 				return {
-					content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
+					content: [
+						{
+							type: "text",
+							text: `${getFinalOutput(result.messages) || "(no output)"}${result.runId ? `\n\n(run ${result.runId})` : ""}`,
+						},
+					],
 					details: makeDetails("single")([result]),
 				};
 			}
@@ -1943,9 +1960,12 @@ export default function (pi: ExtensionAPI) {
 	// exit, still burning tokens against a session nobody is watching any more.
 	pi.on("session_shutdown", (_event, ctx) => {
 		const stopped = abortAllAsyncRuns();
-		clearRetainedRuns();
 		if (stopped > 0 && ctx.hasUI) {
 			ctx.ui.notify(`Stopped ${stopped} detached subagent run${stopped === 1 ? "" : "s"}.`, "info");
 		}
+		// A killed child has up to SIGKILL_GRACE_MS left and is still writing its session into the
+		// retention root. Deleting it out from under a dying process only manufactures errors.
+		if (stopped > 0) setTimeout(clearRetainedRuns, SIGKILL_GRACE_MS + 1_000).unref?.();
+		else clearRetainedRuns();
 	});
 }
