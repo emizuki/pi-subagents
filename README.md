@@ -17,7 +17,7 @@ catalogue, so it always reflects whichever provider the session is on.
 ## Install
 
 ```bash
-pi install git:github.com/<you>/pi-subagents
+pi install git:github.com/emizuki/pi-subagents
 ```
 
 Agent definitions are not a pi resource type, so copy the samples yourself:
