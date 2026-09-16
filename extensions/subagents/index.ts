@@ -1156,7 +1156,9 @@ function buildGuidelines(choices: ModelLike[], current: string | undefined, agen
 
 	// Steering the agent choice matters more than the model: a full-tool agent on a read-only
 	// task costs more and can write files the task never asked it to touch.
-	const restricted = agents.filter((a) => a.tools?.length && !a.tools.some((t) => t === "write" || t === "edit"));
+	const restricted = agents.filter(
+		(a) => a.suggest && a.tools?.length && !a.tools.some((t) => t === "write" || t === "edit"),
+	);
 	if (restricted.length > 0 && agents.length > restricted.length) {
 		const names = restricted.map((a) => `"${a.name}"`).join(" or ");
 		guidelines.push(

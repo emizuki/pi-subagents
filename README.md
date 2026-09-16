@@ -307,6 +307,7 @@ is useful; a tree of it is a bill.
 | `inheritSkills` | `false` | Whether the child rediscovers pi's skill catalogue |
 | `inheritProjectContext` | `true` | Whether the child loads `AGENTS.md` / `CLAUDE.md` from its cwd |
 | `defaultContext` | `fresh` | `fork` makes this agent prefer a branched transcript, degrading to fresh when the parent has none |
+| `suggest` | `true` | Whether the tool's guidance offers this agent as a general read-only choice. Set `false` for a specialist that expects a particular input |
 
 `aliases` exists because callers reach for habitual names. Superpowers, for instance, hardcodes
 `Subagent (general-purpose):` in its dispatch templates, and models improvise around it with

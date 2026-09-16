@@ -24,6 +24,14 @@ export interface AgentConfig {
 	inheritProjectContext: boolean;
 	/** Preference only: when the parent has no persisted session, a fork preference runs fresh. */
 	defaultContext?: "fresh" | "fork";
+	/**
+	 * Whether to offer this agent in the tool's guidance as a general read-only choice.
+	 *
+	 * Defaults to true for any agent with a restricted tool list, which is right for a scout and
+	 * wrong for a specialist: an agent that expects one finding to score, or a diff to audit, does
+	 * nothing useful with "find the auth code" and should say so rather than be recommended for it.
+	 */
+	suggest: boolean;
 	systemPrompt: string;
 	source: "user" | "project";
 	filePath: string;
@@ -52,6 +60,7 @@ type AgentFrontmatter = {
 	inheritSkills?: unknown;
 	inheritProjectContext?: unknown;
 	defaultContext?: unknown;
+	suggest?: unknown;
 };
 
 /**
@@ -116,6 +125,7 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			thinking: typeof frontmatter.thinking === "string" ? frontmatter.thinking : undefined,
 			inheritSkills: frontmatter.inheritSkills === true,
 			inheritProjectContext: frontmatter.inheritProjectContext !== false,
+			suggest: frontmatter.suggest !== false,
 			defaultContext:
 				frontmatter.defaultContext === "fork" || frontmatter.defaultContext === "fresh"
 					? frontmatter.defaultContext
