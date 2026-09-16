@@ -13,6 +13,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -280,6 +281,8 @@ interface DispatchDefaults {
 	model?: string;
 	thinkingLevel?: ThinkingLevel;
 	lookupModel?: (key: string) => ModelLike | undefined;
+	/** Answers the child's supervisor requests; absent when the parent cannot reach an operator. */
+	supervise?: SupervisorHandler;
 }
 
 /**
@@ -287,6 +290,21 @@ interface DispatchDefaults {
  * the tool again. One level of delegation is useful; a tree of them multiplies cost silently.
  */
 const DEPTH_ENV_VAR = "PI_SUBAGENT_DEPTH";
+/** Directory the child writes supervisor requests into and reads replies from. */
+const IPC_ENV_VAR = "PI_SUBAGENT_IPC_DIR";
+/** A supervisor request waits on a human, so the ceiling is generous; it exists to avoid a hang. */
+const SUPERVISOR_TIMEOUT_MS = 10 * 60_000;
+const SUPERVISOR_POLL_MS = 250;
+const SUPERVISOR_TOOL = "contact_supervisor";
+const SUPERVISOR_REASONS = ["need_decision", "interview_request", "progress_update"] as const;
+type SupervisorReason = (typeof SUPERVISOR_REASONS)[number];
+
+interface SupervisorRequest {
+	id: string;
+	reason: SupervisorReason;
+	message: string;
+	agent: string;
+}
 const MAX_SUBAGENT_DEPTH = 1;
 
 function currentDepth(): number {
@@ -450,6 +468,44 @@ function thinkingRank(level: ThinkingLevel): number {
 	return THINKING_LEVELS.indexOf(level);
 }
 
+type SupervisorHandler = (request: SupervisorRequest) => Promise<string>;
+
+/**
+ * Parent-facing half: answer any requests the child has written, once.
+ *
+ * Replies are staged then renamed for the same reason requests are: the child polls for the file
+ * and must not parse a partial one.
+ */
+async function drainSupervisorRequests(dir: string, handle: SupervisorHandler): Promise<void> {
+	let entries: string[];
+	try {
+		entries = fs.readdirSync(dir);
+	} catch {
+		return;
+	}
+	for (const entry of entries) {
+		if (!entry.endsWith(".req.json")) continue;
+		const requestPath = path.join(dir, entry);
+		let request: SupervisorRequest;
+		try {
+			request = JSON.parse(fs.readFileSync(requestPath, "utf8"));
+		} catch {
+			continue;
+		}
+		// Claim it before awaiting, so a slow answer is not handed out twice by the next poll.
+		try {
+			fs.renameSync(requestPath, `${requestPath}.claimed`);
+		} catch {
+			continue;
+		}
+		const answer = await handle(request);
+		if (request.reason === "progress_update") continue;
+		const replyPath = path.join(dir, `${request.id}.res.json`);
+		fs.writeFileSync(`${replyPath}.partial`, JSON.stringify({ message: answer }), "utf8");
+		fs.renameSync(`${replyPath}.partial`, replyPath);
+	}
+}
+
 function modelKey(model: ModelLike): string {
 	return `${model.provider}/${model.id}`;
 }
@@ -534,7 +590,9 @@ async function runSingleAgent(
 	}
 	if (model) args.push("--model", model);
 	if (thinking) args.push("--thinking", thinking);
-	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
+	// An agent with an explicit allowlist would otherwise be unable to reach the channel at all.
+	const childTools = agent.tools && agent.tools.length > 0 ? [...new Set([...agent.tools, SUPERVISOR_TOOL])] : undefined;
+	if (childTools) args.push("--tools", childTools.join(","));
 	// A child that rediscovers the whole skill catalogue pays for it on every dispatch, and the
 	// task it was handed is narrower than the catalogue. Repository context is the opposite: a
 	// delegated edit should respect the conventions of the repo it runs in.
@@ -568,6 +626,8 @@ async function runSingleAgent(
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
 	let tmpSessionDir: string | null = null;
+	let ipcDir: string | null = null;
+	let supervisorTimer: ReturnType<typeof setInterval> | null = null;
 
 	const currentResult: SingleResult = {
 		agent: agentName,
@@ -591,6 +651,10 @@ async function runSingleAgent(
 	};
 
 	try {
+		if (dispatchDefaults.supervise) {
+			ipcDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-ipc-"));
+		}
+
 		if (forking && parentSession) {
 			// Fork from a sanitized copy, and keep the branch in a scratch session dir so delegated
 			// runs never show up in the operator's session list.
@@ -618,8 +682,27 @@ async function runSingleAgent(
 				cwd: cwd ?? defaultCwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
-				env: { ...process.env, [DEPTH_ENV_VAR]: String(currentDepth() + 1) },
+				env: {
+					...process.env,
+					[DEPTH_ENV_VAR]: String(currentDepth() + 1),
+					PI_SUBAGENT_AGENT: agent.name,
+					...(ipcDir ? { [IPC_ENV_VAR]: ipcDir } : {}),
+				},
 			});
+			if (ipcDir && dispatchDefaults.supervise) {
+				const dir = ipcDir;
+				const handle = dispatchDefaults.supervise;
+				let draining = false;
+				supervisorTimer = setInterval(() => {
+					// A reply can sit on a human for minutes; never start a second sweep over it.
+					if (draining) return;
+					draining = true;
+					void drainSupervisorRequests(dir, handle).finally(() => {
+						draining = false;
+					});
+				}, SUPERVISOR_POLL_MS);
+			}
+
 			let buffer = "";
 
 			const processLine = (line: string) => {
@@ -708,9 +791,16 @@ async function runSingleAgent(
 			} catch {
 				/* ignore */
 			}
+		if (supervisorTimer) clearInterval(supervisorTimer);
 		if (tmpSessionDir)
 			try {
 				fs.rmSync(tmpSessionDir, { recursive: true, force: true });
+			} catch {
+				/* ignore */
+			}
+		if (ipcDir)
+			try {
+				fs.rmSync(ipcDir, { recursive: true, force: true });
 			} catch {
 				/* ignore */
 			}
@@ -839,10 +929,82 @@ function makeSubagentParams(choices: ModelLike[], current: string | undefined) {
 	});
 }
 
-function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
-	// Running inside a spawned subagent: do not offer the tool again.
-	if (currentDepth() >= MAX_SUBAGENT_DEPTH) return;
+/**
+ * Child-facing half of the supervisor channel.
+ *
+ * A child that hits a real decision should be able to ask instead of guessing, and a guess is
+ * indistinguishable from an answer once it reaches the parent as prose. Registered only inside a
+ * spawned child, which is also the only place the tool could work: it needs the IPC directory the
+ * parent created for that run.
+ */
+function registerContactSupervisorTool(pi: ExtensionAPI) {
+	pi.registerTool({
+		name: SUPERVISOR_TOOL,
+		label: "Contact supervisor",
+		description: [
+			"Ask the session that dispatched you, which can reach the operator.",
+			"Use need_decision when a choice is genuinely the operator's to make and guessing would be wrong,",
+			"interview_request when you need structured input, and progress_update to report a discovery that",
+			"changes the plan without waiting for an answer.",
+			"Do not ask when instructions merely look restrictive: a no-edit instruction simply wins.",
+		].join(" "),
+		parameters: Type.Object({
+			reason: StringEnum(SUPERVISOR_REASONS, { description: "Why you are contacting the supervisor" }),
+			message: Type.String({ description: "The question or update, self-contained: the supervisor has not seen your context" }),
+		}),
 
+		async execute(_toolCallId, params, signal) {
+			const dir = process.env[IPC_ENV_VAR];
+			if (!dir) {
+				return {
+					content: [{ type: "text", text: "No supervisor channel is available. Proceed on your own judgement and say what you assumed." }],
+					isError: true,
+				};
+			}
+
+			const id = randomUUID();
+			const request: SupervisorRequest = {
+				id,
+				reason: params.reason as SupervisorReason,
+				message: params.message,
+				agent: process.env.PI_SUBAGENT_AGENT ?? "subagent",
+			};
+			// Write to a temp name first: the parent polls this directory and must never read a
+			// half-written request.
+			const finalPath = path.join(dir, `${id}.req.json`);
+			const stagingPath = `${finalPath}.partial`;
+			fs.writeFileSync(stagingPath, JSON.stringify(request), "utf8");
+			fs.renameSync(stagingPath, finalPath);
+
+			if (request.reason === "progress_update") {
+				return { content: [{ type: "text", text: "Update delivered to the supervisor." }] };
+			}
+
+			const replyPath = path.join(dir, `${id}.res.json`);
+			const deadline = Date.now() + SUPERVISOR_TIMEOUT_MS;
+			while (Date.now() < deadline) {
+				if (signal?.aborted) {
+					return { content: [{ type: "text", text: "Aborted while waiting for the supervisor." }], isError: true };
+				}
+				if (fs.existsSync(replyPath)) {
+					try {
+						const reply = JSON.parse(fs.readFileSync(replyPath, "utf8")) as { message?: string };
+						return { content: [{ type: "text", text: reply.message || "(empty reply)" }] };
+					} catch {
+						// Fall through and retry: the parent may still be writing.
+					}
+				}
+				await new Promise((resolve) => setTimeout(resolve, SUPERVISOR_POLL_MS));
+			}
+			return {
+				content: [{ type: "text", text: "The supervisor did not answer in time. Proceed on your own judgement and state the assumption you made." }],
+				isError: true,
+			};
+		},
+	});
+}
+
+function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 	const current = ctx.model ? modelKey(ctx.model) : undefined;
 	const choices = modelChoices(ctx);
 	const agents = discoverAgents(ctx.cwd, "user").agents;
@@ -873,6 +1035,21 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					const parts = splitModelKey(key);
 					return parts ? ctx.modelRegistry.find(parts.provider, parts.id) : undefined;
 				},
+				// Without a UI there is no operator to ask, so the channel is not offered at all
+				// rather than handing children a question that can only time out.
+				supervise: ctx.hasUI
+					? async (request) => {
+							if (request.reason === "progress_update") {
+								ctx.ui.notify(`[${request.agent}] ${request.message}`, "info");
+								return "";
+							}
+							const answer = await ctx.ui.input(`[${request.agent}] asks`, request.message);
+							return (
+								answer?.trim() ||
+								"No answer from the operator. Proceed on your own judgement and state the assumption you made."
+							);
+						}
+					: undefined,
 			};
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
@@ -1436,8 +1613,17 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 }
 
 export default function (pi: ExtensionAPI) {
+	// Inside a spawned child the tool to offer is the one pointing back up, not the one pointing
+	// further down: delegation stops at one level, but asking the operator does not.
+	const register = (ctx: ExtensionContext) => {
+		if (currentDepth() >= MAX_SUBAGENT_DEPTH) {
+			registerContactSupervisorTool(pi);
+			return;
+		}
+		registerSubagentTool(pi, ctx);
+	};
 	// The model enum is baked into the tool schema, so rebuild it whenever the catalogue behind it
 	// can change: session start (also fires for /new, /resume and /fork) and model selection.
-	pi.on("session_start", (_event, ctx) => registerSubagentTool(pi, ctx));
-	pi.on("model_select", (_event, ctx) => registerSubagentTool(pi, ctx));
+	pi.on("session_start", (_event, ctx) => register(ctx));
+	pi.on("model_select", (_event, ctx) => register(ctx));
 }

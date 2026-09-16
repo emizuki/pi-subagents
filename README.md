@@ -188,6 +188,35 @@ and left every `text` and `toolCall` block untouched.
 Forked children write into a scratch session directory, so delegated runs never appear in the
 operator's session list.
 
+## Asking instead of guessing
+
+A child that meets a real decision can ask, with `contact_supervisor`:
+
+| `reason` | Behaviour |
+|----------|-----------|
+| `need_decision` | Blocks until the operator answers |
+| `interview_request` | Blocks, for structured input |
+| `progress_update` | Does not block; surfaces a notification |
+
+The channel is a scratch directory created per dispatch and handed to the child through
+`PI_SUBAGENT_IPC_DIR`: the child writes `<id>.req.json`, the parent answers with `<id>.res.json`,
+both staged under a temporary name and renamed into place so neither side can read a half-written
+file. The parent claims a request by renaming it before awaiting the answer, so a reply that sits
+on a human for minutes is never handed out twice.
+
+Files rather than a socket, which is also what `nicobailon/pi-subagents` settled on: a request has
+to outlive the process that made it, and a socket dies with it. Requests are polled every 250 ms —
+imperceptible next to a human deciding.
+
+The tool is registered only inside a spawned child, and it is appended to that agent's `tools`
+allowlist automatically, since an agent with an explicit list could otherwise never reach it.
+Delegation stops at one level, but asking upward does not: the tool a child gets is the one
+pointing back up, not the one pointing further down.
+
+When the parent has no UI, the channel is not offered at all, rather than handing children a
+question that could only time out. A request that goes unanswered for ten minutes returns an
+instruction to proceed and state the assumption, which is also what an unreachable operator gets.
+
 ## Depth limit
 
 A subagent inherits this process's environment, so it loads the same packages and would
