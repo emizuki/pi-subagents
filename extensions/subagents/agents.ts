@@ -158,13 +158,16 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
 
 	const agentMap = new Map<string, AgentConfig>();
 
+	// Keyed case-insensitively, because lookup is: a user `recon` and a project `Recon` would
+	// otherwise both survive and dispatch would silently pick whichever was discovered first.
+	const put = (agent: AgentConfig) => agentMap.set(agent.name.toLowerCase(), agent);
 	if (scope === "both") {
-		for (const agent of userAgents) agentMap.set(agent.name, agent);
-		for (const agent of projectAgents) agentMap.set(agent.name, agent);
+		for (const agent of userAgents) put(agent);
+		for (const agent of projectAgents) put(agent);
 	} else if (scope === "user") {
-		for (const agent of userAgents) agentMap.set(agent.name, agent);
+		for (const agent of userAgents) put(agent);
 	} else {
-		for (const agent of projectAgents) agentMap.set(agent.name, agent);
+		for (const agent of projectAgents) put(agent);
 	}
 
 	return { agents: resolveAliasCollisions(Array.from(agentMap.values())), projectAgentsDir };

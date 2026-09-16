@@ -50,7 +50,8 @@ Use a chain: recon finds the auth code, then general-purpose adds a test for it
 | Parallel | `{ tasks: [...] }` | Concurrent (max 8 tasks, 4 at a time) |
 | Chain | `{ chain: [...] }` | Sequential, with a `{previous}` placeholder |
 
-Every mode accepts `model` and `thinking`, per task in parallel and chain mode.
+Every mode accepts `model`, `thinking` and `context`. In parallel and chain mode a per-item value
+wins over the top-level one, which applies to every item that does not set its own.
 
 ## Choosing a model
 
@@ -98,9 +99,12 @@ a level unsupported and a missing key means the level works up to `high` but lea
 and `max` unsupported. A model with `reasoning: false` supports only `off`.
 
 Because the model is chosen in the same call, the schema can only offer the union of levels
-across the offered models. The real check happens before the subprocess is spawned: an
-unsupported pair fails with the list of levels that model does accept, rather than being
-clamped silently by pi.
+across the offered models. The real check happens before the subprocess is spawned, and what it
+does depends on who asked. A level you passed on the call fails loudly, with the list of levels
+that model does accept. A level that was merely inherited — from the agent's `thinking:`, from
+`defaultThinking`, or from the session — is clamped down to the closest supported one instead,
+the same way `maxThinking` clamps: the caller asked for work, not for a particular amount of
+deliberation.
 
 The map differs per provider for the same model id, so validation is keyed on `provider/id`.
 
@@ -213,8 +217,9 @@ allowlist automatically, since an agent with an explicit list could otherwise ne
 Delegation stops at one level, but asking upward does not: the tool a child gets is the one
 pointing back up, not the one pointing further down.
 
-When the parent has no UI, the channel is not offered at all, rather than handing children a
-question that could only time out. A request that goes unanswered for ten minutes returns an
+When the parent has no UI there is nothing to ask, so no channel directory is created. The child
+still has the tool — registration depends only on depth — but calling it returns an immediate
+error telling it to proceed on its own judgement, rather than blocking until a timeout. A request that goes unanswered for ten minutes returns an
 instruction to proceed and state the assumption, which is also what an unreachable operator gets.
 
 ## Detached runs
@@ -225,7 +230,7 @@ instruction to proceed and state the assumption, which is also what an unreachab
 { agent: "general-purpose", task: "...", async: true }
   -> Started 4f2a9c31 (general-purpose), detached.
 
-{ action: "status" }                      // every run this session
+{ action: "status" }                      // every detached run this session
 { action: "status", id: "4f2a9c31" }      // one run, with its output once finished
 { action: "stop",   id: "4f2a9c31" }
 ```
@@ -257,8 +262,7 @@ finished child can be revived instead:
 { resume: "4f2a9c31", task: "The review found X. Fix it." }
 ```
 
-`async: true` works with `resume` as well, detaching the revived child. `model`, `thinking` and
-`context` are rejected on a resume rather than ignored: a revived child keeps the contract it was
+`async: true` works with `resume` as well, detaching the revived child. `model`, `thinking`, `context` and `cwd` are rejected on a resume rather than ignored: a revived child keeps the contract it was
 launched with, so silently dropping them would have been worse than refusing.
 
 A run that is still in flight cannot be resumed — two children appending to one transcript
@@ -274,7 +278,7 @@ task heading, and a chain lists `step N: run …` at the end — because three p
 the same agent are otherwise indistinguishable, and resuming the second of them is exactly the
 case this exists for.
 
-`{ action: "runs" }` lists retained runs and says `resumable` or `not resumable` for each, which
+`{ action: "runs" }` lists retained and in-flight runs and says `resumable` or `not resumable` for each, which
 is worth checking before building a plan around reviving one. A run with no retained session file
 reports `not resumable`; start a fresh agent of the same role and say that it is a fallback.
 
@@ -302,6 +306,7 @@ is useful; a tree of it is a bill.
 | `thinking` | inherit | Thinking level, independent of the model spec |
 | `inheritSkills` | `false` | Whether the child rediscovers pi's skill catalogue |
 | `inheritProjectContext` | `true` | Whether the child loads `AGENTS.md` / `CLAUDE.md` from its cwd |
+| `defaultContext` | `fresh` | `fork` makes this agent prefer a branched transcript, degrading to fresh when the parent has none |
 
 `aliases` exists because callers reach for habitual names. Superpowers, for instance, hardcodes
 `Subagent (general-purpose):` in its dispatch templates, and models improvise around it with
@@ -322,7 +327,8 @@ a repo-controlled prompt without the prompt that a canonical name would have tri
 {
   "subagents": {
     "defaultThinking": "low",
-    "maxThinking": "high"
+    "maxThinking": "high",
+    "defaultContext": "fresh"
   }
 }
 ```
@@ -330,7 +336,9 @@ a repo-controlled prompt without the prompt that a canonical name would have tri
 `defaultThinking` applies to agents that specify no thinking level of their own, independent of
 the parent session's level. `maxThinking` is a ceiling: a request above it is clamped, not
 rejected, because the caller asked for work rather than for a particular amount of deliberation.
-Both are read fresh on each dispatch, project settings overriding user settings.
+Both are read fresh on each dispatch, project settings overriding user settings. The project
+file is found by walking up from the working directory, the same way project agents are, so
+running pi from a subdirectory still picks up the repository's settings.
 
 ## Agent definitions
 
@@ -361,7 +369,7 @@ confirmation unless `confirmProjectAgents: false` is set.
 
 ## Limitations
 
-- Collapsed view shows the last 10 items; Ctrl+O expands.
+- Collapsed view shows the last 10 items in single mode, 5 per step or task in chain and parallel; Ctrl+O expands.
 - Parallel model-visible output is capped at 50 KB per task.
 - Agents are rediscovered on each invocation, so they can be edited mid-session.
 - Parallel mode is limited to 8 tasks, 4 concurrent.

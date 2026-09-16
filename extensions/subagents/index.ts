@@ -475,8 +475,22 @@ function readSettingsFile(file: string): Record<string, unknown> | undefined {
 }
 
 /** `subagents` settings, project overriding user, read fresh so edits apply without a restart. */
+/** Walk up for the project settings file, the way project agents are already discovered. */
+function findProjectSettings(cwd: string): string | undefined {
+	let dir = path.resolve(cwd);
+	for (;;) {
+		const candidate = path.join(dir, CONFIG_DIR_NAME, "settings.json");
+		if (fs.existsSync(candidate)) return candidate;
+		const parent = path.dirname(dir);
+		if (parent === dir) return undefined;
+		dir = parent;
+	}
+}
+
 function readSubagentSettings(cwd: string): SubagentSettings {
-	const files = [path.join(getAgentDir(), "settings.json"), path.join(cwd, CONFIG_DIR_NAME, "settings.json")];
+	const files = [path.join(getAgentDir(), "settings.json"), findProjectSettings(cwd)].filter(
+		(file): file is string => Boolean(file),
+	);
 	const merged: SubagentSettings = {};
 	for (const file of files) {
 		const raw = readSettingsFile(file)?.subagents as Record<string, unknown> | undefined;
@@ -556,6 +570,16 @@ function findSessionFile(runDir: string): string | undefined {
 
 const STALE_TEMP_AGE_MS = 24 * 60 * 60 * 1000;
 
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		// EPERM means it exists and belongs to someone else, which still counts as alive.
+		return (error as NodeJS.ErrnoException)?.code === "EPERM";
+	}
+}
+
 /**
  * Remove scratch directories left by earlier runs.
  *
@@ -574,6 +598,10 @@ function sweepStaleTempDirs(): void {
 	}
 	for (const entry of entries) {
 		if (!entry.isDirectory() || !entry.name.startsWith("pi-subagent-")) continue;
+		// A retention root's mtime only moves when a dispatch adds a directory, so a long quiet
+		// session would look stale; never sweep one whose owning process is still alive.
+		const owner = /^pi-subagent-runs-(\d+)$/.exec(entry.name)?.[1];
+		if (owner && isProcessAlive(Number(owner))) continue;
 		const full = path.join(os.tmpdir(), entry.name);
 		try {
 			if (fs.statSync(full).mtimeMs > cutoff) continue;
@@ -616,6 +644,22 @@ interface AsyncRun {
  * run started in one tool call is still addressable from the next.
  */
 const asyncRuns = new Map<string, AsyncRun>();
+
+/**
+ * Run ids with a live child, detached or not.
+ *
+ * `asyncRuns` state flips to "stopped" the moment abort is requested, but the child still has
+ * SIGKILL_GRACE_MS to exit and is still flushing its transcript. Resuming against that file would
+ * put a second pi on it. Synchronous runs never enter `asyncRuns` at all, so they need the same
+ * bookkeeping.
+ */
+const runsInFlight = new Set<string>();
+
+const LISTED_RUN_CHARS = 800;
+
+function truncateForListing(text: string): string {
+	return text.length <= LISTED_RUN_CHARS ? text : `${text.slice(0, LISTED_RUN_CHARS)}…\n  (ask for this run by id for the rest)`;
+}
 
 function describeAsyncRun(run: AsyncRun): string {
 	const seconds = Math.round(((run.finishedAt ?? Date.now()) - run.startedAt) / 1000);
@@ -672,8 +716,9 @@ async function drainSupervisorRequests(dir: string, handle: SupervisorHandler): 
 		try {
 			answer = await handle(request);
 		} catch {
-			// A cancelled prompt is not a reason to stop answering the others.
-			continue;
+			// A cancelled prompt still has to release the child: the request is already claimed and
+			// can never be handed out again, so saying nothing leaves it blocked until its deadline.
+			answer = "No answer from the operator. Proceed on your own judgement and state the assumption you made.";
 		}
 		if (request.reason === "progress_update") continue;
 		const replyPath = path.join(dir, `${request.id}.res.json`);
@@ -832,11 +877,13 @@ async function runSingleAgent(
 	let supervisorTimer: ReturnType<typeof setInterval> | null = null;
 
 	const currentResult: SingleResult = {
+		// -1 until the process closes. The parallel view counts anything else as finished, and this
+		// object is published live, so starting at 0 made a task read as done on its first message.
+		exitCode: -1,
 		runId: retain?.id,
 		agent: agentName,
 		agentSource: agent.source,
 		task,
-		exitCode: 0,
 		messages: [],
 		stderr: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
@@ -853,6 +900,7 @@ async function runSingleAgent(
 		}
 	};
 
+	if (retain) runsInFlight.add(retain.id);
 	try {
 		if (dispatchDefaults.supervise) {
 			ipcDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-ipc-"));
@@ -1035,6 +1083,7 @@ async function runSingleAgent(
 			} catch {
 				/* ignore */
 			}
+		if (retain) runsInFlight.delete(retain.id);
 		if (supervisorTimer) clearInterval(supervisorTimer);
 		if (forkSource)
 			try {
@@ -1319,6 +1368,26 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 			const agents = discovery.agents;
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
 
+			if (params.action) {
+				// Same shape as the async/resume rejections below: an action returns before any mode
+				// runs, so a dispatch passed alongside one would be answered with a listing and
+				// silently never executed.
+				const dispatchKeys = (["agent", "task", "tasks", "chain", "resume", "async", "model", "thinking", "context"] as const).filter(
+					(key) => params[key] !== undefined,
+				);
+				if (dispatchKeys.length > 0) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `action: "${params.action}" inspects runs and dispatches nothing, so ${dispatchKeys.join(", ")} would be ignored. Make the dispatch in its own call.`,
+							},
+						],
+						isError: true,
+					};
+				}
+			}
+
 			if (params.action === "status") {
 				const runs = params.id
 					? [asyncRuns.get(params.id)].filter((r): r is AsyncRun => Boolean(r))
@@ -1327,15 +1396,25 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					const text = params.id ? `No run with id "${params.id}".` : "No detached runs in this session.";
 					return { content: [{ type: "text", text }], isError: Boolean(params.id) };
 				}
-				return { content: [{ type: "text", text: runs.map(describeAsyncRun).join("\n\n") }] };
+				// One run by id prints in full; the whole list is a summary, or a long session drops
+				// every finished transcript into context at once.
+				const rendered = params.id
+					? runs.map((r) => describeAsyncRun(r))
+					: runs.map((r) => truncateForListing(describeAsyncRun(r)));
+				return { content: [{ type: "text", text: rendered.join("\n\n") }] };
 			}
 
 			if (params.action === "runs") {
 				// A retained record only appears once the child exits, so an in-flight detached run
 				// would otherwise be invisible here while `status` reports it running — two views of
 				// the same run disagreeing, which reads as "that run does not exist".
-				const lines = [...retainedRuns.values()].map(
-					(r) => `${r.id}  ${r.agent}  ${r.resumable ? "resumable" : "not resumable"}${r.model ? `  ${r.model}` : ""}`,
+				// Liveness first: a resumed run reuses its retained id, so a record exists while the
+				// revived child is still going. Printing that record would call it resumable while
+				// `status` calls it running — the disagreement this merge exists to remove.
+				const lines = [...retainedRuns.values()].map((r) =>
+					runsInFlight.has(r.id)
+						? `${r.id}  ${r.agent}  still running, not resumable yet`
+						: `${r.id}  ${r.agent}  ${r.resumable ? "resumable" : "not resumable"}${r.model ? `  ${r.model}` : ""}`,
 				);
 				for (const run of asyncRuns.values()) {
 					if (run.state !== "running" || retainedRuns.has(run.id)) continue;
@@ -1493,7 +1572,11 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 						step.agent,
 						taskWithContext,
 						step.cwd,
-						{ model: step.model, thinking: step.thinking, context: step.context },
+						{
+							model: step.model ?? params.model,
+							thinking: step.thinking ?? params.thinking,
+							context: step.context ?? params.context,
+						},
 						i + 1,
 						{ id: newRunId() },
 						signal,
@@ -1577,7 +1660,11 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 						t.agent,
 						t.task,
 						t.cwd,
-						{ model: t.model, thinking: t.thinking, context: t.context },
+						{
+							model: t.model ?? params.model,
+							thinking: t.thinking ?? params.thinking,
+							context: t.context ?? params.context,
+						},
 						undefined,
 						{ id: newRunId() },
 						signal,
@@ -1636,7 +1723,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 						isError: true,
 					};
 				}
-				if (asyncRuns.get(target.id)?.state === "running") {
+				if (runsInFlight.has(target.id)) {
 					return {
 						content: [
 							{
@@ -1662,6 +1749,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					params.model ? "model" : undefined,
 					params.thinking ? "thinking" : undefined,
 					params.context ? "context" : undefined,
+					params.cwd ? "cwd" : undefined,
 				].filter(Boolean);
 				if (ignored.length > 0) {
 					return {
@@ -1698,7 +1786,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					agents,
 					params.agent ?? resumeTarget?.agent ?? "",
 					params.task,
-					params.cwd ?? resumeTarget?.cwd,
+					resumeTarget ? resumeTarget.cwd : params.cwd,
 					{ model: params.model, thinking: params.thinking, context: params.context },
 					undefined,
 					{ id, resume: resumeTarget },
@@ -1739,7 +1827,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					agents,
 					params.agent ?? resumeTarget?.agent ?? "",
 					params.task,
-					params.cwd ?? resumeTarget?.cwd,
+					resumeTarget ? resumeTarget.cwd : params.cwd,
 					{ model: params.model, thinking: params.thinking, context: params.context },
 					undefined,
 					{ id: singleRunId, resume: resumeTarget },
@@ -1917,7 +2005,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 			};
 
 			if (details.mode === "chain") {
-				const successCount = details.results.filter((r) => r.exitCode === 0).length;
+				const successCount = details.results.filter((r) => !isFailedResult(r)).length;
 				const icon = successCount === details.results.length ? theme.fg("success", "✓") : theme.fg("error", "✗");
 
 				if (expanded) {
@@ -1934,9 +2022,12 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					);
 
 					for (const r of details.results) {
-						const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+						const rIcon = isFailedResult(r) ? theme.fg("error", "✗") : theme.fg("success", "✓");
 						const displayItems = getDisplayItems(r.messages);
 						const finalOutput = getFinalOutput(r.messages);
+						// A spawn failure has neither tool calls nor output, so without this the
+						// expanded view shows less than the collapsed one it was opened from.
+						const rFailure = getFailureText(r);
 
 						container.addChild(new Spacer(1));
 						container.addChild(
@@ -1947,6 +2038,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 							),
 						);
 						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
+						if (rFailure) container.addChild(new Text(theme.fg("error", `Error: ${rFailure}`), 0, 0));
 
 						// Show tool calls
 						for (const item of displayItems) {
@@ -1986,7 +2078,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					theme.fg("toolTitle", theme.bold("chain ")) +
 					theme.fg("accent", `${successCount}/${details.results.length} steps`);
 				for (const r of details.results) {
-					const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+					const rIcon = isFailedResult(r) ? theme.fg("error", "✗") : theme.fg("success", "✓");
 					const displayItems = getDisplayItems(r.messages);
 					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
 					const stepFailure = getFailureText(r);
@@ -2028,12 +2120,16 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 						const rIcon = isFailedResult(r) ? theme.fg("error", "✗") : theme.fg("success", "✓");
 						const displayItems = getDisplayItems(r.messages);
 						const finalOutput = getFinalOutput(r.messages);
+						// A spawn failure has neither tool calls nor output, so without this the
+						// expanded view shows less than the collapsed one it was opened from.
+						const rFailure = getFailureText(r);
 
 						container.addChild(new Spacer(1));
 						container.addChild(
 							new Text(`${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${rIcon}`, 0, 0),
 						);
 						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
+						if (rFailure) container.addChild(new Text(theme.fg("error", `Error: ${rFailure}`), 0, 0));
 
 						// Show tool calls
 						for (const item of displayItems) {
@@ -2124,11 +2220,11 @@ export default function (pi: ExtensionAPI) {
 		}
 		// A killed child has up to SIGKILL_GRACE_MS left and is still writing its session into the
 		// retention root. Deleting it out from under a dying process only manufactures errors.
-		// A killed child keeps writing into the retention root for up to SIGKILL_GRACE_MS, so
-		// deleting it immediately manufactures errors in a dying process. But an unref'd timer does
-		// not survive process exit, which leaked the root whenever anything was aborted, so clear
-		// synchronously too: the delayed sweep is best-effort tidying, not the guarantee.
-		if (stopped > 0) setTimeout(clearRetainedRuns, SIGKILL_GRACE_MS + 1_000).unref?.();
+		// Synchronously, and only synchronously. The retention root is keyed on the process id, not
+		// the session, and session_shutdown also fires for /new, /resume and /fork — so a delayed
+		// sweep would delete the *next* session's root while its children were writing into it.
+		// Whatever a dying child still writes lands in a directory that is already gone, which is
+		// harmless; outliving the sweep and corrupting a live session is not.
 		clearRetainedRuns();
 		asyncRuns.clear();
 	});
