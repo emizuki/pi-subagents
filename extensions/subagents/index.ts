@@ -470,6 +470,65 @@ function thinkingRank(level: ThinkingLevel): number {
 
 type SupervisorHandler = (request: SupervisorRequest) => Promise<string>;
 
+/**
+ * Retained child sessions for this parent session. A reviewer that finds a fault is only useful
+ * if the agent that wrote the code can be handed that finding — which needs its session back,
+ * not a fresh child re-derived from a task description.
+ */
+const retentionRoot = path.join(os.tmpdir(), `pi-subagent-runs-${process.pid}`);
+
+interface RetainedRun {
+	id: string;
+	agent: string;
+	/** The resolved launch contract. A resumed child keeps it rather than re-deriving it. */
+	model?: string;
+	thinking?: ThinkingLevel;
+	tools?: string[];
+	cwd?: string;
+	runDir: string;
+	sessionFile?: string;
+	resumable: boolean;
+}
+
+const retainedRuns = new Map<string, RetainedRun>();
+
+/** pi names the session itself, so find it rather than assuming a path. */
+function findSessionFile(runDir: string): string | undefined {
+	const stack = [runDir];
+	let newest: { file: string; mtime: number } | undefined;
+	while (stack.length > 0) {
+		const dir = stack.pop() as string;
+		let entries: fs.Dirent[];
+		try {
+			entries = fs.readdirSync(dir, { withFileTypes: true });
+		} catch {
+			continue;
+		}
+		for (const entry of entries) {
+			const full = path.join(dir, entry.name);
+			if (entry.isDirectory()) stack.push(full);
+			else if (entry.name.endsWith(".jsonl")) {
+				const mtime = fs.statSync(full).mtimeMs;
+				if (!newest || mtime > newest.mtime) newest = { file: full, mtime };
+			}
+		}
+	}
+	return newest?.file;
+}
+
+function newRunId(): string {
+	return randomUUID().slice(0, 8);
+}
+
+function clearRetainedRuns(): void {
+	retainedRuns.clear();
+	try {
+		fs.rmSync(retentionRoot, { recursive: true, force: true });
+	} catch {
+		/* ignore */
+	}
+}
+
 type AsyncRunState = "running" | "complete" | "failed" | "stopped";
 
 interface AsyncRun {
@@ -568,11 +627,14 @@ async function runSingleAgent(
 	cwd: string | undefined,
 	overrides: TaskOverrides,
 	step: number | undefined,
+	/** Retain this run's session under this id so it can be resumed, or revive an existing one. */
+	retain: { id: string; resume?: RetainedRun } | undefined,
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 ): Promise<SingleResult> {
-	const agent = findAgent(agents, agentName);
+	const resuming = retain?.resume;
+	const agent = resuming ? findAgent(agents, resuming.agent) : findAgent(agents, agentName);
 
 	if (!agent) {
 		const available = agents.map((a) => `"${describeAgent(a)}"`).join(", ") || "none";
@@ -592,18 +654,19 @@ async function runSingleAgent(
 	// Precedence: per-call override > agent frontmatter > dispatching session.
 	const explicitSpec = overrides.model ?? agent.model;
 	const explicit = explicitSpec ? splitThinkingSuffix(explicitSpec) : undefined;
-	const model = explicit?.model ?? dispatchDefaults.model;
+	const model = resuming ? resuming.model : (explicit?.model ?? dispatchDefaults.model);
 
 	const settings = readSubagentSettings(cwd ?? defaultCwd);
 	const frontmatterThinking = isThinkingLevel(agent.thinking) ? agent.thinking : undefined;
 	// An explicit model does not inherit the session's thinking level, but a per-call `thinking`,
 	// the agent's own `thinking:`, and a configured default all still apply.
-	let thinking =
-		overrides.thinking ??
-		frontmatterThinking ??
-		explicit?.thinking ??
-		settings.defaultThinking ??
-		(explicit ? undefined : dispatchDefaults.thinkingLevel);
+	let thinking = resuming
+		? resuming.thinking
+		: (overrides.thinking ??
+			frontmatterThinking ??
+			explicit?.thinking ??
+			settings.defaultThinking ??
+			(explicit ? undefined : dispatchDefaults.thinkingLevel));
 
 	// A ceiling is a budget control, so clamp rather than fail: the caller asked for work, not for
 	// a particular amount of deliberation, and refusing the whole dispatch helps nobody.
@@ -634,7 +697,11 @@ async function runSingleAgent(
 	if (model) args.push("--model", model);
 	if (thinking) args.push("--thinking", thinking);
 	// An agent with an explicit allowlist would otherwise be unable to reach the channel at all.
-	const childTools = agent.tools && agent.tools.length > 0 ? [...new Set([...agent.tools, SUPERVISOR_TOOL])] : undefined;
+	const childTools = resuming
+		? resuming.tools
+		: agent.tools && agent.tools.length > 0
+			? [...new Set([...agent.tools, SUPERVISOR_TOOL])]
+			: undefined;
 	if (childTools) args.push("--tools", childTools.join(","));
 	// A child that rediscovers the whole skill catalogue pays for it on every dispatch, and the
 	// task it was handed is narrower than the catalogue. Repository context is the opposite: a
@@ -698,9 +765,22 @@ async function runSingleAgent(
 			ipcDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-ipc-"));
 		}
 
-		if (forking && parentSession) {
-			// Fork from a sanitized copy, and keep the branch in a scratch session dir so delegated
-			// runs never show up in the operator's session list.
+		if (resuming) {
+			// Revive the stored session in place; the launch contract came from the record, not
+			// from re-resolving the agent, so the child picks up exactly where it left off.
+			args.push("--session", resuming.sessionFile as string, "--session-dir", resuming.runDir);
+		} else if (retain) {
+			// Keep the child's session so a later pass can hand it a review finding. It lives under
+			// this process's retention root, never the operator's session directory.
+			const runDir = path.join(retentionRoot, retain.id);
+			fs.mkdirSync(runDir, { recursive: true });
+			if (forking && parentSession) {
+				const source = path.join(runDir, "parent.jsonl");
+				sanitizeSessionForFork(parentSession, source);
+				args.push("--fork", source);
+			}
+			args.push("--session-dir", runDir);
+		} else if (forking && parentSession) {
 			tmpSessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-fork-"));
 			const source = path.join(tmpSessionDir, "parent.jsonl");
 			sanitizeSessionForFork(parentSession, source);
@@ -709,7 +789,7 @@ async function runSingleAgent(
 			args.push("--no-session");
 		}
 
-		if (agent.systemPrompt.trim()) {
+		if (!resuming && agent.systemPrompt.trim()) {
 			const tmp = await writePromptToTempFile(agent.name, agent.systemPrompt);
 			tmpPromptDir = tmp.dir;
 			tmpPromptPath = tmp.filePath;
@@ -819,6 +899,23 @@ async function runSingleAgent(
 		});
 
 		currentResult.exitCode = exitCode;
+		if (retain) {
+			const runDir = resuming ? resuming.runDir : path.join(retentionRoot, retain.id);
+			const sessionFile = findSessionFile(runDir);
+			retainedRuns.set(retain.id, {
+				id: retain.id,
+				agent: agent.name,
+				model,
+				thinking,
+				tools: childTools,
+				cwd,
+				runDir,
+				sessionFile,
+				// Without a session file there is nothing to revive, so say so rather than letting a
+				// later resume discover it.
+				resumable: Boolean(sessionFile),
+			});
+		}
 		if (wasAborted) throw new Error("Subagent was aborted");
 		return currentResult;
 	} finally {
@@ -976,8 +1073,15 @@ function makeSubagentParams(choices: ModelLike[], current: string | undefined) {
 			}),
 		),
 		action: Type.Optional(
-			StringEnum(["status", "stop"] as const, {
-				description: 'Inspect detached runs ("status", optionally with id) or end one ("stop", with id).',
+			StringEnum(["status", "stop", "runs"] as const, {
+				description:
+					'Inspect detached runs ("status", optionally with id), end one ("stop", with id), or list resumable runs ("runs").',
+			}),
+		),
+		resume: Type.Optional(
+			Type.String({
+				description:
+					"Run id to revive instead of starting a new child, with task as the follow-up. Mutually exclusive with agent; the revived child keeps its original agent, model and tools.",
 			}),
 		),
 		id: Type.Optional(Type.String({ description: "Run id, for status or stop" })),
@@ -1121,6 +1225,17 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 				return { content: [{ type: "text", text: runs.map(describeAsyncRun).join("\n\n") }] };
 			}
 
+			if (params.action === "runs") {
+				const runs = [...retainedRuns.values()];
+				if (runs.length === 0) {
+					return { content: [{ type: "text", text: "No retained runs in this session." }] };
+				}
+				const lines = runs.map(
+					(r) => `${r.id}  ${r.agent}  ${r.resumable ? "resumable" : "not resumable"}${r.model ? `  ${r.model}` : ""}`,
+				);
+				return { content: [{ type: "text", text: lines.join("\n") }] };
+			}
+
 			if (params.action === "stop") {
 				const run = params.id ? asyncRuns.get(params.id) : undefined;
 				if (!run) {
@@ -1137,7 +1252,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 
 			const hasChain = (params.chain?.length ?? 0) > 0;
 			const hasTasks = (params.tasks?.length ?? 0) > 0;
-			const hasSingle = Boolean(params.agent && params.task);
+			const hasSingle = Boolean((params.agent || params.resume) && params.task);
 			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
 
 			const makeDetails =
@@ -1226,6 +1341,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 						step.cwd,
 						{ model: step.model, thinking: step.thinking, context: step.context },
 						i + 1,
+						{ id: newRunId() },
 						signal,
 						chainUpdate,
 						makeDetails("chain"),
@@ -1300,6 +1416,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 						t.cwd,
 						{ model: t.model, thinking: t.thinking, context: t.context },
 						undefined,
+						{ id: newRunId() },
 						signal,
 						// Per-task update callback
 						(partial) => {
@@ -1334,8 +1451,41 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 				};
 			}
 
+			if (params.resume && params.agent) {
+				return {
+					content: [
+						{ type: "text", text: "Pass either resume or agent, not both: a revived child keeps its own contract." },
+					],
+					isError: true,
+				};
+			}
+
+			let resumeTarget: RetainedRun | undefined;
+			if (params.resume) {
+				const target = retainedRuns.get(params.resume);
+				if (!target) {
+					const known = [...retainedRuns.keys()].join(", ") || "none";
+					return {
+						content: [{ type: "text", text: `No retained run "${params.resume}". Known runs: ${known}.` }],
+						isError: true,
+					};
+				}
+				if (!target.resumable || !target.sessionFile) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Run ${target.id} is not resumable: no session was retained for it. Start a fresh ${target.agent} instead, and say that it is a fallback.`,
+							},
+						],
+						isError: true,
+					};
+				}
+				resumeTarget = target;
+			}
+
 			if (params.agent && params.task && params.async) {
-				const id = randomUUID().slice(0, 8);
+				const id = newRunId();
 				// Its own controller, never the tool call\'s: that signal fires the moment this call
 				// returns, which for a detached run is immediately.
 				const controller = new AbortController();
@@ -1358,6 +1508,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					params.cwd,
 					{ model: params.model, thinking: params.thinking, context: params.context },
 					undefined,
+					{ id },
 					controller.signal,
 					// No live rendering: this tool call is already over by the time output arrives.
 					undefined,
@@ -1387,16 +1538,18 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 				};
 			}
 
-			if (params.agent && params.task) {
+			if ((params.agent || resumeTarget) && params.task) {
+				const singleRunId = resumeTarget ? resumeTarget.id : newRunId();
 				const result = await runSingleAgent(
 					ctx.cwd,
 					dispatchDefaults,
 					agents,
-					params.agent,
+					params.agent ?? resumeTarget?.agent ?? "",
 					params.task,
-					params.cwd,
+					params.cwd ?? resumeTarget?.cwd,
 					{ model: params.model, thinking: params.thinking, context: params.context },
 					undefined,
+					{ id: singleRunId, resume: resumeTarget },
 					signal,
 					onUpdate,
 					makeDetails("single"),
@@ -1764,6 +1917,7 @@ export default function (pi: ExtensionAPI) {
 	// exit, still burning tokens against a session nobody is watching any more.
 	pi.on("session_shutdown", (_event, ctx) => {
 		const stopped = abortAllAsyncRuns();
+		clearRetainedRuns();
 		if (stopped > 0 && ctx.hasUI) {
 			ctx.ui.notify(`Stopped ${stopped} detached subagent run${stopped === 1 ? "" : "s"}.`, "info");
 		}

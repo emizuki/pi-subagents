@@ -239,8 +239,29 @@ watching.
 Parallel and chain stay synchronous. They already run concurrently, and the reason to detach is
 to stop waiting, which is not the same problem.
 
-`resume` is not implemented. Reviving a finished child means keeping its session, and children
-run `--no-session` on purpose; retention is a separate decision rather than an oversight.
+## Resuming a child
+
+A reviewer that finds a fault is only useful if the agent that wrote the code can be handed that
+finding. Re-dispatching a fresh child from a task description loses everything it learned, so a
+finished child can be revived instead:
+
+```
+{ agent: "general-purpose", task: "Implement the parser" }   -> run 4f2a9c31
+{ agent: "recon", task: "Review what changed" }              -> finds a fault
+{ resume: "4f2a9c31", task: "The review found X. Fix it." }
+```
+
+`resume` and `agent` are mutually exclusive. A revived child keeps its stored agent, model,
+thinking level and tool allowlist rather than re-deriving them, and its system prompt is not
+appended again — the session already carries it.
+
+`{ action: "runs" }` lists retained runs and says `resumable` or `not resumable` for each, which
+is worth checking before building a plan around reviving one. A run with no retained session file
+reports `not resumable`; start a fresh agent of the same role and say that it is a fallback.
+
+This is why children no longer run `--no-session`. Each run gets a session under a retention root
+belonging to this process, never the operator's session directory, and the whole root is deleted
+on session shutdown. Retention is per parent session and does not survive a restart.
 
 ## Depth limit
 
