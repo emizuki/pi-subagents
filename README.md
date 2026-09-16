@@ -121,7 +121,7 @@ with `--models` or `enabledModels` once you know which models your account actua
 
 | Agent | For |
 |-------|-----|
-| `general-purpose` | Open-ended research and multi-step work; read-only tools |
+| `general-purpose` | Anything open-ended: investigate, then act; full tools |
 | `scout` | Fast recon, returns compressed findings |
 | `planner` | Turns a request into an implementation plan |
 | `reviewer` | Reviews a change |
