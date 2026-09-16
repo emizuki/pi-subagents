@@ -1623,6 +1623,9 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 							},
 						],
 						details: makeDetails("parallel")([]),
+						// Every neighbouring guard marks itself an error; without it a caller that
+						// miscounts a batch reads a rejection as a success that returned no results.
+						isError: true,
 					};
 
 				// Track all results for streaming updates
