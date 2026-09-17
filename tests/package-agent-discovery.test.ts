@@ -284,3 +284,138 @@ test("a malformed settings file logs one diagnostic naming it and still resolves
 		new RegExp(path.join(project, ".pi", "settings.json").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
 	);
 });
+
+test("a malformed settings file logs its diagnostic at most once per file path across multiple discovery calls", () => {
+	const { agentDir, project } = fixture();
+	fs.writeFileSync(path.join(agentDir, "settings.json"), "{not-json");
+
+	const { errors: firstCallErrors } = captureConsoleError(() =>
+		discoverPackageAgentDirectories(project, "user", false),
+	);
+	const { errors: secondCallErrors } = captureConsoleError(() =>
+		discoverPackageAgentDirectories(project, "user", false),
+	);
+	const { errors: thirdCallErrors } = captureConsoleError(() =>
+		discoverPackageAgentDirectories(project, "user", false),
+	);
+
+	// The condition is sticky (the file stays malformed), so without deduplication this diagnostic
+	// would print on every dispatch for the life of the session, into a live pi-tui frame.
+	assert.equal(firstCallErrors.length, 1, "expected the first call to log the diagnostic once");
+	assert.equal(secondCallErrors.length, 0, "expected the second call not to repeat the diagnostic");
+	assert.equal(thirdCallErrors.length, 0, "expected the third call not to repeat the diagnostic");
+});
+
+test("strips a UTF-8 BOM before parsing settings.json", () => {
+	const { agentDir, project } = fixture();
+	const packageRoot = path.join(agentDir, "npm", "node_modules", "bom-agents");
+	writePackage(packageRoot, "bom-agents");
+	// PowerShell 5.1's Set-Content/Out-File write a BOM by default; Pi core's own SettingsManager
+	// strips it (`settings-manager.js` uses `stripBom` before `JSON.parse`), so this resolver must
+	// match that behavior rather than fail to parse a settings.json Pi itself reads fine.
+	const bomPrefixed = "\uFEFF" + JSON.stringify({ packages: ["npm:bom-agents"] });
+	fs.writeFileSync(path.join(agentDir, "settings.json"), bomPrefixed);
+
+	const { result: found, errors } = captureConsoleError(() =>
+		discoverPackageAgentDirectories(project, "user", false),
+	);
+
+	assert.deepEqual(found.map((entry) => entry.dir), [path.join(packageRoot, "agents")]);
+	assert.deepEqual(errors, [], "a BOM-prefixed settings.json is valid JSON once stripped, not a parse failure");
+});
+
+test("strips a UTF-8 BOM before parsing a package's package.json", () => {
+	const { agentDir, project } = fixture();
+	const packageRoot = path.join(agentDir, "npm", "node_modules", "bom-manifest-agents");
+	fs.mkdirSync(path.join(packageRoot, "agents"), { recursive: true });
+	// Pi core's own package-manifest reader (`pi-manifest.js`) strips a leading BOM before
+	// `JSON.parse`; this resolver reimplements that read for `pi.subagents.agents` and must match.
+	const bomPrefixed =
+		"\uFEFF" + JSON.stringify({ name: "bom-manifest-agents", pi: { subagents: { agents: ["./agents"] } } });
+	fs.writeFileSync(path.join(packageRoot, "package.json"), bomPrefixed);
+	fs.writeFileSync(
+		path.join(agentDir, "settings.json"),
+		JSON.stringify({ packages: ["npm:bom-manifest-agents"] }),
+	);
+
+	const found = discoverPackageAgentDirectories(project, "user", false);
+
+	assert.deepEqual(found.map((entry) => entry.dir), [path.join(packageRoot, "agents")]);
+});
+
+/**
+ * A tiny "npm" stand-in that appends one line to a log file every time it runs, so tests can count
+ * invocations of the legacy global-npm-root fallback (`npm root -g`, or `pnpm list -g ...` for
+ * pnpm) without depending on a real npm/pnpm installation. Prints an arbitrary path to stdout and
+ * exits 0, matching what `runCommandSync` in `DefaultPackageManager` requires to not throw.
+ */
+function writeCountingNpmScript(scriptPath: string): void {
+	fs.writeFileSync(
+		scriptPath,
+		[
+			'const fs = require("node:fs");',
+			"fs.appendFileSync(process.argv[2], \"run\\n\");",
+			"console.log(process.argv[2]);",
+			"",
+		].join("\n"),
+	);
+}
+
+function countRuns(logFile: string): number {
+	if (!fs.existsSync(logFile)) return 0;
+	return fs.readFileSync(logFile, "utf8").split("\n").filter(Boolean).length;
+}
+
+test("memoizes the legacy global-npm-root fallback across discovery calls in the same process", () => {
+	const { root, agentDir, project } = fixture();
+	const logFile = path.join(root, "npm-calls.log");
+	const scriptPath = path.join(root, "fake-npm.cjs");
+	writeCountingNpmScript(scriptPath);
+	// A user-scope npm source with no managed install under agentDir/npm/node_modules falls back to
+	// the legacy global npm root, which DefaultPackageManager resolves by spawning the configured
+	// npmCommand synchronously — once per unmemoized call, blocking the event loop each time.
+	fs.writeFileSync(
+		path.join(agentDir, "settings.json"),
+		JSON.stringify({
+			packages: ["npm:@fixture/uninstalled-agents"],
+			npmCommand: [process.execPath, scriptPath, logFile],
+		}),
+	);
+
+	discoverPackageAgentDirectories(project, "user", false);
+	discoverPackageAgentDirectories(project, "user", false);
+
+	assert.equal(
+		countRuns(logFile),
+		1,
+		"expected the legacy npm-root fallback to run at most once across two discovery calls in one process",
+	);
+});
+
+test("a settings file edit invalidates the memoized install-path resolution", () => {
+	const { root, agentDir, project } = fixture();
+	const logFile = path.join(root, "npm-calls.log");
+	const scriptPath = path.join(root, "fake-npm.cjs");
+	writeCountingNpmScript(scriptPath);
+	const settingsFile = path.join(agentDir, "settings.json");
+	const settingsBody = JSON.stringify({
+		packages: ["npm:@fixture/uninstalled-agents"],
+		npmCommand: [process.execPath, scriptPath, logFile],
+	});
+	fs.writeFileSync(settingsFile, settingsBody);
+
+	discoverPackageAgentDirectories(project, "user", false);
+	assert.equal(countRuns(logFile), 1);
+
+	// Rewrite with semantically identical content but a different byte size (leading whitespace is
+	// valid, ignorable JSON), simulating a settings edit mid-session without depending on filesystem
+	// mtime resolution being fine-grained enough to differ within one test run.
+	fs.writeFileSync(settingsFile, ` ${settingsBody}`);
+	discoverPackageAgentDirectories(project, "user", false);
+
+	assert.equal(
+		countRuns(logFile),
+		2,
+		"expected the settings edit to invalidate the memo and re-run the legacy fallback",
+	);
+});
