@@ -452,8 +452,10 @@ own agent directories without any copy or symlink step, by declaring them under
   of this contract has no separate filter for selecting individual agent directories.
 - Package agents follow their package's own install scope, not a setting of their own: a
   user-scope install (plain `pi install`) is what makes them available at the default
-  `agentScope: "user"`. A project-scope install (`pi install --local`) makes them behave like a
-  `.pi/agents/*.md` file instead — they need `agentScope: "project"` or `"both"`.
+  `agentScope: "user"`. A project-scope install (`pi install --local`) makes them need
+  `agentScope: "project"` or `"both"`, the same as a `.pi/agents/*.md` file — but the two are not
+  otherwise equivalent: `.pi/agents` is found by walking up from the session cwd to find the
+  project root, while project-scoped package settings are read only at the session cwd exactly.
 - A project-scoped package declaration is read only once Pi reports the project trusted; an
   untrusted project's package list contributes no agents. There is therefore nothing for the
   repo-controlled-agent confirmation to prompt about on a fresh dispatch of a project-scoped
@@ -464,6 +466,10 @@ own agent directories without any copy or symlink step, by declaring them under
   value that is not an array of strings, and any other malformed declaration are all skipped
   silently, the same as a malformed Markdown agent file — one broken package never hides agents
   from another source.
+- An unreadable or malformed `settings.json` (either scope's) is different: it prints one
+  diagnostic line naming the file to stderr, at most once per file path for the life of the
+  process — not once per dispatch — so leaving it broken does not spam a live session. Fixing the
+  file takes effect on the next dispatch even though the earlier diagnostic is not reprinted.
 
 A package that currently relies on Pi's convention-based discovery for its other resources
 (skills, prompts, extensions, themes) and adds a `pi` manifest key for the first time, purely to
