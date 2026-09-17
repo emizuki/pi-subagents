@@ -970,69 +970,18 @@ test("retained project-agent trust cannot be bypassed by default resume scope", 
 	assert.equal(captureArgs(capture).length, 2);
 });
 
-test("a project-scoped package agent in an untrusted session must be confirmed before it runs", async () => {
-	const project = path.join(root, "package-agent-confirm-project");
-	const packageRoot = path.join(project, ".pi", "npm", "node_modules", "vendor-agents");
-	writePackageAgent(packageRoot, "vendor-agents", "vendor-worker.md", { name: "vendor-worker" });
-	writeFileSync(path.join(project, ".pi", "settings.json"), JSON.stringify({ packages: ["npm:vendor-agents"] }));
-	const capture = path.join(root, "package-agent-confirm-capture.jsonl");
-	setFakeMode("normal", capture);
-
-	const ctx = makeContext(project, { hasUI: true });
-	// The real trust engine cannot disagree with itself within one synchronous dispatch, so this
-	// fake models the two moments explicitly instead: discovery (the two calls below) sees a
-	// trusted project, matching how the project-scoped package setting was able to be read at all;
-	// the confirmation gate's own check, further down in the same call, sees an untrusted session.
-	// That isolates the gate's *predicate* (this test's subject) from discovery-time trust gating,
-	// which tests/package-agent-discovery.test.ts already covers on its own.
-	let trustQueries = 0;
-	ctx.isProjectTrusted = () => {
-		trustQueries += 1;
-		return trustQueries <= 2;
-	};
-	let confirmed: [string, string] | undefined;
-	ctx.ui.confirm = async (title: string, body: string) => {
-		confirmed = [title, body];
-		return true;
-	};
-
-	const result = await harness.execute({ agent: "vendor-worker", task: "first", agentScope: "both" }, ctx);
-
-	assert.ok(trustQueries >= 3, "expected the gate to re-check trust after discovery");
-	assert.ok(confirmed, "expected the confirmation dialog to be shown");
-	assert.equal(confirmed?.[0], "Run project-local agents?");
-	assert.match(confirmed?.[1] ?? "", /vendor-worker/);
-	assert.match(confirmed?.[1] ?? "", /vendor-agents/);
-	assert.doesNotMatch(confirmed?.[1] ?? "", /\(unknown\)/);
-	assert.doesNotMatch(resultText(result), /Refused|Canceled|Unknown agent/);
-	assert.equal(captureArgs(capture).length, 1);
-});
-
-test("a project-scoped package agent is refused without a UI to confirm it", async () => {
-	const project = path.join(root, "package-agent-refuse-project");
-	const packageRoot = path.join(project, ".pi", "npm", "node_modules", "vendor-agents");
-	writePackageAgent(packageRoot, "vendor-agents", "vendor-worker.md", { name: "vendor-worker" });
-	writeFileSync(path.join(project, ".pi", "settings.json"), JSON.stringify({ packages: ["npm:vendor-agents"] }));
-	const capture = path.join(root, "package-agent-refuse-capture.jsonl");
-	setFakeMode("normal", capture);
-
-	const ctx = makeContext(project, { hasUI: false });
-	// See the sibling confirmation test above for why discovery and the gate check disagree here.
-	let trustQueries = 0;
-	ctx.isProjectTrusted = () => {
-		trustQueries += 1;
-		return trustQueries <= 2;
-	};
-
-	const result = await harness.execute({ agent: "vendor-worker", task: "first", agentScope: "both" }, ctx);
-
-	assert.ok(trustQueries >= 3, "expected the gate to re-check trust after discovery");
-	assert.match(resultText(result), /Refused: vendor-worker/);
-	assert.match(resultText(result), /vendor-agents/);
-	assert.doesNotMatch(resultText(result), /\(unknown\)/);
-	assert.equal(await harness.effectiveError(result, ctx), true);
-	assert.deepEqual(captureArgs(capture), []);
-});
+// A fresh dispatch can never observe a project-scoped package agent that discovery found while
+// the confirmation gate, moments later in the same synchronous call, sees the project as
+// untrusted: project package settings are read only when `ctx.isProjectTrusted()` is true, and
+// the gate's own check is a second call to that same, real (synchronous, no intervening await)
+// predicate. Both calls happen in the same tick, so they cannot disagree outside a test fake that
+// forces them to. Earlier revisions of this suite had two tests here ("...must be confirmed
+// before it runs" and "...is refused without a UI to confirm it") that only exercised that
+// unreachable combination, by hard-coding `isProjectTrusted()` to flip from true to false after
+// exactly the two calls made during discovery — a call count private to today's implementation of
+// `execute`. They were removed rather than kept passing against a fake trust engine. The resume
+// path below is different and stays covered: a retained run's package provenance is fixed at
+// launch, so trust genuinely can change relative to it within one session.
 
 test("a user-scoped package agent does not trigger the project-agent confirmation", async () => {
 	const packageRoot = path.join(agentDir, "npm", "node_modules", "user-vendor-agents");
