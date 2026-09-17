@@ -202,23 +202,76 @@ function readDeclaredDirectories(
 	return result;
 }
 
+interface CachedPackageManager {
+	manager: DefaultPackageManager;
+	/** The global settings file's stat at construction time, used to invalidate on edit. */
+	stat: FileStat | undefined;
+}
+
 /**
- * One `DefaultPackageManager` per distinct (cwd, agentDir, projectTrusted, npm-command-source)
- * combination, kept for the life of the process. Reusing the instance makes its own internal
- * `globalNpmRoot` cache effective across calls, not just within one: the legacy global-npm-root
- * fallback this resolver's caller relies on (see `installPathCache` below) spawns `npm root -g`
- * (or, for pnpm, `pnpm list -g --depth 0 --json`) synchronously, and a fresh manager built on every
- * call — as an earlier version of this resolver did — pays that spawn again on every dispatch. The
- * npm-command-source component ties the cache to the global settings file's stat, so editing
- * `npmCommand` mid-session (a new manager needs a new `SettingsManager.inMemory` to see it) rebuilds
- * the manager instead of silently keeping the stale command.
+ * One `DefaultPackageManager` per distinct (cwd, agentDir, projectTrusted) combination, kept for
+ * the life of the process and *overwritten in place* — never appended alongside — when the global
+ * settings file's stat changes. Reusing the instance makes its own internal `globalNpmRoot` cache
+ * effective across calls, not just within one: the legacy global-npm-root fallback this resolver's
+ * caller relies on (see `installPathCache` below) spawns `npm root -g` (or, for pnpm, `pnpm list -g
+ * --depth 0 --json`) synchronously, and a fresh manager built on every call — as an earlier version
+ * of this resolver did — pays that spawn again on every dispatch.
+ *
+ * The stat is stored alongside the manager and checked on lookup (the same pattern
+ * `installPathCache` uses), not folded into the map key: an earlier version of this cache keyed on
+ * the stat directly, which meant every edit to the global settings file — including a semantically
+ * no-op rewrite — minted a new key and left the previous manager for the same (cwd, agentDir,
+ * projectTrusted) permanently in the map, growing without bound over a long session that edits
+ * settings repeatedly.
  */
-const packageManagerCache = new Map<string, DefaultPackageManager>();
+const packageManagerCache = new Map<string, CachedPackageManager>();
+
+/**
+ * How long a *negative* `getInstalledPath` result stays cached before this resolver is willing to
+ * pay for another resolution. `DefaultPackageManager.addSourceToSettings` skips writing
+ * `settings.json` when the normalized source already matches an existing `packages` entry, while
+ * `install()` still performs the on-disk installation — so `pi install <source-already-in-settings>`
+ * (a synced config on a new machine, or a prior failed install that left its entry behind) installs
+ * a package without changing the settings file's `mtimeMs`/`size` at all, and the settings-stat
+ * invalidation this cache otherwise relies on never fires. A bounded TTL bounds how long that
+ * install stays invisible without depending on a settings edit: 60 seconds is long enough that a
+ * burst of dispatches within one user turn (tool registration plus an immediate call, or a chain /
+ * parallel fan-out) shares one resolution rather than paying the synchronous spawn per child, and
+ * short enough that a package installed mid-session becomes visible on its own well within a normal
+ * interactive pace, without requiring a session restart. A *positive* result has no such window —
+ * see `isStillInstalled` below — because its cost of staying wrong (a deleted package still
+ * "resolving") is cheaper to catch directly than to bound by time.
+ */
+const NEGATIVE_RESOLUTION_TTL_MS = 60_000;
+
+/** Overridable so tests can exercise `NEGATIVE_RESOLUTION_TTL_MS` expiry deterministically instead
+ * of sleeping for a minute. Not part of this module's contract for callers other than tests. */
+let clockNow: () => number = () => Date.now();
+
+export function __setInstallPathClockForTests(fn: (() => number) | undefined): void {
+	clockNow = fn ?? (() => Date.now());
+}
+
+/** Test-only introspection so a cache-growth regression (see `packageManagerCache` above) is
+ * something a test can assert on directly instead of inferring from spawn counts. */
+export function __packageAgentCacheSizesForTests(): { packageManagers: number; installPaths: number } {
+	return { packageManagers: packageManagerCache.size, installPaths: installPathCache.size };
+}
 
 interface CachedInstallPath {
 	path: string | undefined;
 	/** The stat of the settings file that supplied this entry, at the time it was resolved. */
 	stat: FileStat | undefined;
+	/** `clockNow()` at resolution time; only consulted for a negative (`path === undefined`) entry. */
+	resolvedAt: number;
+}
+
+function isStillInstalled(dir: string): boolean {
+	try {
+		return fs.existsSync(dir);
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -230,6 +283,12 @@ interface CachedInstallPath {
  * those, blocking the event loop each time. Entries are invalidated per source file (see
  * `sameFileStat`), not wholesale, so editing one scope's settings mid-session does not stall a
  * fix to the other scope behind a cached value.
+ *
+ * A cached entry is only ever trusted subject to two further checks, applied on every lookup (see
+ * `discoverPackageAgentDirectories`): a positive result is dropped and re-resolved the moment its
+ * directory no longer exists (`isStillInstalled`), and a negative result is only reused within
+ * `NEGATIVE_RESOLUTION_TTL_MS` of when it was produced, because a settings-file edit is not the
+ * only way a negative can go stale — see that constant's comment.
  *
  * This cache holds only resolved install *paths* — not the agents inside them. Manifests and agent
  * Markdown are still read fresh on every call (`readDeclaredDirectories`, uncached), so an edit to
@@ -280,17 +339,15 @@ export function discoverPackageAgentDirectories(
 	// swallowing of read errors into an empty result with nothing observable by the caller — which
 	// would turn a corrupt settings file into "no packages configured" instead of the diagnostic
 	// `readPackagesFile` prints above.
-	const managerKey = [
-		projectRoot,
-		agentDir,
-		String(projectTrusted),
-		globalStat ? `${globalStat.mtimeMs}:${globalStat.size}` : "none",
-	].join("\u0000");
-	let packages = packageManagerCache.get(managerKey);
-	if (!packages) {
+	const managerKey = [projectRoot, agentDir, String(projectTrusted)].join("\u0000");
+	const cachedManager = packageManagerCache.get(managerKey);
+	let packages: DefaultPackageManager;
+	if (cachedManager && sameFileStat(cachedManager.stat, globalStat)) {
+		packages = cachedManager.manager;
+	} else {
 		const settings = SettingsManager.inMemory(npmCommand ? { npmCommand } : {}, { projectTrusted });
 		packages = new DefaultPackageManager({ cwd: projectRoot, agentDir, settingsManager: settings });
-		packageManagerCache.set(managerKey, packages);
+		packageManagerCache.set(managerKey, { manager: packages, stat: globalStat });
 	}
 
 	const byDirectory = new Map<string, PackageAgentDirectory>();
@@ -300,8 +357,14 @@ export function discoverPackageAgentDirectories(
 		if (!source) continue;
 		const installKey = [packageScope, source, projectRoot, agentDir].join("\u0000");
 		const cached = installPathCache.get(installKey);
+		const cacheIsUsable =
+			!!cached &&
+			sameFileStat(cached.stat, fileStat) &&
+			(cached.path !== undefined
+				? isStillInstalled(cached.path)
+				: clockNow() - cached.resolvedAt < NEGATIVE_RESOLUTION_TTL_MS);
 		let packageRoot: string | undefined;
-		if (cached && sameFileStat(cached.stat, fileStat)) {
+		if (cached && cacheIsUsable) {
 			packageRoot = cached.path;
 		} else {
 			try {
@@ -309,7 +372,7 @@ export function discoverPackageAgentDirectories(
 			} catch {
 				packageRoot = undefined;
 			}
-			installPathCache.set(installKey, { path: packageRoot, stat: fileStat });
+			installPathCache.set(installKey, { path: packageRoot, stat: fileStat, resolvedAt: clockNow() });
 		}
 		if (!packageRoot) continue;
 		for (const directory of readDeclaredDirectories(packageRoot, packageScope)) {

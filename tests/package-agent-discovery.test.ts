@@ -3,7 +3,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, test } from "node:test";
-import { discoverPackageAgentDirectories } from "../extensions/subagents/package-agents.ts";
+import {
+	__packageAgentCacheSizesForTests,
+	__setInstallPathClockForTests,
+	discoverPackageAgentDirectories,
+} from "../extensions/subagents/package-agents.ts";
 
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 const roots: string[] = [];
@@ -347,7 +351,10 @@ test("strips a UTF-8 BOM before parsing a package's package.json", () => {
  * A tiny "npm" stand-in that appends one line to a log file every time it runs, so tests can count
  * invocations of the legacy global-npm-root fallback (`npm root -g`, or `pnpm list -g ...` for
  * pnpm) without depending on a real npm/pnpm installation. Prints an arbitrary path to stdout and
- * exits 0, matching what `runCommandSync` in `DefaultPackageManager` requires to not throw.
+ * exits 0, matching what `runCommandSync` in `DefaultPackageManager` requires to not throw. If a
+ * fourth `npmCommand` argument is configured, it is echoed instead of the log file path — letting a
+ * test make the fake "npm root -g" report a real, existing directory so `getInstalledPath` resolves
+ * positively instead of always negatively.
  */
 function writeCountingNpmScript(scriptPath: string): void {
 	fs.writeFileSync(
@@ -355,7 +362,7 @@ function writeCountingNpmScript(scriptPath: string): void {
 		[
 			'const fs = require("node:fs");',
 			"fs.appendFileSync(process.argv[2], \"run\\n\");",
-			"console.log(process.argv[2]);",
+			"console.log(process.argv[3] ?? process.argv[2]);",
 			"",
 		].join("\n"),
 	);
@@ -417,5 +424,144 @@ test("a settings file edit invalidates the memoized install-path resolution", ()
 		countRuns(logFile),
 		2,
 		"expected the settings edit to invalidate the memo and re-run the legacy fallback",
+	);
+});
+
+test("does not accumulate package-manager cache entries across repeated settings edits to the same file", () => {
+	const { agentDir, project } = fixture();
+	const settingsFile = path.join(agentDir, "settings.json");
+	const packageRoot = path.join(agentDir, "npm", "node_modules", "cache-growth-agents");
+	writePackage(packageRoot, "cache-growth-agents");
+
+	const before = __packageAgentCacheSizesForTests().packageManagers;
+	// Five edits to the same (cwd, agentDir, projectTrusted) combination's settings file, each
+	// changing its stat, simulating a user re-saving settings.json repeatedly across a session. An
+	// earlier version of this cache folded the settings stat into the map *key* instead of checking
+	// it against a stored value, so every edit minted a new entry and the previous
+	// `DefaultPackageManager` for the same combination was never removed.
+	for (let i = 0; i < 5; i++) {
+		fs.writeFileSync(
+			settingsFile,
+			" ".repeat(i) + JSON.stringify({ packages: ["npm:cache-growth-agents"] }),
+		);
+		discoverPackageAgentDirectories(project, "user", false);
+	}
+	const after = __packageAgentCacheSizesForTests().packageManagers;
+
+	assert.equal(
+		after - before,
+		1,
+		"expected exactly one package-manager cache entry for this (cwd, agentDir, projectTrusted), not one per settings edit",
+	);
+});
+
+test("a cached negative install-path result expires after its TTL and discovers a package installed in the meantime", () => {
+	const { root, agentDir, project } = fixture();
+	// A local source whose directory does not exist yet when settings first list it: this models the
+	// exact scenario NEGATIVE_RESOLUTION_TTL_MS exists for — DefaultPackageManager.addSourceToSettings
+	// skips writing settings.json when the normalized source already matches an existing `packages`
+	// entry, while `install()` still performs the on-disk installation, so settings.json's stat never
+	// changes even though the package really does get installed.
+	const localRoot = path.join(root, "not-yet-installed-agents");
+	fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ packages: [localRoot] }));
+
+	let fakeNow = 0;
+	__setInstallPathClockForTests(() => fakeNow);
+	try {
+		assert.deepEqual(
+			discoverPackageAgentDirectories(project, "user", false),
+			[],
+			"the package is not installed yet, so the first call resolves and caches a negative result",
+		);
+
+		// The package is "installed" on disk now, exactly as `pi install` would, without any
+		// settings.json change (settings.json already listed this exact source).
+		writePackage(localRoot, "not-yet-installed-agents");
+
+		// Just inside the 60s TTL: the negative result is still cached, so the now-installed package
+		// stays invisible.
+		fakeNow += 59_000;
+		assert.deepEqual(
+			discoverPackageAgentDirectories(project, "user", false),
+			[],
+			"expected the negative result to still be cached inside the TTL window",
+		);
+
+		// Just past the 60s TTL: the negative result expires and the package is discovered.
+		fakeNow += 2_000;
+		const found = discoverPackageAgentDirectories(project, "user", false);
+		assert.deepEqual(
+			found.map((entry) => entry.dir),
+			[path.join(localRoot, "agents")],
+			"expected the negative result to expire past the TTL window and discover the now-installed package",
+		);
+	} finally {
+		__setInstallPathClockForTests(undefined);
+	}
+});
+
+test("a cached positive install-path result has no TTL and survives well past the negative-result window", () => {
+	const { root, agentDir, project } = fixture();
+	const localRoot = path.join(root, "installed-agents");
+	writePackage(localRoot, "installed-agents");
+	fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ packages: [localRoot] }));
+
+	let fakeNow = 0;
+	__setInstallPathClockForTests(() => fakeNow);
+	try {
+		const first = discoverPackageAgentDirectories(project, "user", false);
+		assert.deepEqual(first.map((entry) => entry.dir), [path.join(localRoot, "agents")]);
+
+		// Ten minutes later — far past the 60s negative-result TTL. A positive result has no time
+		// bound of its own; only its directory's continued existence is checked on each hit (see the
+		// next test for that check), so it must still resolve here even though the TTL alone would
+		// have expired a negative result long before this point.
+		fakeNow += 10 * 60_000;
+		const second = discoverPackageAgentDirectories(project, "user", false);
+		assert.deepEqual(second.map((entry) => entry.dir), [path.join(localRoot, "agents")]);
+	} finally {
+		__setInstallPathClockForTests(undefined);
+	}
+});
+
+test("a cached positive install-path result is dropped and re-resolved once its directory no longer exists", () => {
+	// A plain "directory disappears, nothing replaces it" scenario cannot distinguish a correctly
+	// revalidated cache from a stale one here: `readDeclaredDirectories` already fails soft (via its
+	// own try/catch around a missing `package.json`) and returns `[]` for a stale, deleted path just
+	// as it would for a freshly re-resolved "not installed" result. To actually exercise
+	// `isStillInstalled`, make the package *move* — disappear from where the cache thinks it is and
+	// reappear somewhere `getInstalledPath` would still find it — so a stale cache and a revalidated
+	// one disagree on the observable result, not just on which internal path string produced it.
+	const { root, agentDir, project } = fixture();
+	const logFile = path.join(root, "npm-calls.log");
+	const scriptPath = path.join(root, "fake-npm.cjs");
+	writeCountingNpmScript(scriptPath);
+	const globalRoot = path.join(root, "fake-global-npm-root");
+	const legacyRoot = path.join(globalRoot, "movable-agents");
+	writePackage(legacyRoot, "movable-agents");
+	fs.writeFileSync(
+		path.join(agentDir, "settings.json"),
+		JSON.stringify({
+			packages: ["npm:movable-agents"],
+			npmCommand: [process.execPath, scriptPath, logFile, globalRoot],
+		}),
+	);
+
+	// No managed install yet, so this resolves through the legacy global-npm-root fallback.
+	const first = discoverPackageAgentDirectories(project, "user", false);
+	assert.deepEqual(first.map((entry) => entry.dir), [path.join(legacyRoot, "agents")]);
+
+	// The package "moves": its legacy-global install disappears, and it reappears at the managed
+	// install path instead (e.g. a later `pi install` migrating it) — all without a settings.json
+	// change, so nothing invalidates the cache by file stat.
+	fs.rmSync(legacyRoot, { recursive: true, force: true });
+	const managedRoot = path.join(agentDir, "npm", "node_modules", "movable-agents");
+	writePackage(managedRoot, "movable-agents");
+
+	const second = discoverPackageAgentDirectories(project, "user", false);
+	assert.deepEqual(
+		second.map((entry) => entry.dir),
+		[path.join(managedRoot, "agents")],
+		"expected the stale cached legacy path to be dropped once it no longer exists and re-resolved to the managed install",
 	);
 });
