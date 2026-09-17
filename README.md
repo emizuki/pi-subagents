@@ -411,7 +411,7 @@ precedence order:
 4. **project** — `.pi/agents/*.md`; only with `agentScope: "project"` or `"both"`.
 
 Every agent's `source` (one of `builtin`, `package`, `user`, `project`) is reported in tool result
-headers and retained-run listings, so it is always visible which of the four definitions ran.
+headers, so it is always visible which of the four definitions ran.
 
 ```markdown
 ---
@@ -453,10 +453,13 @@ own agent directories without any copy or symlink step, by declaring them under
 - Package agents follow their package's own install scope, not a setting of their own: a
   user-scope install (plain `pi install`) is what makes them available at the default
   `agentScope: "user"`. A project-scope install (`pi install --local`) makes them behave like a
-  `.pi/agents/*.md` file instead — they need `agentScope: "project"` or `"both"`, and an
-  untrusted project prompts for confirmation the same way (see Security).
+  `.pi/agents/*.md` file instead — they need `agentScope: "project"` or `"both"`.
 - A project-scoped package declaration is read only once Pi reports the project trusted; an
-  untrusted project's package list contributes no agents.
+  untrusted project's package list contributes no agents. There is therefore nothing for the
+  repo-controlled-agent confirmation to prompt about on a fresh dispatch of a project-scoped
+  package agent — it is simply absent instead. That confirmation applies to `.pi/agents` project
+  agent files (see Security), and to resuming a retained run backed by a project-scoped package
+  agent whose project's trust has changed since the run was launched.
 - A missing package installation, an unreadable or malformed `package.json`, a `subagents.agents`
   value that is not an array of strings, and any other malformed declaration are all skipped
   silently, the same as a malformed Markdown agent file — one broken package never hides agents
@@ -474,8 +477,11 @@ Each call runs a separate `pi` subprocess with a delegated system prompt and too
 configuration. Project-local agents — `.pi/agents/*.md` files and package agents installed at
 project scope alike — are repo-controlled prompts that can instruct the model to read files and
 run commands, so only user-level agents load by default. Pass `agentScope: "both"` for
-repositories you trust; untrusted projects additionally prompt for confirmation unless
-`confirmProjectAgents: false` is set. Project `.pi/settings.json` is also repo-controlled and is
+repositories you trust. An untrusted project additionally prompts for confirmation, unless
+`confirmProjectAgents: false` is set, before running a `.pi/agents` agent and before resuming a
+retained run backed by a project-scoped package agent whose project has since become untrusted; a
+project-scoped package agent is otherwise simply unavailable in an untrusted project rather than
+prompted for on a fresh dispatch. Project `.pi/settings.json` is also repo-controlled and is
 ignored until pi reports the project trusted.
 
 ## Limitations
