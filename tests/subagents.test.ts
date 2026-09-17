@@ -162,6 +162,46 @@ function setFakeMode(mode: string, captureFile: string, text = "ok"): void {
 	process.env.FAKE_PI_TEXT = text;
 }
 
+/** Make each child hold long enough that overlapping runs are observable in the probe file. */
+function setConcurrencyProbe(captureFile: string, holdMs: number): void {
+	process.env.FAKE_PI_CONCURRENCY_CAPTURE = captureFile;
+	process.env.FAKE_PI_HOLD_MS = String(holdMs);
+}
+
+function clearConcurrencyProbe(): void {
+	delete process.env.FAKE_PI_CONCURRENCY_CAPTURE;
+	delete process.env.FAKE_PI_HOLD_MS;
+}
+
+/** Highest number of children alive at the same moment, from the probe's start/end events. */
+function peakConcurrency(captureFile: string): number {
+	if (!existsSync(captureFile)) return 0;
+	let live = 0;
+	let peak = 0;
+	for (const event of readFileSync(captureFile, "utf8").trim().split("\n").filter(Boolean)) {
+		if (event === "start") {
+			live++;
+			peak = Math.max(peak, live);
+		} else {
+			live--;
+		}
+	}
+	return peak;
+}
+
+function writeUserSubagentSettings(subagents: Record<string, unknown>): void {
+	writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ subagents }));
+}
+
+function clearUserSubagentSettings(): void {
+	const file = path.join(agentDir, "settings.json");
+	if (existsSync(file)) unlinkSync(file);
+}
+
+function parallelTasks(count: number, label: string): Array<{ agent: string; task: string }> {
+	return Array.from({ length: count }, (_, index) => ({ agent: "general-purpose", task: `${label} ${index}` }));
+}
+
 function captureArgs(captureFile: string): string[][] {
 	if (!existsSync(captureFile)) return [];
 	return readFileSync(captureFile, "utf8")
@@ -199,6 +239,7 @@ import path from "node:path";
 const args = process.argv.slice(2);
 if (process.env.FAKE_PI_CAPTURE) appendFileSync(process.env.FAKE_PI_CAPTURE, JSON.stringify(args) + "\\n");
 if (process.env.FAKE_PI_CWD_CAPTURE) appendFileSync(process.env.FAKE_PI_CWD_CAPTURE, process.cwd() + "\\n");
+if (process.env.FAKE_PI_CONCURRENCY_CAPTURE) appendFileSync(process.env.FAKE_PI_CONCURRENCY_CAPTURE, "start\\n");
 const sessionDirIndex = args.indexOf("--session-dir");
 if (sessionDirIndex !== -1) {
   const sessionDir = args[sessionDirIndex + 1];
@@ -220,14 +261,19 @@ const events = process.env.FAKE_PI_MODE === "empty-final"
     ]
   : [{ type: "message_end", message: { role: "assistant", content, stopReason: "end" } }];
 const bytes = Buffer.from(events.map((event) => JSON.stringify(event)).join("\\n") + "\\n", "utf8");
-if (process.env.FAKE_PI_MODE === "split-utf8") {
-  const emoji = Buffer.from("🙂", "utf8");
-  const start = bytes.indexOf(emoji);
-  process.stdout.write(bytes.subarray(0, start + 2));
-  setTimeout(() => process.stdout.write(bytes.subarray(start + 2)), 20);
-} else {
-  process.stdout.write(bytes);
-}
+const emit = () => {
+  if (process.env.FAKE_PI_CONCURRENCY_CAPTURE) appendFileSync(process.env.FAKE_PI_CONCURRENCY_CAPTURE, "end\\n");
+  if (process.env.FAKE_PI_MODE === "split-utf8") {
+    const emoji = Buffer.from("🙂", "utf8");
+    const start = bytes.indexOf(emoji);
+    process.stdout.write(bytes.subarray(0, start + 2));
+    setTimeout(() => process.stdout.write(bytes.subarray(start + 2)), 20);
+  } else {
+    process.stdout.write(bytes);
+  }
+};
+const holdMs = Number(process.env.FAKE_PI_HOLD_MS ?? 0);
+if (holdMs > 0) setTimeout(emit, holdMs); else emit();
 `,
 	);
 	chmodSync(fakePi, 0o755);
@@ -255,7 +301,15 @@ after(async () => {
 		if (value === undefined) delete process.env[key];
 		else process.env[key] = value;
 	}
-	for (const key of ["FAKE_PI_MODE", "FAKE_PI_CAPTURE", "FAKE_PI_TEXT", "FAKE_PI_CWD_CAPTURE"]) delete process.env[key];
+	for (const key of [
+		"FAKE_PI_MODE",
+		"FAKE_PI_CAPTURE",
+		"FAKE_PI_TEXT",
+		"FAKE_PI_CWD_CAPTURE",
+		"FAKE_PI_CONCURRENCY_CAPTURE",
+		"FAKE_PI_HOLD_MS",
+	])
+		delete process.env[key];
 	rmSync(root, { recursive: true, force: true });
 });
 
@@ -463,6 +517,176 @@ test("parallel aggregate output is capped globally rather than once per task", a
 	assert.match(resultText(result), /Output truncated/);
 	assert.equal(result.details.results.length, 6);
 	assert.ok(result.details.results.every((item: any) => item.messages[0].content[0].text.length === 12 * 1024));
+});
+
+test("default settings keep the eight-task parallel cap", async () => {
+	const capture = path.join(root, "default-cap-capture.jsonl");
+	setFakeMode("normal", capture);
+	const ctx = makeContext(root);
+	await harness.refresh(ctx);
+	const result = await harness.execute({ tasks: parallelTasks(9, "capped") }, ctx);
+	assert.match(resultText(result), /Too many parallel tasks \(9\)\. Max is 8\./);
+	assert.equal(await harness.effectiveError(result, ctx), true);
+	assert.deepEqual(captureArgs(capture), []);
+});
+
+test("default settings keep at most four children running at once", async () => {
+	const capture = path.join(root, "default-concurrency-capture.jsonl");
+	const probe = path.join(root, "default-concurrency-probe.txt");
+	setFakeMode("normal", capture);
+	setConcurrencyProbe(probe, 400);
+	try {
+		const ctx = makeContext(root);
+		await harness.refresh(ctx);
+		const result = await harness.execute({ tasks: parallelTasks(6, "default concurrency") }, ctx);
+		assert.equal(result.details.results.length, 6);
+		const peak = peakConcurrency(probe);
+		assert.ok(peak > 1, `expected parallel execution, saw peak ${peak}`);
+		assert.ok(peak <= 4, `expected the default cap to hold, saw peak ${peak}`);
+	} finally {
+		clearConcurrencyProbe();
+	}
+});
+
+test("user settings raise the parallel task limit", async () => {
+	const capture = path.join(root, "raised-cap-capture.jsonl");
+	setFakeMode("normal", capture);
+	try {
+		writeUserSubagentSettings({ maxParallelTasks: 9 });
+		const ctx = makeContext(root);
+		await harness.refresh(ctx);
+		const result = await harness.execute({ tasks: parallelTasks(9, "raised") }, ctx);
+		assert.doesNotMatch(resultText(result), /Too many parallel tasks/);
+		assert.equal(result.details.results.length, 9);
+	} finally {
+		clearUserSubagentSettings();
+	}
+});
+
+test("user settings can remove the parallel task limit entirely", async () => {
+	const capture = path.join(root, "unbounded-tasks-capture.jsonl");
+	setFakeMode("normal", capture);
+	try {
+		writeUserSubagentSettings({ maxParallelTasks: "unbounded" });
+		const ctx = makeContext(root);
+		await harness.refresh(ctx);
+		const result = await harness.execute({ tasks: parallelTasks(12, "unbounded") }, ctx);
+		assert.doesNotMatch(resultText(result), /Too many parallel tasks/);
+		assert.equal(result.details.results.length, 12);
+	} finally {
+		clearUserSubagentSettings();
+	}
+});
+
+test("user settings can remove the concurrency cap", async () => {
+	const capture = path.join(root, "unbounded-concurrency-capture.jsonl");
+	const probe = path.join(root, "unbounded-concurrency-probe.txt");
+	setFakeMode("normal", capture);
+	setConcurrencyProbe(probe, 600);
+	try {
+		writeUserSubagentSettings({ maxConcurrency: "unbounded" });
+		const ctx = makeContext(root);
+		await harness.refresh(ctx);
+		const result = await harness.execute({ tasks: parallelTasks(6, "unbounded concurrency") }, ctx);
+		assert.equal(result.details.results.length, 6);
+		// Beyond the default cap is the claim; pinning the exact peak would only measure how fast
+		// this machine starts six Node processes.
+		const peak = peakConcurrency(probe);
+		assert.ok(peak > 4, `expected the cap to be lifted, saw peak ${peak}`);
+	} finally {
+		clearConcurrencyProbe();
+		clearUserSubagentSettings();
+	}
+});
+
+test("malformed limit settings fall back to the defaults", async () => {
+	const capture = path.join(root, "malformed-limits-capture.jsonl");
+	setFakeMode("normal", capture);
+	try {
+		writeUserSubagentSettings({ maxParallelTasks: 0, maxConcurrency: "lots" });
+		const ctx = makeContext(root);
+		await harness.refresh(ctx);
+		const result = await harness.execute({ tasks: parallelTasks(9, "malformed") }, ctx);
+		assert.match(resultText(result), /Max is 8\./);
+	} finally {
+		clearUserSubagentSettings();
+	}
+});
+
+test("a malformed concurrency setting falls back to the default cap", async () => {
+	const capture = path.join(root, "malformed-concurrency-capture.jsonl");
+	const probe = path.join(root, "malformed-concurrency-probe.txt");
+	setFakeMode("normal", capture);
+	setConcurrencyProbe(probe, 400);
+	try {
+		writeUserSubagentSettings({ maxConcurrency: "lots" });
+		const ctx = makeContext(root);
+		await harness.refresh(ctx);
+		const result = await harness.execute({ tasks: parallelTasks(6, "malformed concurrency") }, ctx);
+		assert.equal(result.details.results.length, 6);
+		const peak = peakConcurrency(probe);
+		assert.ok(peak <= 4, `expected the default cap to hold, saw peak ${peak}`);
+	} finally {
+		clearConcurrencyProbe();
+		clearUserSubagentSettings();
+	}
+});
+
+test("trusted project settings lower a limit the user raised", async () => {
+	const project = path.join(root, "limit-compose-project");
+	mkdirSync(path.join(project, ".pi"), { recursive: true });
+	writeFileSync(path.join(project, ".pi", "settings.json"), JSON.stringify({ subagents: { maxParallelTasks: 2 } }));
+	const capture = path.join(root, "limit-compose-capture.jsonl");
+	setFakeMode("normal", capture);
+	try {
+		writeUserSubagentSettings({ maxParallelTasks: 9 });
+		const ctx = makeContext(project, { trusted: true });
+		await harness.refresh(ctx);
+		const result = await harness.execute({ tasks: parallelTasks(3, "composed limits") }, ctx);
+		assert.match(resultText(result), /Max is 2\./);
+	} finally {
+		clearUserSubagentSettings();
+	}
+});
+
+test("trusted project settings cannot raise the parallel task limit", async () => {
+	const project = path.join(root, "limit-raise-project");
+	mkdirSync(path.join(project, ".pi"), { recursive: true });
+	writeFileSync(
+		path.join(project, ".pi", "settings.json"),
+		JSON.stringify({ subagents: { maxParallelTasks: "unbounded" } }),
+	);
+	const capture = path.join(root, "limit-raise-capture.jsonl");
+	setFakeMode("normal", capture);
+	const ctx = makeContext(project, { trusted: true });
+	await harness.refresh(ctx);
+	const result = await harness.execute({ tasks: parallelTasks(9, "project raise") }, ctx);
+	assert.match(resultText(result), /Max is 8\./);
+});
+
+test("trusted project settings can lower the parallel task limit", async () => {
+	const project = path.join(root, "limit-lower-project");
+	mkdirSync(path.join(project, ".pi"), { recursive: true });
+	writeFileSync(path.join(project, ".pi", "settings.json"), JSON.stringify({ subagents: { maxParallelTasks: 2 } }));
+	const capture = path.join(root, "limit-lower-capture.jsonl");
+	setFakeMode("normal", capture);
+	const ctx = makeContext(project, { trusted: true });
+	await harness.refresh(ctx);
+	const result = await harness.execute({ tasks: parallelTasks(3, "project lower") }, ctx);
+	assert.match(resultText(result), /Max is 2\./);
+});
+
+test("untrusted project settings cannot change the parallel task limit", async () => {
+	const project = path.join(root, "limit-untrusted-project");
+	mkdirSync(path.join(project, ".pi"), { recursive: true });
+	writeFileSync(path.join(project, ".pi", "settings.json"), JSON.stringify({ subagents: { maxParallelTasks: 1 } }));
+	const capture = path.join(root, "limit-untrusted-capture.jsonl");
+	setFakeMode("normal", capture);
+	const ctx = makeContext(project, { trusted: false });
+	await harness.refresh(ctx);
+	const result = await harness.execute({ tasks: parallelTasks(2, "untrusted limit") }, ctx);
+	assert.doesNotMatch(resultText(result), /Too many parallel tasks/);
+	assert.equal(result.details.results.length, 2);
 });
 
 test("parallel results are structurally failed when any child fails", async () => {

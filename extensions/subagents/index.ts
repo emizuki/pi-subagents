@@ -36,8 +36,8 @@ import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 
-const MAX_PARALLEL_TASKS = 8;
-const MAX_CONCURRENCY = 4;
+const DEFAULT_MAX_PARALLEL_TASKS = 8;
+const DEFAULT_MAX_CONCURRENCY = 4;
 /** How long a child gets to exit on SIGTERM before SIGKILL. */
 const SIGKILL_GRACE_MS = 5_000;
 const COLLAPSED_ITEM_COUNT = 10;
@@ -523,10 +523,43 @@ function describeAgent(agent: AgentConfig): string {
 
 type ForkContext = "fresh" | "fork";
 
+/** A parallel fan-out limit: a positive integer, or an explicit opt-out of the cap. */
+type FanOutLimit = number | "unbounded";
+
 interface SubagentSettings {
 	defaultThinking?: ThinkingLevel;
 	maxThinking?: ThinkingLevel;
 	defaultContext?: ForkContext;
+	/** Admission limit for one parallel call. Always resolved, defaulting to DEFAULT_MAX_PARALLEL_TASKS. */
+	maxParallelTasks: FanOutLimit;
+	/** Children alive at once within one parallel call. Always resolved, defaulting to DEFAULT_MAX_CONCURRENCY. */
+	maxConcurrency: FanOutLimit;
+}
+
+/**
+ * Anything that is not a positive integer or `"unbounded"` is ignored, so a typo in settings
+ * falls back to the default rather than silently uncapping or crippling dispatch.
+ */
+function parseFanOutLimit(value: unknown): FanOutLimit | undefined {
+	if (value === "unbounded") return "unbounded";
+	if (typeof value === "number" && Number.isInteger(value) && value >= 1) return value;
+	return undefined;
+}
+
+function fanOutRank(limit: FanOutLimit): number {
+	return limit === "unbounded" ? Number.POSITIVE_INFINITY : limit;
+}
+
+/**
+ * Only the operator's own settings may raise a limit. A repository is not an authorization
+ * boundary for how many processes the machine runs, so a trusted project may lower one and
+ * nothing more: a checkout that could raise it would be a fan-out amplifier for anything that
+ * reaches the dispatching model, and prompt injection reaches it through the files it reads.
+ */
+function resolveFanOutLimit(userValue: unknown, projectValue: unknown, fallback: number): FanOutLimit {
+	const effective = parseFanOutLimit(userValue) ?? fallback;
+	const project = parseFanOutLimit(projectValue);
+	return project !== undefined && fanOutRank(project) < fanOutRank(effective) ? project : effective;
 }
 
 /**
@@ -646,11 +679,19 @@ function readSubagentSettings(
 	cwd: string,
 	trustedProject: { file: string; root: string } | undefined,
 ): SubagentSettings {
-	const files = [path.join(getAgentDir(), "settings.json")];
-	if (trustedProject && isWithinProject(cwd, trustedProject.root)) files.push(trustedProject.file);
-	const merged: SubagentSettings = {};
-	for (const file of files) {
-		const raw = readSettingsFile(file)?.subagents as Record<string, unknown> | undefined;
+	const readSubagents = (file: string) => readSettingsFile(file)?.subagents as Record<string, unknown> | undefined;
+	const userRaw = readSubagents(path.join(getAgentDir(), "settings.json"));
+	const projectRaw =
+		trustedProject && isWithinProject(cwd, trustedProject.root) ? readSubagents(trustedProject.file) : undefined;
+	const merged: SubagentSettings = {
+		maxParallelTasks: resolveFanOutLimit(
+			userRaw?.maxParallelTasks,
+			projectRaw?.maxParallelTasks,
+			DEFAULT_MAX_PARALLEL_TASKS,
+		),
+		maxConcurrency: resolveFanOutLimit(userRaw?.maxConcurrency, projectRaw?.maxConcurrency, DEFAULT_MAX_CONCURRENCY),
+	};
+	for (const raw of [userRaw, projectRaw]) {
 		if (!raw) continue;
 		for (const key of ["defaultThinking", "maxThinking"] as const) {
 			const value = raw[key];
@@ -1878,12 +1919,18 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 			}
 
 			if (params.tasks && params.tasks.length > 0) {
-				if (params.tasks.length > MAX_PARALLEL_TASKS)
+				// The limits govern the whole call, so they follow the dispatching session's cwd rather
+				// than any per-task cwd, which a caller could otherwise point at a permissive project.
+				const { maxParallelTasks, maxConcurrency } = readSubagentSettings(
+					ctx.cwd,
+					dispatchDefaults.trustedProjectSettings,
+				);
+				if (maxParallelTasks !== "unbounded" && params.tasks.length > maxParallelTasks)
 					return {
 						content: [
 							{
 								type: "text",
-								text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
+								text: `Too many parallel tasks (${params.tasks.length}). Max is ${maxParallelTasks}.`,
 							},
 						],
 						details: makeDetails("parallel")([]),
@@ -1919,7 +1966,8 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					}
 				};
 
-				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
+				const concurrency = maxConcurrency === "unbounded" ? params.tasks.length : maxConcurrency;
+				const results = await mapWithConcurrencyLimit(params.tasks, concurrency, async (t, index) => {
 					const result = await runSingleAgent(
 						ctx.cwd,
 						dispatchDefaults,

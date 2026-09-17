@@ -72,7 +72,7 @@ Use a chain: recon finds the auth code, then general-purpose adds a test for it
 | Mode | Parameter | Description |
 |------|-----------|-------------|
 | Single | `{ agent, task }` | One agent, one task |
-| Parallel | `{ tasks: [...] }` | Concurrent (max 8 tasks, 4 at a time) |
+| Parallel | `{ tasks: [...] }` | Concurrent (8 tasks, 4 at a time by default; see [Settings](#settings)) |
 | Chain | `{ chain: [...] }` | Sequential, with a `{previous}` placeholder |
 
 Every mode accepts `model`, `thinking` and `context`. In parallel and chain mode a per-item value
@@ -370,7 +370,9 @@ a repo-controlled prompt without the prompt that a canonical name would have tri
   "subagents": {
     "defaultThinking": "low",
     "maxThinking": "high",
-    "defaultContext": "fresh"
+    "defaultContext": "fresh",
+    "maxParallelTasks": 8,
+    "maxConcurrency": 4
   }
 }
 ```
@@ -383,7 +385,41 @@ them only after pi has marked the parent project trusted, and only for child wor
 inside that trusted project's canonical root. This prevents an untrusted `.pi/settings.json` —
 or an unrelated per-task `cwd` — from silently forcing context forking or changing budgets.
 Within a trusted project the file is found by walking upward, so running pi from a subdirectory
-still picks up the repository's settings.
+still picks up the repository's settings. `defaultThinking`, `maxThinking` and `defaultContext`
+resolve per child, against that child's own `cwd`; the two fan-out limits below govern the whole
+call and resolve once, against the dispatching session's `cwd`.
+
+### Parallel fan-out limits
+
+`maxParallelTasks` is how many tasks one parallel call may submit; `maxConcurrency` is how many
+children run at once within that call. They default to `8` and `4`. Each accepts a positive
+integer or the string `"unbounded"`, which removes that limit:
+
+```json
+{
+  "subagents": {
+    "maxParallelTasks": "unbounded",
+    "maxConcurrency": "unbounded"
+  }
+}
+```
+
+The two are independent: an unbounded task count with a finite concurrency still queues, and an
+unbounded concurrency starts every submitted task immediately. Each child is a full `pi` process,
+so an unbounded call spends tokens and machine resources in proportion to the list the model
+writes — which is the point of making it an explicit choice rather than a default.
+
+The aggregate result stays capped at pi's 50 KB / 2,000-line limits, and that cap is a head
+truncation over the tasks in order. A large fan-out therefore drops the later tasks' text from
+what the model reads, even though `details` keeps every transcript and the run ids stay
+resumable. Retained child sessions also accumulate until the parent session shuts down.
+
+Unlike the other settings, **only user settings may raise a limit**. A trusted project may lower
+one and nothing more, and an untrusted project is ignored entirely. A repository is not an
+authorization boundary for how many processes the machine runs, and a checkout that could raise
+the limit would amplify anything that reaches the dispatching model through the files it reads.
+A value that is neither a positive integer nor `"unbounded"` is ignored, falling back to the
+default. Neither setting affects the depth limit: children still cannot spawn children.
 
 ## Agent definitions
 
@@ -420,7 +456,8 @@ repo-controlled and is ignored until pi reports the project trusted.
 - Collapsed view shows the last 10 items in single mode, 5 per step or task in chain and parallel; Ctrl+O expands.
 - Every final tool result is capped globally at pi's 50 KB / 2,000-line limits, including the aggregate from parallel tasks. Full text remains in tool `details`, and truncation notices preserve resumable run ids.
 - Agents are rediscovered on each invocation, so they can be edited mid-session.
-- Parallel mode is limited to 8 tasks, 4 concurrent.
+- Parallel mode defaults to 8 tasks, 4 concurrent; raise or remove both in user settings.
+- Removing the limits does not remove the depth limit: a child still cannot dispatch its own subagents.
 
 ## Checks
 
