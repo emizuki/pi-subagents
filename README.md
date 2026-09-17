@@ -7,12 +7,11 @@ Derived from the `subagent/` example in the [pi repository](https://github.com/e
 
 ## Why
 
-The upstream example pins a model in each agent's frontmatter. That breaks when you switch
-providers often: `model: claude-haiku-4-5` is meaningless once the session is on an OpenAI
-provider, and an agent that pins a model silently loses the session's thinking level.
+The upstream example pins a model in each agent's frontmatter. That is inflexible when tasks
+need different models, and an agent that pins a model silently loses the session's thinking level.
 
-This fork moves both choices to the call site. The model enum is generated from the live
-catalogue, so it always reflects whichever provider the session is on.
+This fork moves both choices to the call site. The model enum follows Pi's current session scope,
+or every model Pi considers available across all providers when the session is unscoped.
 
 ## Install
 
@@ -38,6 +37,7 @@ only when a specific agent should deviate.
 
 ```
 Use recon to find all authentication code
+Use reviewer to review the current diff without changing files
 Run 2 recon agents in parallel: one for models, one for providers
 Use a chain: recon finds the auth code, then general-purpose adds a test for it
 ```
@@ -83,18 +83,22 @@ contain a colon (`llama3:8b`) are left alone.
 
 ### Which models are offered
 
-The `model` enum is built at registration time from `ctx.scopedModels` when session scoping
-is configured (`--models`, or `enabledModels` in settings), and otherwise from the current
-provider's catalogue. A non-empty scope is also enforced at execution time, so an agent's
-frontmatter cannot bypass it by pinning a model that the enum does not offer. Scoping is the
-intended way to keep expensive models out of reach:
+The `model` enum is built at registration time from `ctx.scopedModels` when the session has a
+scope configured through `--models` or `enabledModels`. That is the same list Pi shows through
+`/scoped-models`. A non-empty scope is also enforced at execution time, so an agent's
+frontmatter cannot bypass it by pinning a model that the enum does not offer.
+
+When `ctx.scopedModels` is empty, the session is unscoped and the enum uses every model in
+`ctx.modelRegistry.getAvailable()`, across all providers. Configuring a scope is therefore useful
+for keeping very large provider catalogues out of the subagent schema:
 
 ```bash
 pi --models "gpt-5.6-*"
 ```
 
-The enum is rebuilt on `session_start` (which also covers `/new`, `/resume` and `/fork`) and
-on `model_select`, so switching providers mid-session keeps the list accurate.
+The enum is rebuilt on `session_start` (which also covers `/new`, `/resume`, `/fork` and
+`/reload`) and on `model_select`. After changing provider authentication or model scope, run
+`/reload` to rebuild it.
 
 ### Which thinking levels are offered
 
@@ -121,8 +125,9 @@ model can be offered and still be rejected at run time, for example:
 Error: Codex error: The 'gpt-5.4-mini' model is not supported when using Codex with a ChatGPT account.
 ```
 
-Nothing local can predict that, so the provider's error is surfaced as-is. Narrow the enum
-with `--models` or `enabledModels` once you know which models your account actually accepts.
+Nothing local can predict that, so the provider's error is surfaced as-is. The extension does
+not automatically retry or substitute another model. Narrow the enum with `--models` or
+`enabledModels` once you know which models your account actually accepts.
 
 ## Sample agents
 
@@ -130,14 +135,16 @@ with `--models` or `enabledModels` once you know which models your account actua
 |-------|-----|-------|
 | `general-purpose` | Anything open-ended: investigate, then act | full |
 | `recon` | Fast codebase recon, returns compressed findings | read, grep, find, ls, bash (investigation only) |
+| `reviewer` | Evidence-based review without modifying the target | read, grep, find, ls, bash (investigation only) |
 
-Neither pins a model, so both follow the session.
+None pins a model, so all three follow the session.
 
-Two agents, not five. A subagent earns its place when the task is self-contained given a
-description — gathering facts, or doing a delimited job. Planning is not: it wants the whole
-conversation, which is exactly what an isolated context does not have, so the dispatching
-agent should plan for itself. `recon` is kept because being focused and cheap is the point
-of it, and it pairs with the guideline below.
+A subagent earns its place when the task is self-contained given a description — gathering facts,
+reviewing a delimited change, or doing a delimited job. Planning is not: it wants the whole
+conversation, which is exactly what an isolated context does not have, so the dispatching agent
+should plan for itself. `recon` is kept because being focused and cheap is the point of it.
+`reviewer` is separate because review requires judgement rather than neutral fact gathering; its
+prompt stays generic and accepts caller-specific output contracts.
 
 `recon` keeps Pi's focused `grep`, `find` and `ls` tools (`grep` uses ripgrep) and also has
 `bash` for read-only git inspection, `ast-grep`, and existing verification commands those tools
@@ -154,9 +161,9 @@ reach for, so left alone the caller will use the expensive agent on the expensiv
 for a read-only look around. The extension emits `promptGuidelines` covering both choices:
 
 ```
-Call the subagent tool with agent: "recon" whenever the task is read-only investigation —
-searching, listing, reading or summarising. Reserve the full-tool agents for work that must
-actually change something.
+Prefer an available specialist when its description directly matches the task. Otherwise, call
+the subagent tool with agent: "recon" for neutral read-only investigation — searching, listing,
+reading or summarising. Reserve the full-tool agents for work that must actually change something.
 
 For that read-only work, also pass a cheaper model to the subagent tool: its model parameter
 lists models cheapest first.
@@ -165,10 +172,12 @@ lists models cheapest first.
 No model is named, and no price ratio is quoted. Both pin the caller to one model, and a
 catalogue entry is not proof the account may use it. Catalogue prices are list prices in any
 case, which a subscription account may not be paying. Instead the `model` enum is ordered
-cheapest first and the guideline says only that, which leaves the caller free to fall back when
-one model is refused. The ordering and the agent names are computed at registration time, so
-they follow the active provider and the agents actually on disk. Nothing is emitted when the
-session is already on the cheapest model, or when no model carries a price.
+cheapest first and the guideline says only that, which leaves the caller free to choose another
+model on a later call when one is refused. The ordering and the agent names are computed at
+registration time, so they follow the current scoped model list (or the available registry when
+unscoped) and the agents actually on disk. An input price of zero is valid for free and local
+models; only a missing price is unknown. Nothing is emitted unless an offered model is strictly
+cheaper than the current one.
 
 ## Context: fresh or fork
 
@@ -262,7 +271,7 @@ finished child can be revived instead:
 
 ```
 { agent: "general-purpose", task: "Implement the parser" }   -> run 4f2a9c31
-{ agent: "recon", task: "Review what changed" }              -> finds a fault
+{ agent: "reviewer", task: "Review what changed" }           -> finds a fault
 { resume: "4f2a9c31", task: "The review found X. Fix it." }
 ```
 

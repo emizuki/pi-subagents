@@ -1355,15 +1355,12 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 	default: "user",
 });
 
-/**
- * Models offered to the LLM as a per-call override. `ctx.scopedModels` is the user's own filter
- * (`--models` / `enabledModels`); when it is empty nothing is scoped, so fall back to the current
- * provider's catalogue rather than every provider pi knows about.
- */
+/** Models offered to the LLM, honoring the current session scope when one is configured. */
 function modelChoices(ctx: ExtensionContext): ModelLike[] {
-	const scoped = ctx.scopedModels.map((s) => s.model);
 	const pool =
-		scoped.length > 0 ? scoped : ctx.modelRegistry.getAvailable().filter((m) => m.provider === ctx.model?.provider);
+		ctx.scopedModels.length > 0
+			? ctx.scopedModels.map(({ model }) => model)
+			: ctx.modelRegistry.getAvailable();
 	const seen = new Set<string>();
 	const unique = pool.filter((m) => !seen.has(modelKey(m)) && seen.add(modelKey(m)));
 	// Cheapest first, unpriced last: the order is the only pricing signal the model gets, and
@@ -1401,7 +1398,7 @@ function thinkingSchema(choices: ModelLike[]) {
  * Name the cheapest offered model explicitly so mechanical work has somewhere obvious to go.
  * Guidelines are appended flat to the prompt with no tool prefix, so each one names the tool.
  */
-function buildGuidelines(choices: ModelLike[], current: string | undefined, agents: AgentConfig[]): string[] {
+function buildGuidelines(choices: ModelLike[], currentModel: ModelLike | undefined, agents: AgentConfig[]): string[] {
 	const guidelines: string[] = [];
 
 	// Steering the agent choice matters more than the model: a full-tool agent on a read-only
@@ -1412,15 +1409,19 @@ function buildGuidelines(choices: ModelLike[], current: string | undefined, agen
 	if (restricted.length > 0 && agents.length > restricted.length) {
 		const names = restricted.map((a) => `"${a.name}"`).join(" or ");
 		guidelines.push(
-			`Call the subagent tool with agent: ${names} whenever the task is read-only investigation — searching, listing, reading or summarising. Reserve the full-tool agents for work that must actually change something.`,
+			`Prefer an available specialist when its description directly matches the task. Otherwise, call the subagent tool with agent: ${names} for neutral read-only investigation — searching, listing, reading or summarising. Reserve the full-tool agents for work that must actually change something.`,
 		);
 	}
 
 	// Deliberately nameless, and deliberately without a price ratio: both pin the caller to one
 	// model. Catalogue prices are list prices anyway, which a subscription account may not pay.
-	const priced = choices.filter((m) => (m.cost?.input ?? 0) > 0);
-	const cheapest = priced[0];
-	if (cheapest && modelKey(cheapest) !== current) {
+	// Zero is a valid price for local and free models; only missing prices are unknown.
+	const cheapest = choices.find((m) => m.cost?.input !== undefined);
+	if (
+		cheapest?.cost?.input !== undefined &&
+		currentModel?.cost?.input !== undefined &&
+		cheapest.cost.input < currentModel.cost.input
+	) {
 		guidelines.push(
 			"For that read-only work, also pass a cheaper model to the subagent tool: its model parameter lists models cheapest first.",
 			"Leave the subagent tool's model unset for work that needs judgement, such as planning, review or writing code; it then inherits the session's model.",
@@ -1576,7 +1577,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 	const choices = modelChoices(ctx);
 	const agents = discoverAgents(ctx.cwd, "user").agents;
 	const SubagentParams = makeSubagentParams(choices, current);
-	const promptGuidelines = buildGuidelines(choices, current, agents);
+	const promptGuidelines = buildGuidelines(choices, ctx.model, agents);
 
 	pi.registerTool({
 		name: "subagent",

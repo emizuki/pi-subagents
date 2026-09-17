@@ -21,6 +21,14 @@ const model = {
 	cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
 };
 const expensiveModel = { ...model, id: "expensive", name: "Expensive", cost: { ...model.cost, input: 100 } };
+const freeModel = {
+	...model,
+	provider: "local-provider",
+	id: "free",
+	name: "Free",
+	cost: { ...model.cost, input: 0 },
+};
+const crossProviderModel = { ...expensiveModel, provider: "other-provider" };
 
 type Handler = (...args: any[]) => any;
 
@@ -121,14 +129,16 @@ function makeContext(
 	overrides: {
 		trusted?: boolean;
 		scopedModels?: Array<{ model: typeof model; thinkingLevel?: string }>;
+		availableModels?: Array<typeof model>;
+		currentModel?: typeof model;
 		parentSessionFile?: string;
 		hasUI?: boolean;
 	} = {},
 ): any {
-	const available = [model, expensiveModel];
+	const available = overrides.availableModels ?? [model, expensiveModel];
 	return {
 		cwd,
-		model,
+		model: overrides.currentModel ?? model,
 		thinkingLevel: "low",
 		scopedModels: overrides.scopedModels ?? [],
 		modelRegistry: {
@@ -260,6 +270,25 @@ test("bundled recon has shell discovery without mutation tools", () => {
 		assert.ok(recon.aliases.includes("scout"));
 		assert.equal(recon.tools.includes("edit"), false);
 		assert.equal(recon.tools.includes("write"), false);
+	} finally {
+		if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
+	}
+});
+
+test("bundled reviewer is discoverable but cannot mutate files", () => {
+	const packageRoot = path.resolve(import.meta.dirname, "..");
+	const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+	try {
+		process.env.PI_CODING_AGENT_DIR = packageRoot;
+		const reviewer = discoverAgents(packageRoot, "user").agents.find((agent) => agent.name === "reviewer");
+		assert.ok(reviewer);
+		assert.deepEqual(reviewer.aliases, ["review", "code-review", "auditor"]);
+		assert.deepEqual(reviewer.tools, ["read", "grep", "find", "ls", "bash"]);
+		assert.equal(reviewer.suggest, false);
+		assert.equal(reviewer.tools.includes("edit"), false);
+		assert.equal(reviewer.tools.includes("write"), false);
+		assert.match(reviewer.systemPrompt, /never modify files/i);
 	} finally {
 		if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
@@ -539,6 +568,50 @@ test("malformed agent frontmatter is skipped without hiding valid agents", () =>
 	assert.deepEqual(discovery.agents.map((agent) => agent.name), ["valid"]);
 });
 
+test("model enum honors the configured session scope", async () => {
+	const ctx = makeContext(root, {
+		scopedModels: [{ model, thinkingLevel: "high" }],
+		availableModels: [model, crossProviderModel],
+	});
+	const tool = await harness.refresh(ctx);
+	assert.deepEqual(tool.parameters.properties.model.enum, ["test-provider/cheap"]);
+});
+
+test("model enum uses every available provider when the session is unscoped", async () => {
+	const ctx = makeContext(root, { availableModels: [model, crossProviderModel] });
+	const tool = await harness.refresh(ctx);
+	assert.deepEqual(tool.parameters.properties.model.enum, ["test-provider/cheap", "other-provider/expensive"]);
+});
+
+test("free current model does not trigger cheaper-model guidance", async () => {
+	const ctx = makeContext(root, {
+		currentModel: freeModel,
+		availableModels: [freeModel, expensiveModel],
+	});
+	const tool = await harness.refresh(ctx);
+	assert.equal(tool.promptGuidelines.some((line: string) => line.includes("pass a cheaper model")), false);
+});
+
+test("free available model triggers cheaper-model guidance for a paid current model", async () => {
+	const ctx = makeContext(root, {
+		currentModel: expensiveModel,
+		availableModels: [expensiveModel, freeModel],
+	});
+	const tool = await harness.refresh(ctx);
+	assert.equal(tool.promptGuidelines.some((line: string) => line.includes("pass a cheaper model")), true);
+});
+
+test("scoped cheaper model triggers guidance when the current model is outside scope", async () => {
+	const ctx = makeContext(root, {
+		currentModel: expensiveModel,
+		scopedModels: [{ model: freeModel }],
+		availableModels: [expensiveModel, freeModel],
+	});
+	const tool = await harness.refresh(ctx);
+	assert.deepEqual(tool.parameters.properties.model.enum, ["local-provider/free"]);
+	assert.equal(tool.promptGuidelines.some((line: string) => line.includes("pass a cheaper model")), true);
+});
+
 test("scoped model thinking pins are forwarded to the child", async () => {
 	const capture = path.join(root, "thinking-capture.jsonl");
 	setFakeMode("normal", capture);
@@ -548,7 +621,7 @@ test("scoped model thinking pins are forwarded to the child", async () => {
 	assert.equal(optionValue(captureArgs(capture)[0], "--thinking"), "high");
 });
 
-test("agent frontmatter cannot select a model outside configured scope", async () => {
+test("agent frontmatter cannot select a model outside configured session scope", async () => {
 	writeAgent(path.join(agentDir, "agents"), "pinned.md", {
 		name: "pinned",
 		model: "test-provider/expensive",
