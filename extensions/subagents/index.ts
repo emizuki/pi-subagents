@@ -1621,7 +1621,8 @@ function registerContactSupervisorTool(pi: ExtensionAPI) {
 function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 	const current = ctx.model ? modelKey(ctx.model) : undefined;
 	const choices = modelChoices(ctx);
-	const agents = discoverAgents(ctx.cwd, "user").agents;
+	const discoveryOptions = { projectTrusted: ctx.isProjectTrusted() };
+	const agents = discoverAgents(ctx.cwd, "user", discoveryOptions).agents;
 	const SubagentParams = makeSubagentParams(choices, current);
 	const promptGuidelines = buildGuidelines(choices, ctx.model, agents);
 
@@ -1634,7 +1635,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 			agents.length > 0
 				? `Available agents: ${agents.map(describeAgent).join(", ")}.`
 				: `No agents found in ${path.join(getAgentDir(), "agents")}.`,
-			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
+			`Default agent scope is "user": bundled agents, agents declared by user-installed packages, and ${path.join(getAgentDir(), "agents")}.`,
 			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
 		].join(" "),
 		promptGuidelines,
@@ -1673,7 +1674,9 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 						}
 					: undefined,
 			};
-			const discovery = discoverAgents(ctx.cwd, agentScope);
+			const discovery = discoverAgents(ctx.cwd, agentScope, {
+				projectTrusted: ctx.isProjectTrusted(),
+			});
 			const agents = discovery.agents;
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
 

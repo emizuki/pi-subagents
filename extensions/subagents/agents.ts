@@ -6,8 +6,21 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import {
+	discoverPackageAgentDirectories,
+	type PackageAgentDirectory,
+} from "./package-agents.ts";
 
 export type AgentScope = "user" | "project" | "both";
+
+export interface AgentDiscoveryOptions {
+	projectTrusted?: boolean;
+}
+
+type PackageProvenance = Partial<Pick<
+	PackageAgentDirectory,
+	"packageName" | "packageRoot" | "packageScope"
+>>;
 
 export type AgentSource = "builtin" | "package" | "user" | "project";
 
@@ -99,7 +112,11 @@ const BUILTIN_AGENTS_DIR = path.resolve(
 	"agents",
 );
 
-function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
+function loadAgentsFromDir(
+	dir: string,
+	source: AgentSource,
+	provenance: PackageProvenance = {},
+): AgentConfig[] {
 	const agents: AgentConfig[] = [];
 
 	if (!fs.existsSync(dir)) {
@@ -154,6 +171,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 					: undefined,
 			systemPrompt: body,
 			source,
+			...provenance,
 			filePath,
 		});
 	}
@@ -181,10 +199,19 @@ function findNearestProjectAgentsDir(cwd: string): string | null {
 	}
 }
 
-export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryResult {
+export function discoverAgents(
+	cwd: string,
+	scope: AgentScope,
+	options: AgentDiscoveryOptions = {},
+): AgentDiscoveryResult {
 	const userDir = path.join(getAgentDir(), "agents");
 	const projectAgentsDir = findNearestProjectAgentsDir(cwd);
 	const builtinAgents = loadAgentsFromDir(BUILTIN_AGENTS_DIR, "builtin");
+	const packageAgents = discoverPackageAgentDirectories(
+		cwd,
+		scope,
+		options.projectTrusted === true,
+	).flatMap(({ dir, ...provenance }) => loadAgentsFromDir(dir, "package", provenance));
 	const userAgents = scope === "project" ? [] : loadAgentsFromDir(userDir, "user");
 	const projectAgents = scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project");
 
@@ -194,6 +221,7 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
 	// otherwise both survive and dispatch would silently pick whichever was discovered first.
 	const put = (agent: AgentConfig) => agentMap.set(agent.name.toLowerCase(), agent);
 	for (const agent of builtinAgents) put(agent);
+	for (const agent of packageAgents) put(agent);
 	if (scope === "both") {
 		for (const agent of userAgents) put(agent);
 		for (const agent of projectAgents) put(agent);
