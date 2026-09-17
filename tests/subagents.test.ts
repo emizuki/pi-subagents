@@ -335,6 +335,31 @@ test("bundled reviewer loads as a builtin and cannot mutate files", () => {
 	assert.match(reviewer.systemPrompt, /never modify files/i);
 });
 
+test("user agent with same name as builtin overrides the builtin", () => {
+	// The test fixture writes general-purpose.md to the user agent directory,
+	// which shadows the builtin general-purpose.md.
+	const result = discoverAgents(root, "user");
+	const generalPurpose = result.agents.find((agent) => agent.name === "general-purpose");
+	assert.ok(generalPurpose);
+	assert.equal(generalPurpose.source, "user", "user agent should override builtin");
+	// Verify exactly one general-purpose agent exists (no duplicates from different sources)
+	const allMatching = result.agents.filter((agent) => agent.name.toLowerCase() === "general-purpose");
+	assert.equal(allMatching.length, 1, "exactly one general-purpose agent should exist");
+});
+
+test("project agent with same name as builtin overrides the builtin", () => {
+	const project = path.join(root, "override-project");
+	const agentsDir = path.join(project, ".pi", "agents");
+	writeAgent(agentsDir, "recon.md", { name: "recon" });
+	const result = discoverAgents(project, "project");
+	const recon = result.agents.find((agent) => agent.name === "recon");
+	assert.ok(recon);
+	assert.equal(recon.source, "project", "project agent should override builtin");
+	// Verify exactly one recon agent exists
+	const allMatching = result.agents.filter((agent) => agent.name.toLowerCase() === "recon");
+	assert.equal(allMatching.length, 1, "exactly one recon agent should exist");
+});
+
 test("invalid tool requests are structurally marked as errors", async () => {
 	const ctx = makeContext(root);
 	await harness.refresh(ctx);

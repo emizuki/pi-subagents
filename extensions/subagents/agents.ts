@@ -189,6 +189,9 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
 	const projectAgents = scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project");
 
 	const agentMap = new Map<string, AgentConfig>();
+
+	// Keyed case-insensitively, because lookup is: a user `recon` and a project `Recon` would
+	// otherwise both survive and dispatch would silently pick whichever was discovered first.
 	const put = (agent: AgentConfig) => agentMap.set(agent.name.toLowerCase(), agent);
 	for (const agent of builtinAgents) put(agent);
 	if (scope === "both") {
