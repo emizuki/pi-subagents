@@ -55,11 +55,11 @@ test("resolves declared agent directories for configured npm, git, and local pac
 
 	const found = discoverPackageAgentDirectories(project, "user", false);
 	assert.deepEqual(
-		found.map((entry) => [entry.packageName, entry.packageScope, entry.dir]),
+		found.map((entry) => [entry.packageName, entry.packageScope, entry.dir, entry.packageRoot]),
 		[
-			["@fixture/npm-agents", "user", path.join(npmRoot, "agents")],
-			["git-agents", "user", path.join(gitRoot, "agents")],
-			["local-agents", "user", path.join(localRoot, "agents")],
+			["@fixture/npm-agents", "user", path.join(npmRoot, "agents"), npmRoot],
+			["git-agents", "user", path.join(gitRoot, "agents"), gitRoot],
+			["local-agents", "user", path.join(localRoot, "agents"), localRoot],
 		],
 	);
 });
@@ -83,6 +83,31 @@ test("loads nearest project packages only after project trust", () => {
 	assert.equal(trusted[0]?.packageScope, "project");
 	assert.equal(trusted[0]?.dir, path.join(packageRoot, "agents"));
 	assert.deepEqual(discoverPackageAgentDirectories(nested, "user", true), []);
+});
+
+test("excludes symlinks escaping the package root", () => {
+	const { root, agentDir, project } = fixture();
+	const packageRoot = path.join(root, "pkg");
+	const outside = path.join(root, "outside");
+	fs.mkdirSync(packageRoot, { recursive: true });
+	fs.mkdirSync(path.join(packageRoot, "agents"), { recursive: true });
+	fs.mkdirSync(outside, { recursive: true });
+	const escapedLink = path.join(packageRoot, "agents", "escaped");
+	fs.symlinkSync(outside, escapedLink);
+	fs.writeFileSync(
+		path.join(packageRoot, "package.json"),
+		JSON.stringify({
+			name: "symlink-test",
+			pi: { subagents: { agents: ["./agents/escaped"] } },
+		}),
+	);
+	fs.writeFileSync(
+		path.join(agentDir, "settings.json"),
+		JSON.stringify({ packages: [packageRoot] }),
+	);
+
+	const found = discoverPackageAgentDirectories(project, "user", false);
+	assert.deepEqual(found, []);
 });
 
 test("skips disabled, escaping, absolute, missing, and malformed package declarations", () => {

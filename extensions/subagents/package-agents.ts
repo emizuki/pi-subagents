@@ -109,35 +109,39 @@ export function discoverPackageAgentDirectories(
 	scope: AgentScope,
 	projectTrusted: boolean,
 ): PackageAgentDirectory[] {
-	const projectRoot = findNearestProjectRoot(cwd);
-	const agentDir = getAgentDir();
-	const settings = SettingsManager.create(projectRoot, agentDir, { projectTrusted });
-	const packages = new DefaultPackageManager({ cwd: projectRoot, agentDir, settingsManager: settings });
-	const configured: Array<{ entry: PackageSource; packageScope: "user" | "project" }> = [];
-	if (scope !== "project") {
-		for (const entry of settings.getGlobalSettings().packages ?? []) {
-			configured.push({ entry, packageScope: "user" });
+	try {
+		const projectRoot = findNearestProjectRoot(cwd);
+		const agentDir = getAgentDir();
+		const settings = SettingsManager.create(projectRoot, agentDir, { projectTrusted });
+		const packages = new DefaultPackageManager({ cwd: projectRoot, agentDir, settingsManager: settings });
+		const configured: Array<{ entry: PackageSource; packageScope: "user" | "project" }> = [];
+		if (scope !== "project") {
+			for (const entry of settings.getGlobalSettings().packages ?? []) {
+				configured.push({ entry, packageScope: "user" });
+			}
 		}
-	}
-	if (scope !== "user" && projectTrusted) {
-		for (const entry of settings.getProjectSettings().packages ?? []) {
-			configured.push({ entry, packageScope: "project" });
+		if (scope !== "user" && projectTrusted) {
+			for (const entry of settings.getProjectSettings().packages ?? []) {
+				configured.push({ entry, packageScope: "project" });
+			}
 		}
-	}
 
-	const byDirectory = new Map<string, PackageAgentDirectory>();
-	for (const { entry, packageScope } of configured) {
-		if (!packageAutoloads(entry)) continue;
-		let packageRoot: string | undefined;
-		try {
-			packageRoot = packages.getInstalledPath(packageSource(entry), packageScope);
-		} catch {
-			continue;
+		const byDirectory = new Map<string, PackageAgentDirectory>();
+		for (const { entry, packageScope } of configured) {
+			if (!packageAutoloads(entry)) continue;
+			let packageRoot: string | undefined;
+			try {
+				packageRoot = packages.getInstalledPath(packageSource(entry), packageScope);
+			} catch {
+				continue;
+			}
+			if (!packageRoot) continue;
+			for (const directory of readDeclaredDirectories(packageRoot, packageScope)) {
+				byDirectory.set(directory.dir, directory);
+			}
 		}
-		if (!packageRoot) continue;
-		for (const directory of readDeclaredDirectories(packageRoot, packageScope)) {
-			byDirectory.set(canonicalPath(directory.dir), directory);
-		}
+		return Array.from(byDirectory.values());
+	} catch {
+		return [];
 	}
-	return Array.from(byDirectory.values());
 }
