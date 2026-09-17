@@ -249,6 +249,23 @@ after(async () => {
 	rmSync(root, { recursive: true, force: true });
 });
 
+test("bundled recon has shell discovery without mutation tools", () => {
+	const packageRoot = path.resolve(import.meta.dirname, "..");
+	const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+	try {
+		process.env.PI_CODING_AGENT_DIR = packageRoot;
+		const recon = discoverAgents(packageRoot, "user").agents.find((agent) => agent.name === "recon");
+		assert.ok(recon);
+		assert.deepEqual(recon.tools, ["read", "grep", "find", "ls", "bash"]);
+		assert.ok(recon.aliases.includes("scout"));
+		assert.equal(recon.tools.includes("edit"), false);
+		assert.equal(recon.tools.includes("write"), false);
+	} finally {
+		if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
+	}
+});
+
 test("invalid tool requests are structurally marked as errors", async () => {
 	const ctx = makeContext(root);
 	await harness.refresh(ctx);

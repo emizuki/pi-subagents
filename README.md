@@ -73,7 +73,7 @@ inherit the session's thinking level, but a scoped model pin still follows that 
 name: recon
 aliases: scout
 description: Fast codebase recon
-tools: read, grep, find, ls
+tools: read, grep, find, ls, bash
 thinking: low
 ---
 ```
@@ -129,23 +129,23 @@ with `--models` or `enabledModels` once you know which models your account actua
 | Agent | For | Tools |
 |-------|-----|-------|
 | `general-purpose` | Anything open-ended: investigate, then act | full |
-| `recon` | Fast codebase recon, returns compressed findings | read, grep, find, ls |
+| `recon` | Fast codebase recon, returns compressed findings | read, grep, find, ls, bash (investigation only) |
 
 Neither pins a model, so both follow the session.
 
 Two agents, not five. A subagent earns its place when the task is self-contained given a
 description — gathering facts, or doing a delimited job. Planning is not: it wants the whole
 conversation, which is exactly what an isolated context does not have, so the dispatching
-agent should plan for itself. `recon` is kept because being restricted and cheap is the point
+agent should plan for itself. `recon` is kept because being focused and cheap is the point
 of it, and it pairs with the guideline below.
 
-`recon` deliberately has no shell. Its whole value is being cheap and unable to change
-anything, and a `bash` in the list would make the restriction decorative — the guideline below
-steers read-only work to it on exactly that promise. pi's built-in `grep` is ripgrep, so
-ordinary search needs no shell anyway. Structural search with `ast-grep` does, which is one
-more reason it belongs to `general-purpose`: a task that needs it is not a quick recon. That
-prompt names `ast-grep` explicitly, because `sg` on Linux is util-linux's setgid utility and
-calling it does something unrelated instead of failing.
+`recon` keeps Pi's focused `grep`, `find` and `ls` tools (`grep` uses ripgrep) and also has
+`bash` for read-only git inspection, `ast-grep`, and existing verification commands those tools
+cannot cover. It still receives neither `edit` nor `write`, and its prompt restricts shell use to
+investigation. This is a behavioral guard, not a security sandbox — shell itself can mutate files
+— so use `general-purpose` whenever mutation is intended. The prompt names `ast-grep` explicitly
+because `sg` on Linux is util-linux's setgid utility and calling it does something unrelated
+instead of failing.
 
 ## Nudging the caller
 
@@ -361,7 +361,7 @@ Markdown with YAML frontmatter, in `~/.pi/agent/agents/*.md` (user level, always
 name: recon
 aliases: scout
 description: Fast codebase recon
-tools: read, grep, find, ls
+tools: read, grep, find, ls, bash
 thinking: low
 ---
 
