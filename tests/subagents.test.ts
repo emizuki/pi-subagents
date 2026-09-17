@@ -313,40 +313,26 @@ after(async () => {
 	rmSync(root, { recursive: true, force: true });
 });
 
-test("bundled recon has shell discovery without mutation tools", () => {
-	const packageRoot = path.resolve(import.meta.dirname, "..");
-	const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
-	try {
-		process.env.PI_CODING_AGENT_DIR = packageRoot;
-		const recon = discoverAgents(packageRoot, "user").agents.find((agent) => agent.name === "recon");
-		assert.ok(recon);
-		assert.deepEqual(recon.tools, ["read", "grep", "find", "ls", "bash"]);
-		assert.ok(recon.aliases.includes("scout"));
-		assert.equal(recon.tools.includes("edit"), false);
-		assert.equal(recon.tools.includes("write"), false);
-	} finally {
-		if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-		else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
-	}
+test("bundled recon loads as a builtin without mutation tools", () => {
+	const recon = discoverAgents(root, "user").agents.find((agent) => agent.name === "recon");
+	assert.ok(recon);
+	assert.equal(recon.source, "builtin");
+	assert.deepEqual(recon.tools, ["read", "grep", "find", "ls", "bash"]);
+	assert.ok(recon.aliases.includes("scout"));
+	assert.equal(recon.tools.includes("edit"), false);
+	assert.equal(recon.tools.includes("write"), false);
 });
 
-test("bundled reviewer is discoverable but cannot mutate files", () => {
-	const packageRoot = path.resolve(import.meta.dirname, "..");
-	const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
-	try {
-		process.env.PI_CODING_AGENT_DIR = packageRoot;
-		const reviewer = discoverAgents(packageRoot, "user").agents.find((agent) => agent.name === "reviewer");
-		assert.ok(reviewer);
-		assert.deepEqual(reviewer.aliases, ["review", "code-review", "auditor"]);
-		assert.deepEqual(reviewer.tools, ["read", "grep", "find", "ls", "bash"]);
-		assert.equal(reviewer.suggest, false);
-		assert.equal(reviewer.tools.includes("edit"), false);
-		assert.equal(reviewer.tools.includes("write"), false);
-		assert.match(reviewer.systemPrompt, /never modify files/i);
-	} finally {
-		if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-		else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
-	}
+test("bundled reviewer loads as a builtin and cannot mutate files", () => {
+	const reviewer = discoverAgents(root, "user").agents.find((agent) => agent.name === "reviewer");
+	assert.ok(reviewer);
+	assert.equal(reviewer.source, "builtin");
+	assert.deepEqual(reviewer.aliases, ["review", "code-review", "auditor"]);
+	assert.deepEqual(reviewer.tools, ["read", "grep", "find", "ls", "bash"]);
+	assert.equal(reviewer.suggest, false);
+	assert.equal(reviewer.tools.includes("edit"), false);
+	assert.equal(reviewer.tools.includes("write"), false);
+	assert.match(reviewer.systemPrompt, /never modify files/i);
 });
 
 test("invalid tool requests are structurally marked as errors", async () => {
@@ -772,7 +758,9 @@ test("empty tools is preserved as a restrictive allowlist", async () => {
 	const agentsDir = path.join(project, ".pi", "agents");
 	writeAgent(agentsDir, "empty.md", { name: "empty", tools: "[]" });
 	const discovery = discoverAgents(project, "project");
-	assert.deepEqual(discovery.agents[0].tools, []);
+	const empty = discovery.agents.find((agent) => agent.name === "empty");
+	assert.ok(empty);
+	assert.deepEqual(empty.tools, []);
 
 	const capture = path.join(root, "empty-tools-capture.jsonl");
 	setFakeMode("normal", capture);
@@ -789,7 +777,8 @@ test("malformed agent frontmatter is skipped without hiding valid agents", () =>
 	writeFileSync(path.join(agentsDir, "broken.md"), "---\nname: [unterminated\ndescription: bad\n---\nbody\n");
 	writeAgent(agentsDir, "valid.md", { name: "valid" });
 	const discovery = discoverAgents(project, "project");
-	assert.deepEqual(discovery.agents.map((agent) => agent.name), ["valid"]);
+	const projectAgents = discovery.agents.filter((agent) => agent.source === "project");
+	assert.deepEqual(projectAgents.map((agent) => agent.name), ["valid"]);
 });
 
 test("model enum honors the configured session scope", async () => {

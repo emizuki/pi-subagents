@@ -4,9 +4,12 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 
 export type AgentScope = "user" | "project" | "both";
+
+export type AgentSource = "builtin" | "package" | "user" | "project";
 
 export interface AgentConfig {
 	name: string;
@@ -33,8 +36,11 @@ export interface AgentConfig {
 	 */
 	suggest: boolean;
 	systemPrompt: string;
-	source: "user" | "project";
+	source: AgentSource;
 	filePath: string;
+	packageName?: string;
+	packageRoot?: string;
+	packageScope?: "user" | "project";
 }
 
 export interface AgentDiscoveryResult {
@@ -86,7 +92,14 @@ function parseToolList(value: unknown): string[] | undefined {
 		.filter(Boolean);
 }
 
-function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig[] {
+const BUILTIN_AGENTS_DIR = path.resolve(
+	path.dirname(fileURLToPath(import.meta.url)),
+	"..",
+	"..",
+	"agents",
+);
+
+function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 	const agents: AgentConfig[] = [];
 
 	if (!fs.existsSync(dir)) {
@@ -171,15 +184,13 @@ function findNearestProjectAgentsDir(cwd: string): string | null {
 export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryResult {
 	const userDir = path.join(getAgentDir(), "agents");
 	const projectAgentsDir = findNearestProjectAgentsDir(cwd);
-
+	const builtinAgents = loadAgentsFromDir(BUILTIN_AGENTS_DIR, "builtin");
 	const userAgents = scope === "project" ? [] : loadAgentsFromDir(userDir, "user");
 	const projectAgents = scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project");
 
 	const agentMap = new Map<string, AgentConfig>();
-
-	// Keyed case-insensitively, because lookup is: a user `recon` and a project `Recon` would
-	// otherwise both survive and dispatch would silently pick whichever was discovered first.
 	const put = (agent: AgentConfig) => agentMap.set(agent.name.toLowerCase(), agent);
+	for (const agent of builtinAgents) put(agent);
 	if (scope === "both") {
 		for (const agent of userAgents) put(agent);
 		for (const agent of projectAgents) put(agent);

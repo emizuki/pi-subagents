@@ -34,7 +34,12 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import {
+	type AgentConfig,
+	type AgentScope,
+	type AgentSource,
+	discoverAgents,
+} from "./agents.ts";
 
 const DEFAULT_MAX_PARALLEL_TASKS = 8;
 const DEFAULT_MAX_CONCURRENCY = 4;
@@ -158,7 +163,7 @@ interface SingleResult {
 	/** Retained-run id, so a caller can resume this particular step or task later. */
 	runId?: string;
 	agent: string;
-	agentSource: "user" | "project" | "unknown";
+	agentSource: AgentSource | "unknown";
 	task: string;
 	exitCode: number;
 	messages: Message[];
@@ -726,7 +731,7 @@ const retentionRoot = path.join(os.tmpdir(), `pi-subagent-runs-${process.pid}`);
 interface RetainedRun {
 	id: string;
 	agent: string;
-	agentSource: "user" | "project";
+	agentSource: AgentSource;
 	agentFilePath: string;
 	/** The resolved launch contract. A resumed child keeps it rather than re-deriving it. */
 	model?: string;
