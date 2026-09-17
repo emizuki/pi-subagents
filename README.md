@@ -400,8 +400,18 @@ default. Neither setting affects the depth limit: children still cannot spawn ch
 
 ## Agent definitions
 
-Markdown with YAML frontmatter, in `~/.pi/agent/agents/*.md` (user level, always loaded) or
-`.pi/agents/*.md` (project level, only with `agentScope: "project"` or `"both"`).
+Agent definitions are Markdown with YAML frontmatter, merged from four sources. Later sources
+override earlier ones when they define the same name (matched case-insensitively), in this
+precedence order:
+
+1. **builtin** — bundled in this package's own `agents/` directory; always loaded.
+2. **package** — declared by other installed Pi packages (see below); follows each package's own
+   install scope.
+3. **user** — `~/.pi/agent/agents/*.md`; always loaded.
+4. **project** — `.pi/agents/*.md`; only with `agentScope: "project"` or `"both"`.
+
+Every agent's `source` (one of `builtin`, `package`, `user`, `project`) is reported in tool result
+headers and retained-run listings, so it is always visible which of the four definitions ran.
 
 ```markdown
 ---
@@ -419,14 +429,54 @@ Omit `model` to inherit the dispatching session's model and thinking level. A ma
 frontmatter document is skipped without preventing other valid agents in the directory from
 being discovered.
 
+### Package agents
+
+An installed Pi package — including but not limited to `@emizuki/pi-code-review` — can expose its
+own agent directories without any copy or symlink step, by declaring them under
+`pi.subagents.agents` in its `package.json`:
+
+```json
+{
+  "pi": {
+    "subagents": {
+      "agents": ["./agents"]
+    }
+  }
+}
+```
+
+- Each entry is a directory path relative to the package root, read non-recursively for
+  top-level `*.md` files in the same format as user and project agents. An absolute path, or one
+  that escapes the package root, is ignored.
+- A package entry with Pi's own `autoload: false` setting is skipped entirely; the first version
+  of this contract has no separate filter for selecting individual agent directories.
+- Package agents follow their package's own install scope, not a setting of their own: a
+  user-scope install (plain `pi install`) is what makes them available at the default
+  `agentScope: "user"`. A project-scope install (`pi install --local`) makes them behave like a
+  `.pi/agents/*.md` file instead — they need `agentScope: "project"` or `"both"`, and an
+  untrusted project prompts for confirmation the same way (see Security).
+- A project-scoped package declaration is read only once Pi reports the project trusted; an
+  untrusted project's package list contributes no agents.
+- A missing package installation, an unreadable or malformed `package.json`, a `subagents.agents`
+  value that is not an array of strings, and any other malformed declaration are all skipped
+  silently, the same as a malformed Markdown agent file — one broken package never hides agents
+  from another source.
+
+A package that currently relies on Pi's convention-based discovery for its other resources
+(skills, prompts, extensions, themes) and adds a `pi` manifest key for the first time, purely to
+declare `pi.subagents.agents`, must also declare those other resource directories explicitly in
+the same manifest: Pi stops auto-discovering a package's resources by convention as soon as any
+`pi` manifest key exists for it.
+
 ## Security
 
 Each call runs a separate `pi` subprocess with a delegated system prompt and tool
-configuration. Project-local agents are repo-controlled prompts that can instruct the model
-to read files and run commands, so only user-level agents load by default. Pass
-`agentScope: "both"` for repositories you trust; untrusted projects additionally prompt for
-confirmation unless `confirmProjectAgents: false` is set. Project `.pi/settings.json` is also
-repo-controlled and is ignored until pi reports the project trusted.
+configuration. Project-local agents — `.pi/agents/*.md` files and package agents installed at
+project scope alike — are repo-controlled prompts that can instruct the model to read files and
+run commands, so only user-level agents load by default. Pass `agentScope: "both"` for
+repositories you trust; untrusted projects additionally prompt for confirmation unless
+`confirmProjectAgents: false` is set. Project `.pi/settings.json` is also repo-controlled and is
+ignored until pi reports the project trusted.
 
 ## Limitations
 
