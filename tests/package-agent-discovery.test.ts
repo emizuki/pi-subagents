@@ -1,0 +1,119 @@
+import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { afterEach, test } from "node:test";
+import { discoverPackageAgentDirectories } from "../extensions/subagents/package-agents.ts";
+
+const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+const roots: string[] = [];
+
+afterEach(() => {
+	if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+	else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+	for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+function fixture(): { root: string; agentDir: string; project: string } {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "package-agent-discovery-"));
+	roots.push(root);
+	const agentDir = path.join(root, "agent-home");
+	const project = path.join(root, "project");
+	fs.mkdirSync(agentDir, { recursive: true });
+	fs.mkdirSync(project, { recursive: true });
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	return { root, agentDir, project };
+}
+
+function writePackage(packageRoot: string, name: string): void {
+	fs.mkdirSync(path.join(packageRoot, "agents"), { recursive: true });
+	fs.writeFileSync(
+		path.join(packageRoot, "package.json"),
+		JSON.stringify({ name, pi: { subagents: { agents: ["./agents"] } } }),
+	);
+}
+
+test("resolves declared agent directories for configured npm, git, and local packages", () => {
+	const { root, agentDir, project } = fixture();
+	const npmRoot = path.join(agentDir, "npm", "node_modules", "@fixture", "npm-agents");
+	const gitRoot = path.join(agentDir, "git", "github.com", "fixture", "git-agents");
+	const localRoot = path.join(root, "local-agents");
+	writePackage(npmRoot, "@fixture/npm-agents");
+	writePackage(gitRoot, "git-agents");
+	writePackage(localRoot, "local-agents");
+	fs.writeFileSync(
+		path.join(agentDir, "settings.json"),
+		JSON.stringify({
+			packages: [
+				"npm:@fixture/npm-agents",
+				"git:github.com/fixture/git-agents",
+				localRoot,
+				localRoot,
+			],
+		}),
+	);
+
+	const found = discoverPackageAgentDirectories(project, "user", false);
+	assert.deepEqual(
+		found.map((entry) => [entry.packageName, entry.packageScope, entry.dir]),
+		[
+			["@fixture/npm-agents", "user", path.join(npmRoot, "agents")],
+			["git-agents", "user", path.join(gitRoot, "agents")],
+			["local-agents", "user", path.join(localRoot, "agents")],
+		],
+	);
+});
+
+test("loads nearest project packages only after project trust", () => {
+	const { agentDir, project } = fixture();
+	const nested = path.join(project, "src", "nested");
+	const packageRoot = path.join(project, ".pi", "npm", "node_modules", "project-agents");
+	fs.mkdirSync(nested, { recursive: true });
+	writePackage(packageRoot, "project-agents");
+	fs.mkdirSync(path.join(project, ".pi"), { recursive: true });
+	fs.writeFileSync(
+		path.join(project, ".pi", "settings.json"),
+		JSON.stringify({ packages: ["npm:project-agents"] }),
+	);
+	fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ packages: [] }));
+
+	assert.deepEqual(discoverPackageAgentDirectories(nested, "both", false), []);
+	const trusted = discoverPackageAgentDirectories(nested, "both", true);
+	assert.equal(trusted.length, 1);
+	assert.equal(trusted[0]?.packageScope, "project");
+	assert.equal(trusted[0]?.dir, path.join(packageRoot, "agents"));
+	assert.deepEqual(discoverPackageAgentDirectories(nested, "user", true), []);
+});
+
+test("skips disabled, escaping, absolute, missing, and malformed package declarations", () => {
+	const { root, agentDir, project } = fixture();
+	const disabledRoot = path.join(root, "disabled");
+	const mixedRoot = path.join(root, "mixed");
+	const malformedRoot = path.join(root, "malformed");
+	writePackage(disabledRoot, "disabled");
+	fs.mkdirSync(path.join(mixedRoot, "agents"), { recursive: true });
+	fs.mkdirSync(path.join(root, "outside"), { recursive: true });
+	fs.mkdirSync(path.join(root, "absolute"), { recursive: true });
+	fs.writeFileSync(
+		path.join(mixedRoot, "package.json"),
+		JSON.stringify({
+			name: "mixed",
+			pi: { subagents: { agents: ["./agents", "../outside", path.join(root, "absolute"), "./missing"] } },
+		}),
+	);
+	fs.mkdirSync(malformedRoot, { recursive: true });
+	fs.writeFileSync(path.join(malformedRoot, "package.json"), "{not-json");
+	fs.writeFileSync(
+		path.join(agentDir, "settings.json"),
+		JSON.stringify({
+			packages: [
+				{ source: disabledRoot, autoload: false },
+				mixedRoot,
+				malformedRoot,
+			],
+		}),
+	);
+
+	const found = discoverPackageAgentDirectories(project, "user", false);
+	assert.deepEqual(found.map((entry) => entry.dir), [path.join(mixedRoot, "agents")]);
+});
