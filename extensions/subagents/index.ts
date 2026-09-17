@@ -526,6 +526,27 @@ function describeAgent(agent: AgentConfig): string {
 	return agent.aliases.length > 0 ? `${agent.name} (aka ${agent.aliases.join(", ")})` : agent.name;
 }
 
+/**
+ * A repo-controlled agent is one whose definition lives inside the checkout: an explicit project
+ * agent file, or a package agent discovered through project-scoped package settings. Either way
+ * its `tools:` and prompt come from the repository, not from the user or the package default, so
+ * both need the same confirmation gate before dispatch — only where Pi found the file differs.
+ */
+function isRepoControlledAgent(agent: AgentConfig | undefined): agent is AgentConfig {
+	return agent?.source === "project" || agent?.packageScope === "project";
+}
+
+/**
+ * Where to point a caller who is asked to trust a repo-controlled agent. `discovery.projectAgentsDir`
+ * only describes the `project` source; it is null for a project-scoped package agent, which would
+ * otherwise render as "(unknown)". A package's own root — or its name, if the root is unavailable —
+ * is a location the caller can actually go inspect.
+ */
+function repoControlledSource(agent: AgentConfig, projectAgentsDir: string | null): string {
+	if (agent.source === "project") return projectAgentsDir ?? "(unknown)";
+	return agent.packageRoot ?? agent.packageName ?? "(unknown package)";
+}
+
 type ForkContext = "fresh" | "fork";
 
 /** A parallel fan-out limit: a positive integer, or an explicit opt-out of the cap. */
@@ -733,6 +754,12 @@ interface RetainedRun {
 	agent: string;
 	agentSource: AgentSource;
 	agentFilePath: string;
+	/** Package provenance, carried alongside agentSource so a resumed run can still be judged
+	 * repo-controlled — or re-saved as one across further resumes — after its live discovery entry
+	 * is gone. */
+	agentPackageScope?: "user" | "project";
+	agentPackageRoot?: string;
+	agentPackageName?: string;
 	/** The resolved launch contract. A resumed child keeps it rather than re-deriving it. */
 	model?: string;
 	thinking?: ThinkingLevel;
@@ -1007,6 +1034,9 @@ async function runSingleAgent(
 				systemPrompt: resuming.systemPrompt,
 				source: resuming.agentSource,
 				filePath: resuming.agentFilePath,
+				packageScope: resuming.agentPackageScope,
+				packageRoot: resuming.agentPackageRoot,
+				packageName: resuming.agentPackageName,
 			}
 		: discoveredAgent;
 
@@ -1350,6 +1380,9 @@ async function runSingleAgent(
 				agent: agent.name,
 				agentSource: agent.source,
 				agentFilePath: agent.filePath,
+				agentPackageScope: agent.packageScope,
+				agentPackageRoot: agent.packageRoot,
+				agentPackageName: agent.packageName,
 				model,
 				thinking,
 				tools: childTools,
@@ -1823,11 +1856,13 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 					// Must resolve aliases: this list drives the project-agent confirmation, and an
 					// alias that failed to resolve here would run a repo-controlled prompt unprompted.
 					.map((name) => findAgent(agents, name))
-					.filter((a): a is AgentConfig => a?.source === "project");
+					.filter(isRepoControlledAgent);
 
 				if (projectAgentsRequested.length > 0) {
 					const names = projectAgentsRequested.map((a) => a.name).join(", ");
-					const dir = discovery.projectAgentsDir ?? "(unknown)";
+					const sources = Array.from(
+						new Set(projectAgentsRequested.map((a) => repoControlledSource(a, discovery.projectAgentsDir))),
+					).join(", ");
 					// A confirmation that cannot be asked has to deny. Previously the whole gate was
 					// conditional on having a UI, so a headless session ran repo-controlled prompts
 					// from an untrusted project with nothing asked and nothing said.
@@ -1836,7 +1871,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 							content: [
 								{
 									type: "text",
-									text: `Refused: ${names} come from ${dir} in a project that is not trusted, and this session cannot ask for confirmation. Trust the project, or pass confirmProjectAgents: false to accept that risk deliberately.`,
+									text: `Refused: ${names} come from ${sources} in a project that is not trusted, and this session cannot ask for confirmation. Trust the project, or pass confirmProjectAgents: false to accept that risk deliberately.`,
 								},
 							],
 							details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
@@ -1844,7 +1879,7 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 						};
 					const ok = await ctx.ui.confirm(
 						"Run project-local agents?",
-						`Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
+						`Agents: ${names}\nSource: ${sources}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
 					);
 					if (!ok)
 						return {
@@ -2089,9 +2124,14 @@ function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
 				resumeTarget = target;
 			}
 
-			// Resume is source-based, not discovery-scope-based: a retained project prompt stays
-			// project-controlled even when the caller omits agentScope or the source file was removed.
-			if (resumeTarget?.agentSource === "project" && confirmProjectAgents && !ctx.isProjectTrusted()) {
+			// Resume is source-based, not discovery-scope-based: a retained project prompt — including one
+			// backed by a project-scoped package agent — stays project-controlled even when the caller omits
+			// agentScope or the source file was removed.
+			if (
+				(resumeTarget?.agentSource === "project" || resumeTarget?.agentPackageScope === "project") &&
+				confirmProjectAgents &&
+				!ctx.isProjectTrusted()
+			) {
 				const dir = path.dirname(resumeTarget.agentFilePath);
 				if (!ctx.hasUI) {
 					return {

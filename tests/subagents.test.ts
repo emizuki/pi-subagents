@@ -124,6 +124,22 @@ function writeAgent(
 	return target;
 }
 
+/** Scaffold a minimal Pi package declaring an agent directory through `pi.subagents.agents`,
+ * mirroring the manifest contract `pi-code-review` depends on. */
+function writePackageAgent(
+	packageRoot: string,
+	packageName: string,
+	agentFile: string,
+	options: { name: string; tools?: string },
+): string {
+	mkdirSync(packageRoot, { recursive: true });
+	writeFileSync(
+		path.join(packageRoot, "package.json"),
+		JSON.stringify({ name: packageName, pi: { subagents: { agents: ["./agents"] } } }),
+	);
+	return writeAgent(path.join(packageRoot, "agents"), agentFile, options);
+}
+
 function makeContext(
 	cwd: string,
 	overrides: {
@@ -946,6 +962,126 @@ test("retained project-agent trust cannot be bypassed by default resume scope", 
 	assert.match(resultText(refused), /Refused: retained run/);
 	assert.equal(await harness.effectiveError(refused, untrustedCtx), true);
 	assert.equal(captureArgs(capture).length, 1);
+	const accepted = await harness.execute(
+		{ resume: runId, task: "second", confirmProjectAgents: false },
+		untrustedCtx,
+	);
+	assert.doesNotMatch(resultText(accepted), /Refused/);
+	assert.equal(captureArgs(capture).length, 2);
+});
+
+test("a project-scoped package agent in an untrusted session must be confirmed before it runs", async () => {
+	const project = path.join(root, "package-agent-confirm-project");
+	const packageRoot = path.join(project, ".pi", "npm", "node_modules", "vendor-agents");
+	writePackageAgent(packageRoot, "vendor-agents", "vendor-worker.md", { name: "vendor-worker" });
+	writeFileSync(path.join(project, ".pi", "settings.json"), JSON.stringify({ packages: ["npm:vendor-agents"] }));
+	const capture = path.join(root, "package-agent-confirm-capture.jsonl");
+	setFakeMode("normal", capture);
+
+	const ctx = makeContext(project, { hasUI: true });
+	// The real trust engine cannot disagree with itself within one synchronous dispatch, so this
+	// fake models the two moments explicitly instead: discovery (the two calls below) sees a
+	// trusted project, matching how the project-scoped package setting was able to be read at all;
+	// the confirmation gate's own check, further down in the same call, sees an untrusted session.
+	// That isolates the gate's *predicate* (this test's subject) from discovery-time trust gating,
+	// which tests/package-agent-discovery.test.ts already covers on its own.
+	let trustQueries = 0;
+	ctx.isProjectTrusted = () => {
+		trustQueries += 1;
+		return trustQueries <= 2;
+	};
+	let confirmed: [string, string] | undefined;
+	ctx.ui.confirm = async (title: string, body: string) => {
+		confirmed = [title, body];
+		return true;
+	};
+
+	const result = await harness.execute({ agent: "vendor-worker", task: "first", agentScope: "both" }, ctx);
+
+	assert.ok(trustQueries >= 3, "expected the gate to re-check trust after discovery");
+	assert.ok(confirmed, "expected the confirmation dialog to be shown");
+	assert.equal(confirmed?.[0], "Run project-local agents?");
+	assert.match(confirmed?.[1] ?? "", /vendor-worker/);
+	assert.match(confirmed?.[1] ?? "", /vendor-agents/);
+	assert.doesNotMatch(confirmed?.[1] ?? "", /\(unknown\)/);
+	assert.doesNotMatch(resultText(result), /Refused|Canceled|Unknown agent/);
+	assert.equal(captureArgs(capture).length, 1);
+});
+
+test("a project-scoped package agent is refused without a UI to confirm it", async () => {
+	const project = path.join(root, "package-agent-refuse-project");
+	const packageRoot = path.join(project, ".pi", "npm", "node_modules", "vendor-agents");
+	writePackageAgent(packageRoot, "vendor-agents", "vendor-worker.md", { name: "vendor-worker" });
+	writeFileSync(path.join(project, ".pi", "settings.json"), JSON.stringify({ packages: ["npm:vendor-agents"] }));
+	const capture = path.join(root, "package-agent-refuse-capture.jsonl");
+	setFakeMode("normal", capture);
+
+	const ctx = makeContext(project, { hasUI: false });
+	// See the sibling confirmation test above for why discovery and the gate check disagree here.
+	let trustQueries = 0;
+	ctx.isProjectTrusted = () => {
+		trustQueries += 1;
+		return trustQueries <= 2;
+	};
+
+	const result = await harness.execute({ agent: "vendor-worker", task: "first", agentScope: "both" }, ctx);
+
+	assert.ok(trustQueries >= 3, "expected the gate to re-check trust after discovery");
+	assert.match(resultText(result), /Refused: vendor-worker/);
+	assert.match(resultText(result), /vendor-agents/);
+	assert.doesNotMatch(resultText(result), /\(unknown\)/);
+	assert.equal(await harness.effectiveError(result, ctx), true);
+	assert.deepEqual(captureArgs(capture), []);
+});
+
+test("a user-scoped package agent does not trigger the project-agent confirmation", async () => {
+	const packageRoot = path.join(agentDir, "npm", "node_modules", "user-vendor-agents");
+	writePackageAgent(packageRoot, "user-vendor-agents", "user-vendor-worker.md", { name: "user-vendor-worker" });
+	writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ packages: ["npm:user-vendor-agents"] }));
+	const capture = path.join(root, "user-package-agent-capture.jsonl");
+	setFakeMode("normal", capture);
+
+	const ctx = makeContext(root, { trusted: false, hasUI: true });
+	let confirmCalls = 0;
+	ctx.ui.confirm = async () => {
+		confirmCalls += 1;
+		return true;
+	};
+
+	try {
+		const result = await harness.execute(
+			{ agent: "user-vendor-worker", task: "first", agentScope: "both" },
+			ctx,
+		);
+		assert.equal(confirmCalls, 0, "a user-scoped package agent must not require confirmation");
+		assert.doesNotMatch(resultText(result), /Refused|Canceled|Unknown agent/);
+		assert.equal(captureArgs(capture).length, 1);
+	} finally {
+		rmSync(packageRoot, { recursive: true, force: true });
+		clearUserSubagentSettings();
+	}
+});
+
+test("resuming a retained run backed by a project-scoped package agent is gated like a project agent", async () => {
+	const project = path.join(root, "package-agent-resume-project");
+	const packageRoot = path.join(project, ".pi", "npm", "node_modules", "vendor-agents");
+	writePackageAgent(packageRoot, "vendor-agents", "vendor-worker.md", { name: "vendor-worker" });
+	writeFileSync(path.join(project, ".pi", "settings.json"), JSON.stringify({ packages: ["npm:vendor-agents"] }));
+	const capture = path.join(root, "package-agent-resume-capture.jsonl");
+	setFakeMode("normal", capture);
+
+	const trustedCtx = makeContext(project, { trusted: true });
+	const first = await harness.execute({ agent: "vendor-worker", task: "first", agentScope: "both" }, trustedCtx);
+	assert.doesNotMatch(resultText(first), /Refused|Unknown agent/);
+	const runId = first.details.results[0].runId;
+	assert.ok(runId);
+
+	const untrustedCtx = makeContext(project, { trusted: false, hasUI: false });
+	const refused = await harness.execute({ resume: runId, task: "second" }, untrustedCtx);
+	assert.match(resultText(refused), /Refused: retained run/);
+	assert.equal(await harness.effectiveError(refused, untrustedCtx), true);
+	assert.equal(captureArgs(capture).length, 1);
+
 	const accepted = await harness.execute(
 		{ resume: runId, task: "second", confirmProjectAgents: false },
 		untrustedCtx,
