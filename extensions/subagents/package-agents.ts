@@ -47,16 +47,6 @@ function isWithin(root: string, candidate: string): boolean {
 	);
 }
 
-function findNearestProjectRoot(cwd: string): string {
-	let current = path.resolve(cwd);
-	while (true) {
-		if (fs.existsSync(path.join(current, CONFIG_DIR_NAME, "settings.json"))) return current;
-		const parent = path.dirname(current);
-		if (parent === current) return path.resolve(cwd);
-		current = parent;
-	}
-}
-
 /**
  * `settings.json` is untrusted, unvalidated JSON — `SettingsManager` parses it with no runtime
  * schema check — so a `packages` entry can be anything JSON allows: `null`, a number, a boolean,
@@ -73,6 +63,49 @@ function packageSource(entry: unknown): string | undefined {
  * `isObject` already excludes `null` (`typeof null === "object"`), arrays, and every primitive. */
 function packageAutoloads(entry: unknown): boolean {
 	return typeof entry === "string" || (isObject(entry) && entry.autoload !== false);
+}
+
+interface ParsedPackagesFile {
+	packages: unknown[];
+	npmCommand?: string[];
+}
+
+/**
+ * Read a settings.json file's `packages` array with a plain, unlocked read, bypassing
+ * `SettingsManager`. `SettingsManager.create` takes an exclusive `proper-lockfile` lock even for
+ * a read and internally swallows an unreadable or malformed file into empty settings with no way
+ * for a caller to observe it — silently dropping every package agent from that scope with nothing
+ * printed, despite this module's own fail-soft comment promising a diagnostic for exactly that
+ * case. A missing file is the common, silent case and is not reported; a file that exists but
+ * cannot be read or parsed gets exactly one diagnostic line naming it, and the caller is left to
+ * carry on with whatever the other scope's file provides.
+ */
+function readPackagesFile(file: string): ParsedPackagesFile | undefined {
+	let raw: string;
+	try {
+		raw = fs.readFileSync(file, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
+		console.error(
+			`pi-subagents: could not read ${file} (${error instanceof Error ? error.message : String(error)}); its package agents are unavailable for this dispatch.`,
+		);
+		return undefined;
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch (error) {
+		console.error(
+			`pi-subagents: could not parse ${file} (${error instanceof Error ? error.message : String(error)}); its package agents are unavailable for this dispatch.`,
+		);
+		return undefined;
+	}
+	if (!isObject(parsed)) return { packages: [] };
+	const npmCommand =
+		Array.isArray(parsed.npmCommand) && parsed.npmCommand.every((entry) => typeof entry === "string")
+			? (parsed.npmCommand as string[])
+			: undefined;
+	return { packages: Array.isArray(parsed.packages) ? parsed.packages : [], npmCommand };
 }
 
 function readDeclaredDirectories(
@@ -119,37 +152,40 @@ export function discoverPackageAgentDirectories(
 	scope: AgentScope,
 	projectTrusted: boolean,
 ): PackageAgentDirectory[] {
-	// Only this setup phase is guarded: per-package failures (getInstalledPath below) and
-	// per-manifest failures (readDeclaredDirectories) are already isolated on their own, so the sole
-	// remaining fault this can catch is the settings/manager construction itself — most plausibly
-	// settings-file lock contention. That is resolver-wide and silently drops every package agent for
-	// this dispatch, unlike a single malformed package, so it gets one diagnostic line rather than
-	// staying silent like the rest of discovery.
-	let settings: SettingsManager;
-	let packages: DefaultPackageManager;
-	try {
-		const projectRoot = findNearestProjectRoot(cwd);
-		const agentDir = getAgentDir();
-		settings = SettingsManager.create(projectRoot, agentDir, { projectTrusted });
-		packages = new DefaultPackageManager({ cwd: projectRoot, agentDir, settingsManager: settings });
-	} catch (error) {
-		console.error(
-			`pi-subagents: package agent discovery could not load package settings (${error instanceof Error ? error.message : String(error)}); no package agents will be available for this dispatch.`,
-		);
-		return [];
-	}
+	const agentDir = getAgentDir();
+	// Anchored to the session cwd exactly, matching where Pi itself builds project settings
+	// (`join(cwd, ".pi", "settings.json")`) and decides project trust (inspecting only `join(cwd,
+	// ".pi")`). Walking up to an ancestor's `.pi/settings.json` here — as an earlier version of this
+	// resolver did — would read repo-controlled `packages` entries Pi itself never considered part of
+	// this session's trusted settings, including for a cwd Pi auto-trusts because it has no `.pi` of
+	// its own.
+	const projectRoot = path.resolve(cwd);
 
 	const configured: Array<{ entry: PackageSource; packageScope: "user" | "project" }> = [];
+	let npmCommand: string[] | undefined;
 	if (scope !== "project") {
-		for (const entry of settings.getGlobalSettings().packages ?? []) {
-			configured.push({ entry, packageScope: "user" });
+		const global = readPackagesFile(path.join(agentDir, "settings.json"));
+		npmCommand = global?.npmCommand;
+		for (const entry of global?.packages ?? []) {
+			configured.push({ entry: entry as PackageSource, packageScope: "user" });
 		}
 	}
 	if (scope !== "user" && projectTrusted) {
-		for (const entry of settings.getProjectSettings().packages ?? []) {
-			configured.push({ entry, packageScope: "project" });
+		const project = readPackagesFile(path.join(projectRoot, CONFIG_DIR_NAME, "settings.json"));
+		for (const entry of project?.packages ?? []) {
+			configured.push({ entry: entry as PackageSource, packageScope: "project" });
 		}
 	}
+	if (configured.length === 0) return [];
+
+	// `DefaultPackageManager.getInstalledPath` only ever calls its settings manager for the
+	// project-trust assertion and, for the legacy global npm-root fallback used to resolve
+	// user-scope npm packages, the configured npm command — never for `packages` itself, which is
+	// already read above with plain, unlocked reads. An in-memory manager supplies exactly that,
+	// without SettingsManager.create's exclusive proper-lockfile read lock (measured ~181ms to
+	// acquire even when uncontended).
+	const settings = SettingsManager.inMemory(npmCommand ? { npmCommand } : {}, { projectTrusted });
+	const packages = new DefaultPackageManager({ cwd: projectRoot, agentDir, settingsManager: settings });
 
 	const byDirectory = new Map<string, PackageAgentDirectory>();
 	for (const { entry, packageScope } of configured) {
@@ -167,5 +203,15 @@ export function discoverPackageAgentDirectories(
 			byDirectory.set(directory.dir, directory);
 		}
 	}
-	return Array.from(byDirectory.values());
+
+	// Every project-scoped directory must sort after every user-scoped one. `Map#set` on an existing
+	// key updates its value in place without moving it, so a directory both scopes resolve to keeps
+	// the position of whichever scope inserted it first — always the user pass above, since it always
+	// runs before the project pass. Left alone, that stale early position could let a later, unrelated
+	// user-scoped directory's agent beat this one by name downstream, inverting the documented
+	// `user package < project package` precedence. A stable sort restores it regardless of Map
+	// insertion order.
+	return Array.from(byDirectory.values()).sort((a, b) =>
+		a.packageScope === b.packageScope ? 0 : a.packageScope === "project" ? 1 : -1,
+	);
 }

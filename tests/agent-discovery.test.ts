@@ -23,7 +23,12 @@ function writeAgent(dir: string, name: string, marker: string): void {
 }
 
 function setup(): { root: string; agentDir: string; project: string; packageRoot: string } {
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-discovery-"));
+	// Canonicalize once, here: on macOS os.tmpdir() is itself a symlink
+	// (/var/folders/... -> /private/var/folders/...), and the resolver canonicalises every
+	// package root and directory it returns. Starting from a canonical root means every path this
+	// fixture derives already matches what the resolver hands back, instead of only coincidentally
+	// matching on platforms where os.tmpdir() happens not to involve a symlink.
+	const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agent-discovery-")));
 	roots.push(root);
 	const agentDir = path.join(root, "agent-home");
 	const project = path.join(root, "project");
@@ -86,9 +91,7 @@ test("applies case-insensitive builtin package user project precedence", () => {
 
 test("ignores project package agents until the project is trusted", () => {
 	const { project } = setup();
-	const nested = path.join(project, "nested");
 	const packageRoot = path.join(project, ".pi", "npm", "node_modules", "project-review");
-	fs.mkdirSync(nested, { recursive: true });
 	writeAgent(path.join(packageRoot, "agents"), "project-auditor", "trusted package marker");
 	fs.writeFileSync(
 		path.join(packageRoot, "package.json"),
@@ -103,13 +106,15 @@ test("ignores project package agents until the project is trusted", () => {
 		JSON.stringify({ packages: ["npm:project-review"] }),
 	);
 
+	// Project package settings are read at the session cwd exactly (no ancestor walk), so the cwd
+	// passed here must be the directory that owns `.pi/settings.json` itself.
 	assert.equal(
-		discoverAgents(nested, "both", { projectTrusted: false }).agents.some(
+		discoverAgents(project, "both", { projectTrusted: false }).agents.some(
 			(agent) => agent.name === "project-auditor",
 		),
 		false,
 	);
-	const trusted = discoverAgents(nested, "both", { projectTrusted: true }).agents.find(
+	const trusted = discoverAgents(project, "both", { projectTrusted: true }).agents.find(
 		(agent) => agent.name === "project-auditor",
 	);
 	assert.equal(trusted?.source, "package");
@@ -144,4 +149,36 @@ test("project package definitions replace global package definitions", () => {
 	assert.equal(agent?.source, "package");
 	assert.equal(agent?.packageScope, "project");
 	assert.equal(agent?.systemPrompt.trim(), "project package marker");
+});
+
+test("a project-scoped package beats a same-named agent from an unrelated user-scoped package sharing its directory", () => {
+	const { root, agentDir, project } = setup();
+	// `sharedPackage` is configured in both scopes via the identical absolute local path, so it
+	// resolves to the same canonical directory either way; `otherUserPackage` is a distinct,
+	// purely user-scoped package that happens to define an agent with the same name.
+	const sharedPackage = path.join(root, "shared-package");
+	const otherUserPackage = path.join(root, "other-user-package");
+	writeAgent(path.join(sharedPackage, "agents"), "collision-agent", "project version");
+	writeAgent(path.join(otherUserPackage, "agents"), "collision-agent", "user version");
+	for (const [packageRoot, name] of [
+		[sharedPackage, "shared-package"],
+		[otherUserPackage, "other-user-package"],
+	] as const) {
+		fs.writeFileSync(
+			path.join(packageRoot, "package.json"),
+			JSON.stringify({ name, pi: { subagents: { agents: ["./agents"] } } }),
+		);
+	}
+	fs.writeFileSync(
+		path.join(agentDir, "settings.json"),
+		JSON.stringify({ packages: [sharedPackage, otherUserPackage] }),
+	);
+	fs.mkdirSync(path.join(project, ".pi"), { recursive: true });
+	fs.writeFileSync(path.join(project, ".pi", "settings.json"), JSON.stringify({ packages: [sharedPackage] }));
+
+	const agent = discoverAgents(project, "both", { projectTrusted: true }).agents.find(
+		(candidate) => candidate.name === "collision-agent",
+	);
+	assert.equal(agent?.packageScope, "project");
+	assert.equal(agent?.systemPrompt.trim(), "project version");
 });

@@ -3,7 +3,6 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, test } from "node:test";
-import { SettingsManager } from "@earendil-works/pi-coding-agent";
 import { discoverPackageAgentDirectories } from "../extensions/subagents/package-agents.ts";
 
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -16,7 +15,13 @@ afterEach(() => {
 });
 
 function fixture(): { root: string; agentDir: string; project: string } {
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "package-agent-discovery-"));
+	// Canonicalize once, here: on macOS os.tmpdir() is itself a symlink
+	// (/var/folders/... -> /private/var/folders/...), and the resolver canonicalises every
+	// package root and directory it returns. Starting from a canonical root means every path this
+	// fixture derives (agentDir, project, and whatever tests build under them) already matches
+	// what the resolver hands back, instead of only coincidentally matching on platforms where
+	// os.tmpdir() happens not to involve a symlink.
+	const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "package-agent-discovery-")));
 	roots.push(root);
 	const agentDir = path.join(root, "agent-home");
 	const project = path.join(root, "project");
@@ -65,7 +70,26 @@ test("resolves declared agent directories for configured npm, git, and local pac
 	);
 });
 
-test("loads nearest project packages only after project trust", () => {
+test("loads project packages declared at the exact session cwd only after project trust", () => {
+	const { agentDir, project } = fixture();
+	const packageRoot = path.join(project, ".pi", "npm", "node_modules", "project-agents");
+	writePackage(packageRoot, "project-agents");
+	fs.mkdirSync(path.join(project, ".pi"), { recursive: true });
+	fs.writeFileSync(
+		path.join(project, ".pi", "settings.json"),
+		JSON.stringify({ packages: ["npm:project-agents"] }),
+	);
+	fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ packages: [] }));
+
+	assert.deepEqual(discoverPackageAgentDirectories(project, "both", false), []);
+	const trusted = discoverPackageAgentDirectories(project, "both", true);
+	assert.equal(trusted.length, 1);
+	assert.equal(trusted[0]?.packageScope, "project");
+	assert.equal(trusted[0]?.dir, path.join(packageRoot, "agents"));
+	assert.deepEqual(discoverPackageAgentDirectories(project, "user", true), []);
+});
+
+test("never reads an ancestor's .pi/settings.json for project packages, even when trusted", () => {
 	const { agentDir, project } = fixture();
 	const nested = path.join(project, "src", "nested");
 	const packageRoot = path.join(project, ".pi", "npm", "node_modules", "project-agents");
@@ -78,12 +102,52 @@ test("loads nearest project packages only after project trust", () => {
 	);
 	fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ packages: [] }));
 
-	assert.deepEqual(discoverPackageAgentDirectories(nested, "both", false), []);
-	const trusted = discoverPackageAgentDirectories(nested, "both", true);
-	assert.equal(trusted.length, 1);
-	assert.equal(trusted[0]?.packageScope, "project");
-	assert.equal(trusted[0]?.dir, path.join(packageRoot, "agents"));
-	assert.deepEqual(discoverPackageAgentDirectories(nested, "user", true), []);
+	// Pi itself builds project settings at the session cwd exactly (`join(cwd, ".pi", "settings.json")`)
+	// and auto-trusts a session cwd that has no `.pi` of its own. A resolver that walked up to an
+	// ancestor's `.pi/settings.json` here would read repo-controlled `packages` (and any `tools:`
+	// grants they imply) that Pi itself never considered part of this session's trusted settings, for
+	// a session Pi may not even have prompted to trust. `trusted: true` here models that auto-trust,
+	// not an actual trust decision about the ancestor project.
+	assert.deepEqual(discoverPackageAgentDirectories(nested, "both", true), []);
+});
+
+test("orders every project-scoped directory after every user-scoped one, even when a directory is configured in both scopes", () => {
+	const { root, agentDir, project } = fixture();
+	// `sharedRoot` is deliberately configured in *both* scopes via the identical absolute local
+	// path, so it resolves to the exact same canonical directory either way. `otherUserRoot` is a
+	// distinct, purely user-scoped directory listed *after* `sharedRoot` in user settings, so it is
+	// the later of the two to be inserted into the dedup map on the user pass.
+	const sharedRoot = path.join(root, "shared-pkg");
+	const otherUserRoot = path.join(root, "other-user-pkg");
+	writePackage(sharedRoot, "shared-pkg");
+	writePackage(otherUserRoot, "other-user-pkg");
+	fs.writeFileSync(
+		path.join(agentDir, "settings.json"),
+		JSON.stringify({ packages: [sharedRoot, otherUserRoot] }),
+	);
+	fs.mkdirSync(path.join(project, ".pi"), { recursive: true });
+	fs.writeFileSync(
+		path.join(project, ".pi", "settings.json"),
+		JSON.stringify({ packages: [sharedRoot] }),
+	);
+
+	const found = discoverPackageAgentDirectories(project, "both", true);
+	const sharedDir = path.join(sharedRoot, "agents");
+	const otherDir = path.join(otherUserRoot, "agents");
+	const scopesByDir = new Map(found.map((entry) => [entry.dir, entry.packageScope]));
+
+	// The directory shared by both scopes must resolve as "project" (the project pass runs last),
+	assert.equal(scopesByDir.get(sharedDir), "project");
+	assert.equal(scopesByDir.get(otherDir), "user");
+	// ...and, because a `Map#set` on an existing key updates the value in place without moving its
+	// position, that project-scoped directory must still be ordered after every purely user-scoped
+	// one, or a same-named agent from `otherUserRoot` could load after it and win by agent name.
+	const sharedIndex = found.findIndex((entry) => entry.dir === sharedDir);
+	const otherIndex = found.findIndex((entry) => entry.dir === otherDir);
+	assert.ok(
+		sharedIndex > otherIndex,
+		`expected the project-scoped directory (index ${sharedIndex}) after the user-scoped one (index ${otherIndex})`,
+	);
 });
 
 test("excludes symlinks escaping the package root", () => {
@@ -163,31 +227,60 @@ test("skips malformed packages entries (null, a number, a boolean, an array, a s
 	assert.deepEqual(found.map((entry) => entry.dir), [path.join(validRoot, "agents")]);
 });
 
-test("a resolver-wide settings failure returns no package agents and logs exactly one diagnostic line", () => {
-	const { agentDir, project } = fixture();
-	fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ packages: [] }));
-
-	// Per-package and per-manifest failures are already covered above and must stay silent; this
-	// simulates the one fault that is *not* isolated deeper: settings/manager construction itself
-	// (most plausibly settings-file lock contention), which drops every package agent for the
-	// dispatch and therefore earns a trace, unlike a single malformed package.
-	const originalCreate = SettingsManager.create;
+/** Capture console.error for the duration of `fn`, restoring the original afterward. */
+function captureConsoleError<T>(fn: () => T): { result: T; errors: unknown[][] } {
 	const originalConsoleError = console.error;
 	const errors: unknown[][] = [];
-	SettingsManager.create = (): never => {
-		throw new Error("settings file is locked");
-	};
 	console.error = (...args: unknown[]) => {
 		errors.push(args);
 	};
 	try {
-		const found = discoverPackageAgentDirectories(project, "user", false);
-		assert.deepEqual(found, []);
+		return { result: fn(), errors };
 	} finally {
-		SettingsManager.create = originalCreate;
 		console.error = originalConsoleError;
 	}
+}
 
+test("an unreadable settings file logs one diagnostic naming it and still resolves the other scope", () => {
+	const { agentDir, project } = fixture();
+	// A directory in place of the settings file makes fs.readFileSync throw EISDIR deterministically,
+	// regardless of which user runs the test (unlike chmod, which a root-owned process ignores).
+	fs.mkdirSync(path.join(agentDir, "settings.json"), { recursive: true });
+	const packageRoot = path.join(project, ".pi", "npm", "node_modules", "project-agents");
+	writePackage(packageRoot, "project-agents");
+	fs.mkdirSync(path.join(project, ".pi"), { recursive: true });
+	fs.writeFileSync(
+		path.join(project, ".pi", "settings.json"),
+		JSON.stringify({ packages: ["npm:project-agents"] }),
+	);
+
+	const { result: found, errors } = captureConsoleError(() =>
+		discoverPackageAgentDirectories(project, "both", true),
+	);
+
+	// The unreadable *user* settings file must not take the *project* scope down with it.
+	assert.deepEqual(found.map((entry) => entry.packageScope), ["project"]);
 	assert.equal(errors.length, 1, "expected exactly one diagnostic line, not silence or a per-call flood");
-	assert.match(String(errors[0]?.[0]), /settings file is locked/);
+	assert.match(String(errors[0]?.[0]), new RegExp(path.join(agentDir, "settings.json").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
+test("a malformed settings file logs one diagnostic naming it and still resolves the other scope", () => {
+	const { agentDir, project } = fixture();
+	const userPackageRoot = path.join(agentDir, "npm", "node_modules", "user-agents");
+	writePackage(userPackageRoot, "user-agents");
+	fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ packages: ["npm:user-agents"] }));
+	fs.mkdirSync(path.join(project, ".pi"), { recursive: true });
+	fs.writeFileSync(path.join(project, ".pi", "settings.json"), "{not-json");
+
+	const { result: found, errors } = captureConsoleError(() =>
+		discoverPackageAgentDirectories(project, "both", true),
+	);
+
+	// The malformed *project* settings file must not take the *user* scope down with it.
+	assert.deepEqual(found.map((entry) => entry.packageScope), ["user"]);
+	assert.equal(errors.length, 1, "expected exactly one diagnostic line, not silence or a per-call flood");
+	assert.match(
+		String(errors[0]?.[0]),
+		new RegExp(path.join(project, ".pi", "settings.json").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+	);
 });
