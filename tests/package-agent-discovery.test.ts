@@ -144,6 +144,25 @@ test("skips disabled, escaping, absolute, missing, and malformed package declara
 	assert.deepEqual(found.map((entry) => entry.dir), [path.join(mixedRoot, "agents")]);
 });
 
+test("skips malformed packages entries (null, a number, a boolean, an array, a sourceless object) and still resolves a valid entry", () => {
+	const { root, agentDir, project } = fixture();
+	const validRoot = path.join(root, "valid");
+	writePackage(validRoot, "valid-agents");
+	// A settings.json entry is untrusted, unvalidated JSON: none of these conform to the
+	// PackageSource shape the type checker promises, and discovery must skip each one silently
+	// rather than throw while indexing into it (null in particular used to throw synchronously,
+	// before ever reaching the per-entry try/catch around getInstalledPath).
+	fs.writeFileSync(
+		path.join(agentDir, "settings.json"),
+		JSON.stringify({
+			packages: [null, 42, true, [], { autoload: true }, validRoot],
+		}),
+	);
+
+	const found = discoverPackageAgentDirectories(project, "user", false);
+	assert.deepEqual(found.map((entry) => entry.dir), [path.join(validRoot, "agents")]);
+});
+
 test("a resolver-wide settings failure returns no package agents and logs exactly one diagnostic line", () => {
 	const { agentDir, project } = fixture();
 	fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ packages: [] }));

@@ -57,12 +57,22 @@ function findNearestProjectRoot(cwd: string): string {
 	}
 }
 
-function packageSource(entry: PackageSource): string {
-	return typeof entry === "string" ? entry : entry.source;
+/**
+ * `settings.json` is untrusted, unvalidated JSON — `SettingsManager` parses it with no runtime
+ * schema check — so a `packages` entry can be anything JSON allows: `null`, a number, a boolean,
+ * an array, or an object with no (or a non-string) `source`, not just the `PackageSource` shape
+ * the type checker promises. Treat anything else as having no usable source rather than indexing
+ * into it and assuming the compile-time type held at runtime.
+ */
+function packageSource(entry: unknown): string | undefined {
+	if (typeof entry === "string") return entry;
+	return isObject(entry) && typeof entry.source === "string" ? entry.source : undefined;
 }
 
-function packageAutoloads(entry: PackageSource): boolean {
-	return typeof entry === "string" || entry.autoload !== false;
+/** Same untrusted-JSON caveat as packageSource: only a plain object can carry `autoload`, and
+ * `isObject` already excludes `null` (`typeof null === "object"`), arrays, and every primitive. */
+function packageAutoloads(entry: unknown): boolean {
+	return typeof entry === "string" || (isObject(entry) && entry.autoload !== false);
 }
 
 function readDeclaredDirectories(
@@ -144,9 +154,11 @@ export function discoverPackageAgentDirectories(
 	const byDirectory = new Map<string, PackageAgentDirectory>();
 	for (const { entry, packageScope } of configured) {
 		if (!packageAutoloads(entry)) continue;
+		const source = packageSource(entry);
+		if (!source) continue;
 		let packageRoot: string | undefined;
 		try {
-			packageRoot = packages.getInstalledPath(packageSource(entry), packageScope);
+			packageRoot = packages.getInstalledPath(source, packageScope);
 		} catch {
 			continue;
 		}
