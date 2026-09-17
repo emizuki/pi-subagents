@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, test } from "node:test";
+import { SettingsManager } from "@earendil-works/pi-coding-agent";
 import { discoverPackageAgentDirectories } from "../extensions/subagents/package-agents.ts";
 
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -141,4 +142,33 @@ test("skips disabled, escaping, absolute, missing, and malformed package declara
 
 	const found = discoverPackageAgentDirectories(project, "user", false);
 	assert.deepEqual(found.map((entry) => entry.dir), [path.join(mixedRoot, "agents")]);
+});
+
+test("a resolver-wide settings failure returns no package agents and logs exactly one diagnostic line", () => {
+	const { agentDir, project } = fixture();
+	fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ packages: [] }));
+
+	// Per-package and per-manifest failures are already covered above and must stay silent; this
+	// simulates the one fault that is *not* isolated deeper: settings/manager construction itself
+	// (most plausibly settings-file lock contention), which drops every package agent for the
+	// dispatch and therefore earns a trace, unlike a single malformed package.
+	const originalCreate = SettingsManager.create;
+	const originalConsoleError = console.error;
+	const errors: unknown[][] = [];
+	SettingsManager.create = (): never => {
+		throw new Error("settings file is locked");
+	};
+	console.error = (...args: unknown[]) => {
+		errors.push(args);
+	};
+	try {
+		const found = discoverPackageAgentDirectories(project, "user", false);
+		assert.deepEqual(found, []);
+	} finally {
+		SettingsManager.create = originalCreate;
+		console.error = originalConsoleError;
+	}
+
+	assert.equal(errors.length, 1, "expected exactly one diagnostic line, not silence or a per-call flood");
+	assert.match(String(errors[0]?.[0]), /settings file is locked/);
 });

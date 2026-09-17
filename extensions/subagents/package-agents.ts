@@ -109,39 +109,51 @@ export function discoverPackageAgentDirectories(
 	scope: AgentScope,
 	projectTrusted: boolean,
 ): PackageAgentDirectory[] {
+	// Only this setup phase is guarded: per-package failures (getInstalledPath below) and
+	// per-manifest failures (readDeclaredDirectories) are already isolated on their own, so the sole
+	// remaining fault this can catch is the settings/manager construction itself — most plausibly
+	// settings-file lock contention. That is resolver-wide and silently drops every package agent for
+	// this dispatch, unlike a single malformed package, so it gets one diagnostic line rather than
+	// staying silent like the rest of discovery.
+	let settings: SettingsManager;
+	let packages: DefaultPackageManager;
 	try {
 		const projectRoot = findNearestProjectRoot(cwd);
 		const agentDir = getAgentDir();
-		const settings = SettingsManager.create(projectRoot, agentDir, { projectTrusted });
-		const packages = new DefaultPackageManager({ cwd: projectRoot, agentDir, settingsManager: settings });
-		const configured: Array<{ entry: PackageSource; packageScope: "user" | "project" }> = [];
-		if (scope !== "project") {
-			for (const entry of settings.getGlobalSettings().packages ?? []) {
-				configured.push({ entry, packageScope: "user" });
-			}
-		}
-		if (scope !== "user" && projectTrusted) {
-			for (const entry of settings.getProjectSettings().packages ?? []) {
-				configured.push({ entry, packageScope: "project" });
-			}
-		}
-
-		const byDirectory = new Map<string, PackageAgentDirectory>();
-		for (const { entry, packageScope } of configured) {
-			if (!packageAutoloads(entry)) continue;
-			let packageRoot: string | undefined;
-			try {
-				packageRoot = packages.getInstalledPath(packageSource(entry), packageScope);
-			} catch {
-				continue;
-			}
-			if (!packageRoot) continue;
-			for (const directory of readDeclaredDirectories(packageRoot, packageScope)) {
-				byDirectory.set(directory.dir, directory);
-			}
-		}
-		return Array.from(byDirectory.values());
-	} catch {
+		settings = SettingsManager.create(projectRoot, agentDir, { projectTrusted });
+		packages = new DefaultPackageManager({ cwd: projectRoot, agentDir, settingsManager: settings });
+	} catch (error) {
+		console.error(
+			`pi-subagents: package agent discovery could not load package settings (${error instanceof Error ? error.message : String(error)}); no package agents will be available for this dispatch.`,
+		);
 		return [];
 	}
+
+	const configured: Array<{ entry: PackageSource; packageScope: "user" | "project" }> = [];
+	if (scope !== "project") {
+		for (const entry of settings.getGlobalSettings().packages ?? []) {
+			configured.push({ entry, packageScope: "user" });
+		}
+	}
+	if (scope !== "user" && projectTrusted) {
+		for (const entry of settings.getProjectSettings().packages ?? []) {
+			configured.push({ entry, packageScope: "project" });
+		}
+	}
+
+	const byDirectory = new Map<string, PackageAgentDirectory>();
+	for (const { entry, packageScope } of configured) {
+		if (!packageAutoloads(entry)) continue;
+		let packageRoot: string | undefined;
+		try {
+			packageRoot = packages.getInstalledPath(packageSource(entry), packageScope);
+		} catch {
+			continue;
+		}
+		if (!packageRoot) continue;
+		for (const directory of readDeclaredDirectories(packageRoot, packageScope)) {
+			byDirectory.set(directory.dir, directory);
+		}
+	}
+	return Array.from(byDirectory.values());
 }
