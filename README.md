@@ -19,44 +19,21 @@ or every model Pi considers available across all providers when the session is u
 pi install npm:@emizuki/pi-subagents
 ```
 
-Agent definitions are not a pi resource type, so link the bundled samples into Pi's agent
-directory. This refuses to overwrite a different global agent with the same name:
+That is the only required step. The extension loads its bundled agents directly from the installed
+package; no copy or symlink into `~/.pi/agent/agents` is needed.
+
+To track the development branch directly instead:
 
 ```bash
-set -euo pipefail
-agent_root="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
-source_dir="$agent_root/npm/node_modules/@emizuki/pi-subagents/agents"
-dest_dir="$agent_root/agents"
-
-test -d "$source_dir"
-mkdir -p "$dest_dir"
-
-for source in "$source_dir"/*.md; do
-  dest="$dest_dir/$(basename "$source")"
-  if [ -L "$dest" ] && [ "$(readlink "$dest")" = "$source" ]; then
-    continue
-  fi
-  if [ -e "$dest" ] || [ -L "$dest" ]; then
-    printf 'Refusing to replace existing agent: %s\n' "$dest" >&2
-    exit 1
-  fi
-done
-
-for source in "$source_dir"/*.md; do
-  dest="$dest_dir/$(basename "$source")"
-  [ -L "$dest" ] || ln -s "$source" "$dest"
-done
+pi install git:github.com/emizuki/pi-subagents
 ```
 
-Run `/reload` after adding or updating the links. Symlinking keeps the samples in step when Pi
-updates the npm package; copies would go stale.
+Older releases asked users to create agent symlinks manually. Existing links remain compatible and
+shadow the identical bundled definitions as user agents, but they can be removed once this version
+is installed.
 
-To track the development branch directly instead, install
-`git:github.com/emizuki/pi-subagents` and use
-`$agent_root/git/github.com/emizuki/pi-subagents/agents` as `source_dir`.
-
-The samples ship without a `model:` pin, so they inherit whatever the session is on. Add a pin
-only when a specific agent should deviate.
+The bundled agents ship without a `model:` pin, so they inherit whatever the session is on. Add a
+pin only when a specific agent should deviate.
 
 ## Usage
 
