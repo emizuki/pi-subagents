@@ -229,8 +229,9 @@ imperceptible next to a human deciding.
 
 The tool is registered only inside a spawned child, and it is appended to that agent's `tools`
 allowlist automatically, since an agent with an explicit list could otherwise never reach it.
-Delegation stops at one level, but asking upward does not: the tool a child gets is the one
-pointing back up, not the one pointing further down.
+An authorized coordinator gets both directions: `contact_supervisor` points upward and `subagent`
+points downward. A depth-2 grandchild gets only `contact_supervisor`; delegation stops at the hard
+depth-2 ceiling.
 
 When the parent has no UI there is nothing to ask, so no channel directory is created. The child
 still has the tool — registration depends only on depth — but calling it returns an immediate
@@ -343,6 +344,10 @@ Authority is pinned at first launch, not at any launch. A run first launched whi
 `maxNestedSpawns` was `0` stores no contract, so re-enabling nesting later never grants it
 delegation on resume — only a fresh launch can.
 
+Coordinators run synchronously: `{ agent: "reviewer", task: "...", async: true }` is rejected so
+its nested tree remains owned by the root call. Leaf agents such as `recon` still support detached
+runs with `async: true`.
+
 A nested child exits when the process that owns it disappears, detected by polling. If the owner's
 process id is recycled by the operating system within the lifetime of a run, that check cannot tell
 the difference and the child will not exit on its own. There is no portable fix: a process's start
@@ -387,7 +392,9 @@ a repo-controlled prompt without the prompt that a canonical name would have tri
     "maxThinking": "high",
     "defaultContext": "fresh",
     "maxParallelTasks": 8,
-    "maxConcurrency": 4
+    "maxConcurrency": 4,
+    "maxNestedSpawns": 4,
+    "maxNestedConcurrency": 2
   }
 }
 ```
@@ -534,7 +541,7 @@ ignored until pi reports the project trusted.
 - Every final tool result is capped globally at pi's 50 KB / 2,000-line limits, including the aggregate from parallel tasks. Full text remains in tool `details`, and truncation notices preserve resumable run ids.
 - Agents are rediscovered on each invocation, so they can be edited mid-session.
 - Parallel mode defaults to 8 tasks, 4 concurrent; raise or remove both in user settings.
-- Removing the limits does not remove the depth limit: a child still cannot dispatch its own subagents.
+- Removing the limits does not remove the depth limit: only an authorized depth-1 coordinator can dispatch nested probes; a grandchild cannot dispatch further.
 
 ## Checks
 

@@ -9,7 +9,7 @@ import { after, before, beforeEach, test } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import extension from "../extensions/subagents/index.ts";
 import { __resetNestedSpawnBudget } from "../extensions/subagents/dispatch.ts";
-import type { AgentConfig } from "../extensions/subagents/agents.ts";
+import { discoverAgents, type AgentConfig } from "../extensions/subagents/agents.ts";
 import { writeFakePi } from "./fake-pi.ts";
 import {
 	encodeNestedRuntime,
@@ -607,6 +607,20 @@ test("a non-subagent tool result does not inflate the total", async () => {
 test("reviewer delegates a probe to recon end to end", async () => {
 	const capture = path.join(tempRoot(), "argv.jsonl");
 	const environmentCapture = path.join(tempRoot(), "environment.jsonl");
+	const userAgentsDir = path.join(agentDir, "agents");
+	rmSync(path.join(userAgentsDir, "reviewer.md"), { force: true });
+	rmSync(path.join(userAgentsDir, "recon.md"), { force: true });
+	const shippedAgents = discoverAgents(root, "user").agents;
+	const shippedReviewer = shippedAgents.find((agent) => agent.name === "reviewer");
+	const shippedRecon = shippedAgents.find((agent) => agent.name === "recon");
+	assert.ok(shippedReviewer, "the shipped reviewer must be discoverable");
+	assert.ok(shippedRecon, "the shipped recon must be discoverable");
+	assert.equal(shippedReviewer.source, "builtin");
+	assert.equal(shippedRecon.source, "builtin");
+	assert.ok(shippedReviewer.filePath.endsWith(path.join("agents", "reviewer.md")));
+	assert.ok(shippedRecon.filePath.endsWith(path.join("agents", "recon.md")));
+	assert.equal(shippedReviewer.allowNestedSubagents, true);
+	assert.deepEqual(shippedReviewer.allowedSubagents, ["recon"]);
 	process.env.FAKE_PI_ENV_CAPTURE = environmentCapture;
 	setFakeMode("delegate", capture); // coordinator emits a nested subagent tool call, then finishes
 	try {
@@ -620,6 +634,15 @@ test("reviewer delegates a probe to recon end to end", async () => {
 		const grandchild = environments.find((entry) => entry.agent === "recon");
 		assert.equal(invocations.length, 2, "both levels must have been launched");
 		assert.ok(child && grandchild, "reviewer and recon must both have been launched");
+		assert.equal(child.depth, "1");
+		assert.equal(grandchild.depth, "2");
+		assert.equal(grandchild.owner, String(child.pid), "recon must be owned by reviewer");
+		// The separate "a coordinator receives an envelope naming exactly its resolved delegates"
+		// test also covers this grant; fake-pi invokes registered tools without enforcing --tools.
+		assert.ok(
+			invocations.some((args) => optionValue(args, "--tools")?.split(",").includes("subagent")),
+			"the coordinator launch must include subagent in --tools",
+		);
 		assert.ok(succeeded(result));
 	} finally {
 		delete process.env.FAKE_PI_CAPTURE;
