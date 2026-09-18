@@ -110,8 +110,10 @@ function matchAgents(agents: AgentConfig[], wanted: string): AgentConfig[] {
 
 /**
  * Turn a coordinator's declared `allowedSubagents` into the canonical names the root is willing to
- * authorize. Every rejection is reported rather than silently swallowed, because this runs for an
- * agent that ships enabled by default and a silent empty result looks identical to a bug.
+ * authorize. The caller must check `allowNestedSubagents` before using this result; this function
+ * only resolves and filters the declared candidates. Every rejection is reported rather than
+ * silently swallowed, because this runs for an agent that ships enabled by default and a silent
+ * empty result looks identical to a bug.
  */
 export function resolveAllowedAgents(
 	coordinator: AgentConfig,

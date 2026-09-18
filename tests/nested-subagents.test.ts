@@ -440,6 +440,42 @@ test("self-reference is dropped by identity, not by spelling", () => {
 	assert.deepEqual(resolveAllowedAgents(reviewer, [reviewer]).allowed, []);
 });
 
+test("self-reference is dropped when names match across different files", () => {
+	const coordinator = agent({
+		name: "reviewer",
+		filePath: "/a/reviewer.md",
+		tools: ["read"],
+		allowNestedSubagents: true,
+		allowedSubagents: ["reviewer"],
+	});
+	const sameName = agent({ name: "reviewer", filePath: "/other/reviewer.md", tools: ["read"] });
+	assert.deepEqual(resolveAllowedAgents(coordinator, [sameName]).allowed, []);
+});
+
+test("self-reference is dropped when file identity matches across different names", () => {
+	const coordinator = agent({
+		name: "reviewer",
+		filePath: "/a/reviewer.md",
+		tools: ["read"],
+		allowNestedSubagents: true,
+		allowedSubagents: ["clone"],
+	});
+	const clone = agent({ name: "clone", filePath: "/a/reviewer.md", tools: ["read"] });
+	assert.deepEqual(resolveAllowedAgents(coordinator, [clone]).allowed, []);
+});
+
+test("resolution matches names and aliases case-insensitively", () => {
+	const boss = agent({
+		name: "boss",
+		tools: ["read"],
+		allowNestedSubagents: true,
+		allowedSubagents: ["RECON", "SCOUT"],
+	});
+	const recon = agent({ name: "recon", tools: ["read"] });
+	const scout = agent({ name: "other", aliases: ["scout"], tools: ["read"] });
+	assert.deepEqual(resolveAllowedAgents(boss, [boss, recon, scout]).allowed, ["recon", "other"]);
+});
+
 test("resolution canonicalises an alias to the agent's real name", () => {
 	const boss = agent({ name: "boss", tools: ["read"], allowNestedSubagents: true, allowedSubagents: ["scout"] });
 	const recon = agent({ name: "recon", aliases: ["scout"], tools: ["read"] });
@@ -459,6 +495,8 @@ test("model ceiling intersects, preserves order, and distinguishes null from emp
 	// null means the root was unscoped: everything local stays selectable.
 	assert.deepEqual(intersectModelCeiling(choices, null), choices);
 	assert.deepEqual(intersectModelCeiling(choices, ["p/cheap"]), [cheap]);
+	// Matching is case-insensitive and output order remains the local choice order, not ceiling order.
+	assert.deepEqual(intersectModelCeiling(choices, ["P/DEAR", "P/CHEAP"]), choices);
 	// An empty ceiling means nothing is selectable. It must never be read as "unrestricted".
 	assert.deepEqual(intersectModelCeiling(choices, []), []);
 	// A ceiling naming something absent locally yields nothing rather than falling back.
