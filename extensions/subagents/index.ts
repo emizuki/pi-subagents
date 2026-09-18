@@ -70,8 +70,31 @@ import {
 	toolResultMetadata,
 	type ToolResultDraft,
 } from "./results.ts";
+import {
+	abortAllAsyncRuns,
+	type AsyncRun,
+	asyncRuns,
+	clearRetainedRuns,
+	describeAsyncRun,
+	findSessionFile,
+	newRunId,
+	type RetainedRun,
+	retainedRuns,
+	retentionRoot,
+	runsInFlight,
+	sweepStaleTempDirs,
+	truncateForListing,
+} from "./runs.ts";
 import { sanitizeSessionForFork } from "./session-fork.ts";
 import { type ForkContext, readSubagentSettings, trustedProjectSettings } from "./settings.ts";
+import {
+	drainSupervisorRequests,
+	IPC_ENV_VAR,
+	registerContactSupervisorTool,
+	SUPERVISOR_POLL_MS,
+	SUPERVISOR_TOOL,
+	type SupervisorHandler,
+} from "./supervisor.ts";
 
 /** How long a child gets to exit on SIGTERM before SIGKILL. */
 const SIGKILL_GRACE_MS = 5_000;
@@ -140,253 +163,10 @@ interface DispatchDefaults {
 	supervise?: SupervisorHandler;
 }
 
-/** Directory the child writes supervisor requests into and reads replies from. */
-const IPC_ENV_VAR = "PI_SUBAGENT_IPC_DIR";
-/** A supervisor request waits on a human, so the ceiling is generous; it exists to avoid a hang. */
-const SUPERVISOR_TIMEOUT_MS = 10 * 60_000;
-const SUPERVISOR_POLL_MS = 250;
-const SUPERVISOR_TOOL = "contact_supervisor";
-const SUPERVISOR_REASONS = ["need_decision", "interview_request", "progress_update"] as const;
-type SupervisorReason = (typeof SUPERVISOR_REASONS)[number];
-
-interface SupervisorRequest {
-	id: string;
-	reason: SupervisorReason;
-	message: string;
-	agent: string;
-}
-
 interface TaskOverrides {
 	model?: string;
 	thinking?: ThinkingLevel;
 	context?: ForkContext;
-}
-
-type SupervisorHandler = (request: SupervisorRequest) => Promise<string>;
-
-/**
- * Retained child sessions for this parent session. A reviewer that finds a fault is only useful
- * if the agent that wrote the code can be handed that finding — which needs its session back,
- * not a fresh child re-derived from a task description.
- */
-const retentionRoot = path.join(os.tmpdir(), `pi-subagent-runs-${process.pid}`);
-
-interface RetainedRun {
-	id: string;
-	agent: string;
-	agentSource: AgentSource;
-	agentFilePath: string;
-	/** Package provenance, carried alongside agentSource so a resumed run can still be judged
-	 * repo-controlled — or re-saved as one across further resumes — after its live discovery entry
-	 * is gone. */
-	agentPackageScope?: "user" | "project";
-	agentPackageRoot?: string;
-	agentPackageName?: string;
-	/** The resolved launch contract. A resumed child keeps it rather than re-deriving it. */
-	model?: string;
-	thinking?: ThinkingLevel;
-	tools?: string[];
-	inheritSkills: boolean;
-	inheritProjectContext: boolean;
-	defaultContext?: ForkContext;
-	systemPrompt: string;
-	cwd: string;
-	runDir: string;
-	sessionFile?: string;
-	resumable: boolean;
-}
-
-const retainedRuns = new Map<string, RetainedRun>();
-
-/** pi names the session itself, so find it rather than assuming a path. */
-function findSessionFile(runDir: string): string | undefined {
-	const stack = [runDir];
-	let newest: { file: string; mtime: number } | undefined;
-	while (stack.length > 0) {
-		const dir = stack.pop() as string;
-		let entries: fs.Dirent[];
-		try {
-			entries = fs.readdirSync(dir, { withFileTypes: true });
-		} catch {
-			continue;
-		}
-		for (const entry of entries) {
-			const full = path.join(dir, entry.name);
-			if (entry.isDirectory()) stack.push(full);
-			else if (entry.name.endsWith(".jsonl")) {
-				try {
-					const mtime = fs.statSync(full).mtimeMs;
-					if (!newest || mtime > newest.mtime) newest = { file: full, mtime };
-				} catch {
-					// Vanished between readdir and stat; not a reason to discard a finished run.
-				}
-			}
-		}
-	}
-	return newest?.file;
-}
-
-const STALE_TEMP_AGE_MS = 24 * 60 * 60 * 1000;
-
-function isProcessAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		// EPERM means it exists and belongs to someone else, which still counts as alive.
-		return (error as NodeJS.ErrnoException)?.code === "EPERM";
-	}
-}
-
-/**
- * Remove scratch directories left by earlier runs.
- *
- * Every temp directory here is cleaned in a `finally`, which does not run when the process is
- * killed outright — an aborted session, a crash, a machine going down mid-dispatch. Each orphan
- * is small, but they accumulate in /tmp forever. Only sweep what is old enough that it cannot
- * belong to a session still running.
- */
-function sweepStaleTempDirs(): void {
-	const cutoff = Date.now() - STALE_TEMP_AGE_MS;
-	let entries: fs.Dirent[];
-	try {
-		entries = fs.readdirSync(os.tmpdir(), { withFileTypes: true });
-	} catch {
-		return;
-	}
-	for (const entry of entries) {
-		if (!entry.isDirectory() || !entry.name.startsWith("pi-subagent-")) continue;
-		// A retention root's mtime only moves when a dispatch adds a directory, so a long quiet
-		// session would look stale; never sweep one whose owning process is still alive.
-		const owner = /^pi-subagent-runs-(\d+)$/.exec(entry.name)?.[1];
-		if (owner && isProcessAlive(Number(owner))) continue;
-		const full = path.join(os.tmpdir(), entry.name);
-		try {
-			if (fs.statSync(full).mtimeMs > cutoff) continue;
-			fs.rmSync(full, { recursive: true, force: true });
-		} catch {
-			// Another session's directory, or one being removed right now; leave it alone.
-		}
-	}
-}
-
-function newRunId(): string {
-	return randomUUID().slice(0, 8);
-}
-
-function clearRetainedRuns(): void {
-	retainedRuns.clear();
-	try {
-		fs.rmSync(retentionRoot, { recursive: true, force: true });
-	} catch {
-		/* ignore */
-	}
-}
-
-type AsyncRunState = "running" | "complete" | "failed" | "stopped";
-
-interface AsyncRun {
-	id: string;
-	agent: string;
-	task: string;
-	state: AsyncRunState;
-	startedAt: number;
-	finishedAt?: number;
-	controller: AbortController;
-	result?: SingleResult;
-	error?: string;
-}
-
-/**
- * Detached runs for this session. Module state, which lives as long as the extension does, so a
- * run started in one tool call is still addressable from the next.
- */
-const asyncRuns = new Map<string, AsyncRun>();
-
-/**
- * Run ids with a live child, detached or not.
- *
- * `asyncRuns` state flips to "stopped" the moment abort is requested, but the child still has
- * SIGKILL_GRACE_MS to exit and is still flushing its transcript. Resuming against that file would
- * put a second pi on it. Synchronous runs never enter `asyncRuns` at all, so they need the same
- * bookkeeping.
- */
-const runsInFlight = new Set<string>();
-
-const LISTED_RUN_CHARS = 800;
-
-function truncateForListing(text: string): string {
-	return text.length <= LISTED_RUN_CHARS ? text : `${text.slice(0, LISTED_RUN_CHARS)}…\n  (ask for this run by id for the rest)`;
-}
-
-function describeAsyncRun(run: AsyncRun): string {
-	const seconds = Math.round(((run.finishedAt ?? Date.now()) - run.startedAt) / 1000);
-	const usage = run.result ? formatUsageStats(run.result.usage, run.result.model) : "";
-	const head = `${run.id}  ${run.state}  ${run.agent}  ${seconds}s${usage ? `  ${usage}` : ""}`;
-	const task = run.task.length > 80 ? `${run.task.slice(0, 80)}…` : run.task;
-	if (run.state === "running") return `${head}\n  task: ${task}`;
-	const body = run.error ?? (run.result ? getResultOutput(run.result) : "(no output)");
-	return `${head}\n  task: ${task}\n  ${body.split("\n").join("\n  ")}`;
-}
-
-/** Stop every live run. Children are separate processes and outlive the session otherwise. */
-function abortAllAsyncRuns(): number {
-	let stopped = 0;
-	for (const run of asyncRuns.values()) {
-		if (run.state !== "running") continue;
-		run.controller.abort();
-		run.state = "stopped";
-		run.finishedAt = Date.now();
-		stopped++;
-	}
-	return stopped;
-}
-
-/**
- * Parent-facing half: answer any requests the child has written, once.
- *
- * Replies are staged then renamed for the same reason requests are: the child polls for the file
- * and must not parse a partial one.
- */
-async function drainSupervisorRequests(dir: string, handle: SupervisorHandler): Promise<void> {
-	let entries: string[];
-	try {
-		entries = fs.readdirSync(dir);
-	} catch {
-		return;
-	}
-	for (const entry of entries) {
-		if (!entry.endsWith(".req.json")) continue;
-		const requestPath = path.join(dir, entry);
-		let request: SupervisorRequest;
-		try {
-			request = JSON.parse(fs.readFileSync(requestPath, "utf8"));
-		} catch {
-			continue;
-		}
-		// Claim it before awaiting, so a slow answer is not handed out twice by the next poll.
-		try {
-			fs.renameSync(requestPath, `${requestPath}.claimed`);
-		} catch {
-			continue;
-		}
-		let answer: string;
-		try {
-			answer = await handle(request);
-		} catch {
-			// A cancelled prompt still has to release the child: the request is already claimed and
-			// can never be handed out again, so saying nothing leaves it blocked until its deadline.
-			answer = "No answer from the operator. Proceed on your own judgement and state the assumption you made.";
-		}
-		if (request.reason === "progress_update") continue;
-		const replyPath = path.join(dir, `${request.id}.res.json`);
-		try {
-			fs.writeFileSync(`${replyPath}.partial`, JSON.stringify({ message: answer }), "utf8");
-			fs.renameSync(`${replyPath}.partial`, replyPath);
-		} catch {
-			// The child timed out and its directory is gone; nothing left to answer.
-		}
-	}
 }
 
 function signalExitCode(signal: NodeJS.Signals | null): number {
@@ -925,84 +705,6 @@ function makeSubagentParams(choices: ModelLike[], current: string | undefined) {
 			}),
 		),
 		id: Type.Optional(Type.String({ description: "Run id, for status or stop" })),
-	});
-}
-
-/**
- * Child-facing half of the supervisor channel.
- *
- * A child that hits a real decision should be able to ask instead of guessing, and a guess is
- * indistinguishable from an answer once it reaches the parent as prose. Registered only inside a
- * spawned child, which is also the only place the tool could work: it needs the IPC directory the
- * parent created for that run.
- */
-function registerContactSupervisorTool(pi: ExtensionAPI) {
-	pi.registerTool({
-		name: SUPERVISOR_TOOL,
-		label: "Contact supervisor",
-		description: [
-			"Ask the session that dispatched you, which can reach the operator.",
-			"Use need_decision when a choice is genuinely the operator's to make and guessing would be wrong,",
-			"interview_request when you need structured input, and progress_update to report a discovery that",
-			"changes the plan without waiting for an answer.",
-			"Do not ask when instructions merely look restrictive: a no-edit instruction simply wins.",
-		].join(" "),
-		parameters: Type.Object({
-			reason: StringEnum(SUPERVISOR_REASONS, { description: "Why you are contacting the supervisor" }),
-			message: Type.String({ description: "The question or update, self-contained: the supervisor has not seen your context" }),
-		}),
-
-		async execute(_toolCallId, params, signal) {
-			const dir = process.env[IPC_ENV_VAR];
-			if (!dir) {
-				return finalizeToolResult({
-					content: [{ type: "text", text: "No supervisor channel is available. Proceed on your own judgement and say what you assumed." }],
-					failed: true,
-				});
-			}
-
-			const id = randomUUID();
-			const request: SupervisorRequest = {
-				id,
-				reason: params.reason as SupervisorReason,
-				message: params.message,
-				agent: process.env.PI_SUBAGENT_AGENT ?? "subagent",
-			};
-			// Write to a temp name first: the parent polls this directory and must never read a
-			// half-written request.
-			const finalPath = path.join(dir, `${id}.req.json`);
-			const stagingPath = `${finalPath}.partial`;
-			fs.writeFileSync(stagingPath, JSON.stringify(request), "utf8");
-			fs.renameSync(stagingPath, finalPath);
-
-			if (request.reason === "progress_update") {
-				return finalizeToolResult({ content: [{ type: "text", text: "Update delivered to the supervisor." }] });
-			}
-
-			const replyPath = path.join(dir, `${id}.res.json`);
-			const deadline = Date.now() + SUPERVISOR_TIMEOUT_MS;
-			while (Date.now() < deadline) {
-				if (signal?.aborted) {
-					return finalizeToolResult({
-						content: [{ type: "text", text: "Aborted while waiting for the supervisor." }],
-						failed: true,
-					});
-				}
-				if (fs.existsSync(replyPath)) {
-					try {
-						const reply = JSON.parse(fs.readFileSync(replyPath, "utf8")) as { message?: string };
-						return finalizeToolResult({ content: [{ type: "text", text: reply.message || "(empty reply)" }] });
-					} catch {
-						// Fall through and retry: the parent may still be writing.
-					}
-				}
-				await new Promise((resolve) => setTimeout(resolve, SUPERVISOR_POLL_MS));
-			}
-			return finalizeToolResult({
-				content: [{ type: "text", text: "The supervisor did not answer in time. Proceed on your own judgement and state the assumption you made." }],
-				failed: true,
-			});
-		},
 	});
 }
 
