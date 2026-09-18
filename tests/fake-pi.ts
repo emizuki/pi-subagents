@@ -93,15 +93,15 @@ if (process.env.FAKE_PI_MODE === "multi-text") {
 } else {
   content = [{ type: "text", text: process.env.FAKE_PI_TEXT ?? "ok" }];
 }
-const usageToolName = process.env.FAKE_PI_MODE === "nested-usage"
+const usageToolName = process.env.FAKE_PI_MODE === "nested-usage" || process.env.FAKE_PI_MODE === "nested-usage-failure"
   ? "subagent"
   : process.env.FAKE_PI_MODE === "other-tool-usage"
     ? "read"
     : undefined;
 const events = usageToolName
   ? [
-      { type: "message_end", message: { role: "assistant", content, usage: { input: 7, output: 3 }, stopReason: "end" } },
-      { type: "message_end", message: { role: "toolResult", toolName: usageToolName, content: [], usage: { input: 100, output: 50 } } },
+      { type: "message_end", message: { role: "assistant", content, usage: { input: 7, output: 3, cacheRead: 11, cacheWrite: 13, totalTokens: 20, cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 } }, stopReason: "end" } },
+      { type: "message_end", message: { role: "toolResult", toolName: usageToolName, content: [], usage: { input: 100, output: 50, cacheRead: 17, cacheWrite: 19, totalTokens: 999, cost: { input: 5, output: 6, cacheRead: 7, cacheWrite: 8, total: 26 } } } },
     ]
   : process.env.FAKE_PI_MODE === "empty-final"
     ? [
@@ -123,6 +123,7 @@ const emit = () => {
 };
 const holdMs = Number(process.env.FAKE_PI_HOLD_MS ?? 0);
 if (holdMs > 0) setTimeout(emit, holdMs); else emit();
+if (process.env.FAKE_PI_MODE === "nested-usage-failure") process.exitCode = 1;
 `,
 	);
 	chmodSync(fakePi, 0o755);

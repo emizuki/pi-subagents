@@ -2,7 +2,7 @@ import { getMarkdownTheme, type ToolDefinition } from "@earendil-works/pi-coding
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import type { AgentScope } from "./agents.ts";
 import { formatToolCall, formatUsageStats } from "./format.ts";
-import { aggregateUsage, type DisplayItem, getDisplayItems, getFailureText, getFinalOutput, isFailedResult, isRunningResult, type SingleResult, type SubagentDetails, type SubagentToolDetails } from "./results.ts";
+import { aggregateUsage, type DisplayItem, getDisplayItems, getFailureText, getFinalOutput, isFailedResult, isRunningResult, type SubagentDetails, type SubagentToolDetails } from "./results.ts";
 import type { makeSubagentParams } from "./schema.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;

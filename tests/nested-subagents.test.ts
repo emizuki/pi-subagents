@@ -352,7 +352,18 @@ function resultText(result: unknown): string {
 		.join("\n");
 }
 
-type NestedUsageDetails = { results: Array<{ usage: { input: number; output: number } }> };
+type NestedUsageDetails = {
+	results: Array<{
+		usage: {
+			input: number;
+			output: number;
+			cacheRead: number;
+			cacheWrite: number;
+			cost: number;
+			contextTokens: number;
+		};
+	}>;
+};
 
 function detailsOf(result: unknown): NestedUsageDetails {
 	assert.ok(typeof result === "object" && result !== null);
@@ -563,6 +574,9 @@ test("a nested result's usage reaches the root's rendered total", async () => {
 		const details = detailsOf(result);
 		assert.equal(details.results[0].usage.input, 100 + 7, "grandchild input must be added to the coordinator's own");
 		assert.equal(details.results[0].usage.output, 50 + 3);
+		assert.equal(details.results[0].usage.cacheRead, 17 + 11);
+		assert.equal(details.results[0].usage.cacheWrite, 19 + 13);
+		assert.equal(details.results[0].usage.cost, 26 + 10);
 	} finally {
 		delete process.env.FAKE_PI_CAPTURE;
 	}
@@ -584,14 +598,54 @@ test("a coordinator publishes nested usage and its probe count", async () => {
 	try {
 		const result = await executeNested({ agent: "recon", task: "probe" });
 		const usage = (result as {
-			usage?: { input: number; output: number; totalTokens: number; cost: { total: number } };
+			usage?: {
+				input: number;
+				output: number;
+				cacheRead: number;
+				cacheWrite: number;
+				totalTokens: number;
+				cost: { total: number };
+			};
 		}).usage;
 		assert.ok(usage);
 		assert.equal(usage.input, 100 + 7);
 		assert.equal(usage.output, 50 + 3);
+		assert.equal(usage.cacheRead, 17 + 11);
+		assert.equal(usage.cacheWrite, 19 + 13);
 		assert.equal(usage.totalTokens, 0);
-		assert.equal(usage.cost.total, 0);
+		assert.equal(usage.cost.total, 26 + 10);
 		assert.match(resultText(result), /Ran 1 nested probe\./);
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
+test("a failed single nested probe still publishes usage and its probe count", async () => {
+	writeAgentFile("recon", { tools: "read" });
+	setFakeMode("nested-usage-failure", path.join(tempRoot(), "failed-coordinator-usage.jsonl"));
+	try {
+		const result = await executeNested({ agent: "recon", task: "failed probe" });
+		const usage = (result as {
+			usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } };
+		}).usage;
+		assert.ok(usage);
+		assert.equal(usage.input, 100 + 7);
+		assert.equal(usage.output, 50 + 3);
+		assert.equal(usage.cacheRead, 17 + 11);
+		assert.equal(usage.cacheWrite, 19 + 13);
+		assert.equal(usage.cost.total, 26 + 10);
+		assert.match(resultText(result), /Ran 1 nested probe\./);
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
+test("a root dispatch does not publish nested usage or a probe count", async () => {
+	setFakeMode("nested-usage", path.join(tempRoot(), "root-usage.jsonl"));
+	try {
+		const result = await runSubagent({ agent: "general-purpose", task: "ordinary probe" });
+		assert.equal((result as { usage?: unknown }).usage, undefined);
+		assert.doesNotMatch(resultText(result), /Ran \d+ nested probes?\./);
 	} finally {
 		delete process.env.FAKE_PI_CAPTURE;
 	}

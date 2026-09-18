@@ -752,16 +752,24 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 					onUpdate,
 					makeDetails("single"),
 				);
+				const results = [result];
 				const isError = isFailedResult(result);
 				if (isError) {
 					const errorMsg = getResultOutput(result);
 					return {
-						content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
-						details: makeDetails("single")([result]),
+						content: [
+							{
+								type: "text",
+								text: `Agent ${result.stopReason || "failed"}: ${errorMsg}${
+									runtime ? `\n\nRan ${results.length} nested probe${results.length === 1 ? "" : "s"}.` : ""
+								}`,
+							},
+						],
+						details: makeDetails("single")(results),
 						failed: true,
+						...(runtime ? { usage: toUsage(aggregateUsage(results)) } : {}),
 					};
 				}
-				const results = [result];
 				return {
 					content: [
 						{
