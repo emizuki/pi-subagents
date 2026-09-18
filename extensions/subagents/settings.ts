@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { isThinkingLevel, THINKING_LEVELS } from "./models.ts";
+import { THINKING_LEVELS } from "./models.ts";
 
 export const DEFAULT_MAX_PARALLEL_TASKS = 8;
 export const DEFAULT_MAX_CONCURRENCY = 4;

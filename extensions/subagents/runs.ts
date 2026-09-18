@@ -16,8 +16,11 @@ import type { ForkContext } from "./settings.ts";
  * loaded it — moving that computation between files does not change when it runs, but making it
  * lazy would change which directory an already-started run writes into.
  *
- * A consequence: a test that dynamically re-imports this module gets fresh, empty state. No
- * current test does.
+ * A consequence: an ordinary dynamic `import()` of this module by its own URL returns the same
+ * cached module and its existing maps — it does not reset state. What does produce a fresh module
+ * graph is Pi's jiti-based reload: the extension loader creates jiti with `moduleCache: false`, so
+ * each `jiti.import()` re-evaluates the module instead of reusing a cached instance. No current
+ * test relies on either.
  */
 
 /**

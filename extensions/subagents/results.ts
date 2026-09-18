@@ -64,9 +64,17 @@ export type MetadataOnlyDetails = { [TOOL_RESULT_META_KEY]: ToolResultMetadata }
  *
  * Named here rather than inferred at the call site because `render.ts` must state it explicitly:
  * a standalone renderer has no object literal to infer it from. It is `unknown` because that is
- * what the object literal itself inferred — the renderers narrow `result.details` with their own
- * cast, and pinning anything narrower makes `execute`'s `onUpdate` reject the `SubagentDetails`
- * it publishes while a child runs.
+ * what the object literal itself infers: `dispatch.ts`'s `execute` threads its result through
+ * `finalizeToolResult()` from inside an inner function whose own return type is annotated
+ * `Promise<ToolResultDraft<unknown>>`, and `AgentToolResult<T>` declares `details: T` non-optional
+ * — so `unknown` is what actually reaches this slot. The renderers narrow `result.details` with
+ * their own cast instead of relying on it.
+ *
+ * That inner annotation is also why pinning this narrower does not fail where you would expect.
+ * The break is in `execute`'s own return type, not `onUpdate`: `DetailsWithMetadata<unknown>`
+ * collapses to the bare, all-optional `{ __piSubagents?: ToolResultMetadata }`, which has none of
+ * `SubagentDetails`'s required fields — no narrower union accepts it unless that inner annotation
+ * loosens too.
  */
 export type SubagentToolDetails = unknown;
 
