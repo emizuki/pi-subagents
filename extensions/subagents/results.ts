@@ -60,12 +60,15 @@ export type DetailsWithMetadata<T> = T & { [TOOL_RESULT_META_KEY]?: ToolResultMe
 export type MetadataOnlyDetails = { [TOOL_RESULT_META_KEY]: ToolResultMetadata };
 
 /**
- * The details union `finalizeToolResult` produces for the subagent tool.
+ * The details type of the subagent tool registration.
  *
  * Named here rather than inferred at the call site because `render.ts` must state it explicitly:
- * a standalone renderer has no object literal to infer it from.
+ * a standalone renderer has no object literal to infer it from. It is `unknown` because that is
+ * what the object literal itself inferred — the renderers narrow `result.details` with their own
+ * cast, and pinning anything narrower makes `execute`'s `onUpdate` reject the `SubagentDetails`
+ * it publishes while a child runs.
  */
-export type SubagentToolDetails = DetailsWithMetadata<unknown> | MetadataOnlyDetails | undefined;
+export type SubagentToolDetails = unknown;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
