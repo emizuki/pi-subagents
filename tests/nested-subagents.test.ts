@@ -41,11 +41,19 @@ test("nested limits default when unset and when malformed", () => {
 	try {
 		writeFileSync(
 			path.join(agentDir, "settings.json"),
+			JSON.stringify({ subagents: { maxNestedSpawns: "lots" } }),
+		);
+		const unset = readSubagentSettings(root, undefined);
+		assert.equal(unset.maxNestedSpawns, DEFAULT_MAX_NESTED_SPAWNS);
+		assert.equal(unset.maxNestedConcurrency, DEFAULT_MAX_NESTED_CONCURRENCY);
+
+		writeFileSync(
+			path.join(agentDir, "settings.json"),
 			JSON.stringify({ subagents: { maxNestedSpawns: "lots", maxNestedConcurrency: 99 } }),
 		);
-		const settings = readSubagentSettings(root, undefined);
-		assert.equal(settings.maxNestedSpawns, DEFAULT_MAX_NESTED_SPAWNS);
-		assert.equal(settings.maxNestedConcurrency, DEFAULT_MAX_NESTED_CONCURRENCY);
+		const malformed = readSubagentSettings(root, undefined);
+		assert.equal(malformed.maxNestedSpawns, DEFAULT_MAX_NESTED_SPAWNS);
+		assert.equal(malformed.maxNestedConcurrency, DEFAULT_MAX_NESTED_CONCURRENCY);
 	} finally {
 		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previous;
@@ -61,17 +69,31 @@ test("a trusted project may lower the nested limits but never raise them", () =>
 	const previous = process.env.PI_CODING_AGENT_DIR;
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	try {
-		writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ subagents: { maxNestedSpawns: 4 } }));
+		writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ subagents: { maxNestedSpawns: 6 } }));
 		const projectFile = path.join(project, ".pi", "settings.json");
 		const trusted = { file: projectFile, root: project };
 
 		writeFileSync(projectFile, JSON.stringify({ subagents: { maxNestedSpawns: 12 } }));
-		assert.equal(readSubagentSettings(project, trusted).maxNestedSpawns, 4, "a project must not raise the cap");
+		assert.equal(readSubagentSettings(project, trusted).maxNestedSpawns, 6, "a project must not raise the cap");
 
 		writeFileSync(projectFile, JSON.stringify({ subagents: { maxNestedSpawns: 1 } }));
 		assert.equal(readSubagentSettings(project, trusted).maxNestedSpawns, 1, "a project may lower the cap");
 
+		writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ subagents: { maxNestedSpawns: 0 } }));
+		writeFileSync(projectFile, JSON.stringify({ subagents: { maxNestedSpawns: 4 } }));
+		assert.equal(
+			readSubagentSettings(project, trusted).maxNestedSpawns,
+			0,
+			"0 is a kill switch, not a typo",
+		);
+
 		// The spec requires both limits, and the two use different parsers and ranges.
+		writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ subagents: { maxNestedConcurrency: 0 } }));
+		assert.equal(
+			readSubagentSettings(root, undefined).maxNestedConcurrency,
+			DEFAULT_MAX_NESTED_CONCURRENCY,
+			"0 is out of range for concurrency",
+		);
 		writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ subagents: { maxNestedConcurrency: 4 } }));
 		writeFileSync(projectFile, JSON.stringify({ subagents: { maxNestedConcurrency: 8 } }));
 		assert.equal(readSubagentSettings(project, trusted).maxNestedConcurrency, 4, "a project must not raise it either");
