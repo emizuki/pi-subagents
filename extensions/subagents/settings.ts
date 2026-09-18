@@ -6,6 +6,8 @@ import { THINKING_LEVELS } from "./models.ts";
 
 export const DEFAULT_MAX_PARALLEL_TASKS = 8;
 export const DEFAULT_MAX_CONCURRENCY = 4;
+export const DEFAULT_MAX_NESTED_SPAWNS = 4;
+export const DEFAULT_MAX_NESTED_CONCURRENCY = 2;
 
 export type ForkContext = "fresh" | "fork";
 
@@ -20,6 +22,10 @@ export interface SubagentSettings {
 	maxParallelTasks: FanOutLimit;
 	/** Children alive at once within one parallel call. Always resolved, defaulting to DEFAULT_MAX_CONCURRENCY. */
 	maxConcurrency: FanOutLimit;
+	/** Total grandchildren one coordinator may start over its whole life. 0 disables nesting. */
+	maxNestedSpawns: number;
+	/** Grandchildren alive at once within one coordinator. */
+	maxNestedConcurrency: number;
 }
 
 /**
@@ -37,15 +43,38 @@ export function fanOutRank(limit: FanOutLimit): number {
 }
 
 /**
+ * A hard process cap, unlike FanOutLimit: there is no "unbounded" spelling, because a machine
+ * running a tree of processes is exactly what these two numbers exist to bound.
+ */
+export function parseBoundedInt(value: unknown, min: number, max: number): number | undefined {
+	if (typeof value !== "number" || !Number.isInteger(value)) return undefined;
+	return value >= min && value <= max ? value : undefined;
+}
+
+/**
+ * Only the operator's own settings may raise a limit; a trusted project may lower one and nothing
+ * more. Shared by every limit family so the rule has one definition to audit.
+ */
+export function resolveLowerableLimit<T>(
+	userValue: unknown,
+	projectValue: unknown,
+	fallback: T,
+	parse: (value: unknown) => T | undefined,
+	rank: (limit: T) => number,
+): T {
+	const effective = parse(userValue) ?? fallback;
+	const project = parse(projectValue);
+	return project !== undefined && rank(project) < rank(effective) ? project : effective;
+}
+
+/**
  * Only the operator's own settings may raise a limit. A repository is not an authorization
  * boundary for how many processes the machine runs, so a trusted project may lower one and
  * nothing more: a checkout that could raise it would be a fan-out amplifier for anything that
  * reaches the dispatching model, and prompt injection reaches it through the files it reads.
  */
 export function resolveFanOutLimit(userValue: unknown, projectValue: unknown, fallback: number): FanOutLimit {
-	const effective = parseFanOutLimit(userValue) ?? fallback;
-	const project = parseFanOutLimit(projectValue);
-	return project !== undefined && fanOutRank(project) < fanOutRank(effective) ? project : effective;
+	return resolveLowerableLimit<FanOutLimit>(userValue, projectValue, fallback, parseFanOutLimit, fanOutRank);
 }
 
 function readSettingsFile(file: string): Record<string, unknown> | undefined {
@@ -102,6 +131,20 @@ export function readSubagentSettings(
 			DEFAULT_MAX_PARALLEL_TASKS,
 		),
 		maxConcurrency: resolveFanOutLimit(userRaw?.maxConcurrency, projectRaw?.maxConcurrency, DEFAULT_MAX_CONCURRENCY),
+		maxNestedSpawns: resolveLowerableLimit(
+			userRaw?.maxNestedSpawns,
+			projectRaw?.maxNestedSpawns,
+			DEFAULT_MAX_NESTED_SPAWNS,
+			(value) => parseBoundedInt(value, 0, 16),
+			(limit) => limit,
+		),
+		maxNestedConcurrency: resolveLowerableLimit(
+			userRaw?.maxNestedConcurrency,
+			projectRaw?.maxNestedConcurrency,
+			DEFAULT_MAX_NESTED_CONCURRENCY,
+			(value) => parseBoundedInt(value, 1, 8),
+			(limit) => limit,
+		),
 	};
 	for (const raw of [userRaw, projectRaw]) {
 		if (!raw) continue;

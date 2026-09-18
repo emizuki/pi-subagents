@@ -182,3 +182,34 @@ test("a project-scoped package beats a same-named agent from an unrelated user-s
 	assert.equal(agent?.packageScope, "project");
 	assert.equal(agent?.systemPrompt.trim(), "project version");
 });
+
+test("coordinator frontmatter parses the nested fields", () => {
+	const { root, agentDir } = setup();
+	fs.mkdirSync(path.join(agentDir, "agents"), { recursive: true });
+	fs.writeFileSync(
+		path.join(agentDir, "agents", "boss.md"),
+		"---\nname: boss\ndescription: d\nallowNestedSubagents: true\nallowedSubagents: recon, scout\n---\nBody\n",
+	);
+	const boss = discoverAgents(root, "user").agents.find((a) => a.name === "boss");
+	assert.ok(boss);
+	assert.equal(boss.allowNestedSubagents, true);
+	assert.deepEqual(boss.allowedSubagents, ["recon", "scout"]);
+});
+
+test("nested fields default off and grant nothing when not exactly true", () => {
+	const { root, agentDir } = setup();
+	fs.mkdirSync(path.join(agentDir, "agents"), { recursive: true });
+	fs.writeFileSync(path.join(agentDir, "agents", "plain.md"), "---\nname: plain\ndescription: d\n---\nBody\n");
+	fs.writeFileSync(
+		path.join(agentDir, "agents", "truthy.md"),
+		'---\nname: truthy\ndescription: d\nallowNestedSubagents: "yes"\nallowedSubagents: recon\n---\nBody\n',
+	);
+	const agents = discoverAgents(root, "user").agents;
+	const plain = agents.find((a) => a.name === "plain");
+	const truthy = agents.find((a) => a.name === "truthy");
+	assert.ok(plain && truthy);
+	assert.equal(plain.allowNestedSubagents, false);
+	assert.deepEqual(plain.allowedSubagents, []);
+	// A string is not the boolean true. Granting on truthiness would let `allowNestedSubagents: "no"` grant.
+	assert.equal(truthy.allowNestedSubagents, false);
+});

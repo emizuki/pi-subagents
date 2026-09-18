@@ -48,6 +48,14 @@ export interface AgentConfig {
 	 * nothing useful with "find the auth code" and should say so rather than be recommended for it.
 	 */
 	suggest: boolean;
+	/**
+	 * Whether this agent may itself delegate, to the agents named in `allowedSubagents`.
+	 * Grants nothing on its own: the root validates the pair and decides, and the grant is
+	 * capped by `maxNestedSpawns`.
+	 */
+	allowNestedSubagents: boolean;
+	/** Candidate delegates, before the root resolves and filters them. Never authoritative. */
+	allowedSubagents: string[];
 	systemPrompt: string;
 	source: AgentSource;
 	filePath: string;
@@ -80,21 +88,16 @@ type AgentFrontmatter = {
 	inheritProjectContext?: unknown;
 	defaultContext?: unknown;
 	suggest?: unknown;
+	allowNestedSubagents?: unknown;
+	allowedSubagents?: unknown;
 };
 
 /**
- * Normalize a frontmatter `tools` value to a list of tool names.
- *
- * Both spellings are valid YAML and both are in use:
- *
- *     tools: read, bash        # string
- *     tools: [read, bash]      # array
- *
- * so accept either. Anything else (a number, a map, a nested list) yields no
- * tools rather than throwing: this runs inside agent discovery, where a single
- * bad file must not take down every other agent in the same directory.
+ * Shared grammar for the comma-or-list frontmatter fields: `tools`, `aliases`, `allowedSubagents`.
+ * Omitted means "unset" and returns undefined. An explicitly empty or malformed list must remain
+ * empty, otherwise a typo such as `tools: {}` silently grants bash/edit/write.
  */
-function parseToolList(value: unknown): string[] | undefined {
+function parseNameList(value: unknown): string[] | undefined {
 	// Omitted means "use pi's defaults". An explicitly empty or malformed allowlist must remain
 	// empty, otherwise a typo such as `tools: {}` silently grants bash/edit/write.
 	if (value === undefined || value === null) return undefined;
@@ -157,14 +160,17 @@ function loadAgentsFromDir(
 
 		agents.push({
 			name: frontmatter.name,
-			aliases: parseToolList(frontmatter.aliases) ?? [],
+			aliases: parseNameList(frontmatter.aliases) ?? [],
 			description: frontmatter.description,
-			tools: parseToolList(frontmatter.tools),
+			tools: parseNameList(frontmatter.tools),
 			model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
 			thinking: typeof frontmatter.thinking === "string" ? frontmatter.thinking : undefined,
 			inheritSkills: frontmatter.inheritSkills === true,
 			inheritProjectContext: frontmatter.inheritProjectContext !== false,
 			suggest: frontmatter.suggest !== false,
+			// Exactly `true`, not truthy: `allowNestedSubagents: "no"` must not grant delegation.
+			allowNestedSubagents: frontmatter.allowNestedSubagents === true,
+			allowedSubagents: parseNameList(frontmatter.allowedSubagents) ?? [],
 			defaultContext:
 				frontmatter.defaultContext === "fork" || frontmatter.defaultContext === "fresh"
 					? frontmatter.defaultContext

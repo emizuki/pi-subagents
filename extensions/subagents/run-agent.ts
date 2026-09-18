@@ -122,6 +122,8 @@ export async function runSingleAgent(
 				inheritProjectContext: resuming.inheritProjectContext,
 				defaultContext: resuming.defaultContext,
 				suggest: false,
+				allowNestedSubagents: false,
+				allowedSubagents: [],
 				systemPrompt: resuming.systemPrompt,
 				source: resuming.agentSource,
 				filePath: resuming.agentFilePath,
