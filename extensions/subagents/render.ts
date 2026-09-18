@@ -2,7 +2,7 @@ import { getMarkdownTheme, type ToolDefinition } from "@earendil-works/pi-coding
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import type { AgentScope } from "./agents.ts";
 import { formatToolCall, formatUsageStats } from "./format.ts";
-import { aggregateUsage, type DisplayItem, getDisplayItems, getFailureText, getFinalOutput, isFailedResult, isRunningResult, type SubagentDetails, type SubagentToolDetails } from "./results.ts";
+import { aggregateUsage, type DisplayItem, getDisplayItems, getFailureText, getFinalOutput, isFailedResult, isRunningResult, type SingleResult, type SubagentDetails, type SubagentToolDetails } from "./results.ts";
 import type { makeSubagentParams } from "./schema.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
@@ -84,6 +84,16 @@ export const renderSubagentResult: NonNullable<SubagentTool["renderResult"]> = (
 		return text.trimEnd();
 	};
 
+	// Delegation diagnostics (a missing, shadowed, or over-ceiling nested agent) land on
+	// `outputNotes` even when the child itself exits 0, so `getFailureText` never surfaces them and
+	// the run renders as a clean success with no note. The model already sees them, appended to its
+	// own output by `getResultOutput` in results.ts; this is the only channel that reaches the
+	// operator, on both the collapsed and expanded views.
+	const renderOutputNotes = (r: SingleResult): string =>
+		r.outputNotes && r.outputNotes.length > 0
+			? theme.fg("warning", r.outputNotes.map((note) => `⚠ ${note}`).join("\n"))
+			: "";
+
 	if (details.mode === "single" && details.results.length === 1) {
 		const r = details.results[0];
 		const isError = isFailedResult(r);
@@ -100,6 +110,8 @@ export const renderSubagentResult: NonNullable<SubagentTool["renderResult"]> = (
 			let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
 			if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 			container.addChild(new Text(header, 0, 0));
+			const notes = renderOutputNotes(r);
+			if (notes) container.addChild(new Text(notes, 0, 0));
 			const failure = getFailureText(r);
 			if (failure) container.addChild(new Text(theme.fg("error", `Error: ${failure}`), 0, 0));
 			container.addChild(new Spacer(1));
@@ -135,6 +147,8 @@ export const renderSubagentResult: NonNullable<SubagentTool["renderResult"]> = (
 
 		let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
 		if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
+		const singleNotes = renderOutputNotes(r);
+		if (singleNotes) text += `\n${singleNotes}`;
 		const failureText = getFailureText(r);
 		if (failureText) text += `\n${theme.fg("error", `Error: ${failureText}`)}`;
 		else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
@@ -283,6 +297,8 @@ export const renderSubagentResult: NonNullable<SubagentTool["renderResult"]> = (
 				container.addChild(
 					new Text(`${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${rIcon}`, 0, 0),
 				);
+				const notes = renderOutputNotes(r);
+				if (notes) container.addChild(new Text(notes, 0, 0));
 				container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
 				if (rFailure) container.addChild(new Text(theme.fg("error", `Error: ${rFailure}`), 0, 0));
 
@@ -328,6 +344,8 @@ export const renderSubagentResult: NonNullable<SubagentTool["renderResult"]> = (
 						: theme.fg("success", "✓");
 			const displayItems = getDisplayItems(r.messages);
 			text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}`;
+			const parallelNotes = renderOutputNotes(r);
+			if (parallelNotes) text += `\n${parallelNotes}`;
 			const taskFailure = getFailureText(r);
 			if (taskFailure) text += `\n${theme.fg("error", `Error: ${taskFailure}`)}`;
 			else if (displayItems.length === 0)
