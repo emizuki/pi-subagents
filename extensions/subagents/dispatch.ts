@@ -8,6 +8,7 @@ import {
 	intersectModelCeiling,
 	nestedRegistrationAllowed,
 	type NestedRuntimeV1,
+	resolveAllowedAgents,
 	withinToolCeiling,
 } from "./nested-runtime.ts";
 import { renderSubagentCall, renderSubagentResult } from "./render.ts";
@@ -33,7 +34,9 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 	// Declared wide, registered narrow. Pi validates against what it was handed, so on the nested
 	// path the extra keys are always undefined at runtime — which is precisely what Step 5's
 	// defence-in-depth guard already assumes. Without this pin, the shared execute body that reads
-	// params.action and friends cannot typecheck against the narrowed schema.
+	// params.action and friends cannot typecheck against the narrowed schema. The direct cast is
+	// intentionally structurally unchecked: TypeBox's opaque TSchema cannot prove nested-schema
+	// shape compatibility, so this pins only the shared execute parameter type, not the schema shape.
 	const SubagentParams = (
 		runtime ? makeNestedSubagentParams(choices, current) : makeSubagentParams(choices, current)
 	) as ReturnType<typeof makeSubagentParams>;
@@ -68,17 +71,22 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 			const agentScope: AgentScope = params.agentScope ?? "user";
 			const nestedSettings = readSubagentSettings(
 				ctx.cwd,
-				ctx.isProjectTrusted() ? trustedProjectSettings(ctx.cwd) : undefined,
+				runtime ? undefined : ctx.isProjectTrusted() ? trustedProjectSettings(ctx.cwd) : undefined,
 			);
 			const dispatchDefaults: DispatchDefaults = {
 				model: ctx.model ? modelKey(ctx.model) : undefined,
 				thinkingLevel: ctx.thinkingLevel,
-				scopedModels: runtime
-					? choices.map((model) => ({ model, thinkingLevel: undefined }))
-					: ctx.scopedModels.length > 0
-						? ctx.scopedModels.map(({ model, thinkingLevel }) => ({ model, thinkingLevel }))
+				scopedModels:
+					runtime && runtime.modelCeiling !== null
+						? choices.map((model) => ({ model, thinkingLevel: undefined }))
+						: ctx.scopedModels.length > 0
+							? ctx.scopedModels.map(({ model, thinkingLevel }) => ({ model, thinkingLevel }))
+							: undefined,
+				trustedProjectSettings: runtime
+					? undefined
+					: ctx.isProjectTrusted()
+						? trustedProjectSettings(ctx.cwd)
 						: undefined,
-				trustedProjectSettings: ctx.isProjectTrusted() ? trustedProjectSettings(ctx.cwd) : undefined,
 				parentSessionFile: ctx.sessionManager.getSessionFile(),
 				lookupModel: (key) => {
 					const parts = splitModelKey(key);
@@ -112,6 +120,12 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 			if (runtime) {
 				const forbidden = ["chain", "async", "action", "id", "resume", "agentScope", "confirmProjectAgents", "cwd"] as const;
 				const used = forbidden.filter((key) => (params as Record<string, unknown>)[key] !== undefined);
+				for (const task of params.tasks ?? []) {
+					const taskParams = task as Record<string, unknown>;
+					for (const key of forbidden) {
+						if (taskParams[key] !== undefined && !used.includes(key)) used.push(key);
+					}
+				}
 				if (used.length > 0) {
 					return {
 						content: [
@@ -605,8 +619,20 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 			// Detaching it as well would leave a two-level tree with no path from the terminal.
 			if (params.async) {
 				const targetAgent = params.agent ? findAgent(agents, params.agent) : undefined;
+				const nestingEnabled = (dispatchDefaults.nested?.maxSpawns ?? 0) > 0;
 				// A resumed run's authority lives on the record, not on any agent file (Task 5).
-				const coordinates = targetAgent?.allowNestedSubagents || (resumeTarget?.allowedAgents?.length ?? 0) > 0;
+				const resumedCoordinates = nestingEnabled && (resumeTarget?.allowedAgents?.length ?? 0) > 0;
+				const freshAuthorityAgents =
+					targetAgent?.allowNestedSubagents && nestingEnabled
+						? discoverAgents(params.cwd ?? ctx.cwd, "user", { projectTrusted: false }).agents
+						: [];
+				const freshCoordinates =
+					nestingEnabled &&
+					Boolean(
+						targetAgent?.allowNestedSubagents &&
+							resolveAllowedAgents(targetAgent, freshAuthorityAgents).allowed.length > 0,
+					);
+				const coordinates = resumedCoordinates || freshCoordinates;
 				if (coordinates) {
 					const name = targetAgent?.name ?? resumeTarget?.agent ?? "that agent";
 					return {

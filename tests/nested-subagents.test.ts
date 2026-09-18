@@ -50,9 +50,9 @@ type TestContext = {
 	scopedModels: Array<{ model: TestContext["model"]; thinkingLevel?: string }>;
 	modelRegistry: {
 		getAvailable: () => TestContext["model"][];
-		find: () => TestContext["model"];
+		find: (provider: string, id: string) => TestContext["model"] | undefined;
 	};
-	sessionManager: { getSessionFile: () => undefined };
+	sessionManager: { getSessionFile: () => string | undefined };
 	hasUI: boolean;
 	isProjectTrusted: () => boolean;
 	ui: {
@@ -74,6 +74,15 @@ type CapturedEnvironment = {
 
 const cheapModel = { provider: "p", id: "cheap", cost: { input: 1 } };
 const dearModel = { provider: "p", id: "dear", cost: { input: 9 } };
+const nestedGuardRuntime = encodeNestedRuntime({
+	version: 1,
+	depth: 1,
+	agent: "reviewer",
+	allowedAgents: ["recon"],
+	toolCeiling: null,
+	modelCeiling: null,
+	budget: { maxSpawns: 4, maxConcurrency: 2 },
+});
 
 class NestedHarness {
 	readonly handlers = new Map<string, TestHandler[]>();
@@ -156,13 +165,14 @@ function makeContext(cwd = root, scoped = false): ExtensionContext {
 
 function writeAgentFile(
 	name: string,
-	options: { allowNestedSubagents?: boolean; allowedSubagents?: string; tools?: string } = {},
+	options: { allowNestedSubagents?: boolean; allowedSubagents?: string; tools?: string; model?: string } = {},
 	directory = path.join(agentDir, "agents"),
 ): string {
 	const fields = [
 		`name: ${name}`,
 		`description: ${name} test agent`,
 		options.tools === undefined ? undefined : `tools: ${options.tools}`,
+		options.model === undefined ? undefined : `model: ${options.model}`,
 		options.allowNestedSubagents ? "allowNestedSubagents: true" : undefined,
 		options.allowedSubagents === undefined ? undefined : `allowedSubagents: ${options.allowedSubagents}`,
 	].filter((field): field is string => field !== undefined);
@@ -275,6 +285,22 @@ async function runSubagent(
 ): Promise<unknown> {
 	await harness.refresh(dispatchContext);
 	return harness.execute(params, dispatchContext);
+}
+
+async function executeNested(params: Record<string, unknown>): Promise<unknown> {
+	const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+	const previousRuntime = process.env[RUNTIME_ENV_VAR];
+	process.env.PI_SUBAGENT_DEPTH = "1";
+	process.env[RUNTIME_ENV_VAR] = nestedGuardRuntime;
+	try {
+		await harness.refresh(context);
+		return await harness.execute(params, context);
+	} finally {
+		if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+		else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+		if (previousRuntime === undefined) delete process.env[RUNTIME_ENV_VAR];
+		else process.env[RUNTIME_ENV_VAR] = previousRuntime;
+	}
 }
 
 before(async () => {
@@ -827,6 +853,218 @@ test("an empty model ceiling refuses rather than falling back to free-form", () 
 	assert.equal(nestedRegistrationAllowed({ localChoices: [cheapModel], ceiling: null }), true);
 });
 
+test("nested registration leaves only contact_supervisor when the model ceiling is empty", () => {
+	const runtime = encodeNestedRuntime({
+		version: 1,
+		depth: 1,
+		agent: "reviewer",
+		allowedAgents: ["recon"],
+		toolCeiling: null,
+		modelCeiling: ["p/absent"],
+		budget: { maxSpawns: 4, maxConcurrency: 2 },
+	});
+	assert.deepEqual([...registerAt("1", runtime)], ["contact_supervisor"]);
+});
+
+test("nested registration wires the model ceiling into the registered schema", async () => {
+	const coordinatorContext = makeContext();
+	const contextValue = coordinatorContext as unknown as TestContext;
+	const dear = {
+		...contextValue.model,
+		id: "dear",
+		name: "Dear",
+		cost: { input: 9, output: 9, cacheRead: 0, cacheWrite: 0 },
+	};
+	contextValue.modelRegistry = {
+		getAvailable: () => [contextValue.model, dear],
+		find: () => contextValue.model,
+	};
+	const runtime = encodeNestedRuntime({
+		version: 1,
+		depth: 1,
+		agent: "reviewer",
+		allowedAgents: ["recon"],
+		toolCeiling: null,
+		modelCeiling: ["test-provider/cheap"],
+		budget: { maxSpawns: 4, maxConcurrency: 2 },
+	});
+	const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+	const previousRuntime = process.env[RUNTIME_ENV_VAR];
+	process.env.PI_SUBAGENT_DEPTH = "1";
+	process.env[RUNTIME_ENV_VAR] = runtime;
+	try {
+		await harness.refresh(coordinatorContext);
+		const tool = harness.tools.get("subagent") as
+			| { parameters?: { properties?: Record<string, unknown> } }
+			| undefined;
+		assert.ok(tool, "nested subagent should be registered");
+		assert.deepEqual(
+			(tool.parameters?.properties?.model as { enum?: string[] }).enum,
+			["test-provider/cheap"],
+		);
+	} finally {
+		if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+		else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+		if (previousRuntime === undefined) delete process.env[RUNTIME_ENV_VAR];
+		else process.env[RUNTIME_ENV_VAR] = previousRuntime;
+	}
+});
+
+test("a nested call carrying a forbidden key is refused", async () => {
+	const capture = path.join(root, "nested-forbidden-capture.jsonl");
+	setFakeMode("normal", capture);
+	try {
+		const result = await executeNested({ agent: "recon", task: "probe", action: "status" });
+		assert.match(resultText(result), /cannot be used here/);
+		assert.equal(spawnCount(capture), 0);
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
+test("a nested call naming an agent outside the allowlist is refused", async () => {
+	const capture = path.join(root, "nested-unknown-capture.jsonl");
+	setFakeMode("normal", capture);
+	try {
+		const result = await executeNested({ agent: "general-purpose", task: "probe" });
+		assert.match(resultText(result), /Not callable from here/);
+		assert.equal(spawnCount(capture), 0);
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
+test("coordinator discovery never consults the process project-trust predicate", async () => {
+	writeAgentFile("recon", { tools: "read" });
+	const coordinatorContext = makeContext();
+	const contextValue = coordinatorContext as unknown as TestContext;
+	contextValue.isProjectTrusted = () => {
+		throw new Error("coordinator discovery must use projectTrusted: false");
+	};
+	const capture = path.join(root, "nested-project-trust-capture.jsonl");
+	const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+	const previousRuntime = process.env[RUNTIME_ENV_VAR];
+	process.env.PI_SUBAGENT_DEPTH = "1";
+	process.env[RUNTIME_ENV_VAR] = nestedGuardRuntime;
+	setFakeMode("normal", capture);
+	try {
+		await harness.refresh(coordinatorContext);
+		const result = await harness.execute({ agent: "recon", task: "probe" }, coordinatorContext);
+		assert.match(resultText(result), /ok/);
+	} finally {
+		if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+		else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+		if (previousRuntime === undefined) delete process.env[RUNTIME_ENV_VAR];
+		else process.env[RUNTIME_ENV_VAR] = previousRuntime;
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
+test("a nested task cannot smuggle cwd through its item", async () => {
+	writeAgentFile("recon", { tools: "read" });
+	const escapeDir = path.join(root, "escape-dir");
+	mkdirSync(escapeDir, { recursive: true });
+	const capture = path.join(root, "nested-task-cwd-capture.jsonl");
+	const cwdCapture = path.join(root, "nested-task-cwd.jsonl");
+	process.env.FAKE_PI_CWD_CAPTURE = cwdCapture;
+	setFakeMode("normal", capture);
+	try {
+		const result = await executeNested({
+			tasks: [{ agent: "recon", task: "probe", cwd: escapeDir }],
+		});
+		assert.match(resultText(result), /cwd cannot be used here/);
+		assert.equal(spawnCount(capture), 0);
+	} finally {
+		delete process.env.FAKE_PI_CWD_CAPTURE;
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
+test("nested model validation leaves an unscoped root's model behavior unchanged", async () => {
+	writeAgentFile("recon", { model: "sonnet", tools: "read" });
+	const coordinatorContext = makeContext();
+	const contextValue = coordinatorContext as unknown as TestContext;
+	contextValue.modelRegistry = {
+		getAvailable: () => [contextValue.model],
+		find: () => undefined,
+	};
+	const capture = path.join(root, "nested-unscoped-model-capture.jsonl");
+	const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+	const previousRuntime = process.env[RUNTIME_ENV_VAR];
+	process.env.PI_SUBAGENT_DEPTH = "1";
+	process.env[RUNTIME_ENV_VAR] = nestedGuardRuntime;
+	setFakeMode("normal", capture);
+	try {
+		await harness.refresh(coordinatorContext);
+		const result = await harness.execute({ agent: "recon", task: "probe" }, coordinatorContext);
+		assert.match(resultText(result), /ok/);
+		assert.equal(spawnCount(capture), 1);
+	} finally {
+		if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+		else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+		if (previousRuntime === undefined) delete process.env[RUNTIME_ENV_VAR];
+		else process.env[RUNTIME_ENV_VAR] = previousRuntime;
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
+test("async detaches only agents with a live nested envelope", async () => {
+	writeCoordinatorFixtures();
+	const capture = path.join(root, "async-without-envelope-capture.jsonl");
+	setFakeMode("normal", capture);
+	writeUserSettings({ maxNestedSpawns: 0 });
+	try {
+		const disabled = await runSubagent({ agent: "reviewer", task: "review", async: true });
+		assert.match(resultText(disabled), /Started .*detached/);
+	} finally {
+		clearUserSettings();
+	}
+
+	writeAgentFile("lonely", { allowNestedSubagents: true, allowedSubagents: "nobody", tools: "read" });
+	try {
+		const empty = await runSubagent({ agent: "lonely", task: "review", async: true });
+		assert.match(resultText(empty), /Started .*detached/);
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
+test("a coordinator does not inherit trusted project subagent defaults", async () => {
+	const project = path.join(root, "nested-defaults-project");
+	mkdirSync(path.join(project, ".pi"), { recursive: true });
+	writeFileSync(
+		path.join(project, ".pi", "settings.json"),
+		JSON.stringify({ subagents: { defaultContext: "fork", defaultThinking: "high", maxThinking: "high" } }),
+	);
+	writeAgentFile("recon", { tools: "read" });
+	const sessionFile = path.join(project, "parent-session.jsonl");
+	writeFileSync(sessionFile, "session\n");
+	const coordinatorContext = makeContext(project);
+	const contextValue = coordinatorContext as unknown as TestContext;
+	contextValue.isProjectTrusted = () => true;
+	contextValue.sessionManager = { getSessionFile: () => sessionFile };
+	const capture = path.join(root, "nested-defaults-capture.jsonl");
+	const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+	const previousRuntime = process.env[RUNTIME_ENV_VAR];
+	process.env.PI_SUBAGENT_DEPTH = "1";
+	process.env[RUNTIME_ENV_VAR] = nestedGuardRuntime;
+	setFakeMode("normal", capture);
+	try {
+		await harness.refresh(coordinatorContext);
+		const result = await harness.execute({ agent: "recon", task: "probe" }, coordinatorContext);
+		assert.match(resultText(result), /ok/);
+		const args = capturedArgs(capture)[0];
+		assert.equal(optionValue(args, "--fork"), undefined);
+		assert.equal(optionValue(args, "--thinking"), "low");
+	} finally {
+		if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+		else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+		if (previousRuntime === undefined) delete process.env[RUNTIME_ENV_VAR];
+		else process.env[RUNTIME_ENV_VAR] = previousRuntime;
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
 test("an ordinary depth-1 child gets no envelope and no owner pid", async () => {
 	const capture = path.join(root, "ordinary-env.jsonl");
 	const argvCapture = path.join(root, "ordinary-argv.jsonl");
@@ -1071,6 +1309,11 @@ test("a resumed coordinator keeps its stored authority while nesting is disabled
 });
 
 test("a depth-1 process emits no envelope for its own child", async () => {
+	writeAgentFile("reviewer", {
+		allowNestedSubagents: true,
+		allowedSubagents: "depth-one-coordinator",
+		tools: "read,grep,find,ls,bash",
+	});
 	writeAgentFile("depth-one-coordinator", {
 		allowNestedSubagents: true,
 		allowedSubagents: "recon",
@@ -1083,9 +1326,9 @@ test("a depth-1 process emits no envelope for its own child", async () => {
 	const depthOneRuntime = encodeNestedRuntime({
 		version: 1,
 		depth: 1,
-		agent: "depth-one-coordinator",
+		agent: "reviewer",
 		allowedAgents: ["depth-one-coordinator"],
-		toolCeiling: null,
+		toolCeiling: ["read", "grep", "find", "ls", "bash"],
 		modelCeiling: null,
 		budget: { maxSpawns: 4, maxConcurrency: 2 },
 	});
