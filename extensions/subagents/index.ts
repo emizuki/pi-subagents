@@ -40,6 +40,9 @@ import {
 	type AgentSource,
 	discoverAgents,
 } from "./agents.ts";
+import { currentDepth, DEPTH_ENV_VAR, MAX_SUBAGENT_DEPTH } from "./depth.ts";
+import { formatToolCall, formatTokens, formatUsageStats } from "./format.ts";
+import { sanitizeSessionForFork } from "./session-fork.ts";
 
 const DEFAULT_MAX_PARALLEL_TASKS = 8;
 const DEFAULT_MAX_CONCURRENCY = 4;
@@ -47,107 +50,6 @@ const DEFAULT_MAX_CONCURRENCY = 4;
 const SIGKILL_GRACE_MS = 5_000;
 const COLLAPSED_ITEM_COUNT = 10;
 const OUTPUT_NOTICE_RESERVE_BYTES = 1024;
-
-function formatTokens(count: number): string {
-	if (count < 1000) return count.toString();
-	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
-	if (count < 1000000) return `${Math.round(count / 1000)}k`;
-	return `${(count / 1000000).toFixed(1)}M`;
-}
-
-function formatUsageStats(
-	usage: {
-		input: number;
-		output: number;
-		cacheRead: number;
-		cacheWrite: number;
-		cost: number;
-		contextTokens?: number;
-		turns?: number;
-	},
-	model?: string,
-): string {
-	const parts: string[] = [];
-	if (usage.turns) parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
-	if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
-	if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
-	if (usage.cacheRead) parts.push(`R${formatTokens(usage.cacheRead)}`);
-	if (usage.cacheWrite) parts.push(`W${formatTokens(usage.cacheWrite)}`);
-	if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
-	if (usage.contextTokens && usage.contextTokens > 0) {
-		parts.push(`ctx:${formatTokens(usage.contextTokens)}`);
-	}
-	if (model) parts.push(model);
-	return parts.join(" ");
-}
-
-function formatToolCall(
-	toolName: string,
-	args: Record<string, unknown>,
-	themeFg: (color: any, text: string) => string,
-): string {
-	const shortenPath = (p: string) => {
-		const home = os.homedir();
-		return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
-	};
-
-	switch (toolName) {
-		case "bash": {
-			const command = (args.command as string) || "...";
-			const preview = command.length > 60 ? `${command.slice(0, 60)}...` : command;
-			return themeFg("muted", "$ ") + themeFg("toolOutput", preview);
-		}
-		case "read": {
-			const rawPath = (args.file_path || args.path || "...") as string;
-			const filePath = shortenPath(rawPath);
-			const offset = args.offset as number | undefined;
-			const limit = args.limit as number | undefined;
-			let text = themeFg("accent", filePath);
-			if (offset !== undefined || limit !== undefined) {
-				const startLine = offset ?? 1;
-				const endLine = limit !== undefined ? startLine + limit - 1 : "";
-				text += themeFg("warning", `:${startLine}${endLine ? `-${endLine}` : ""}`);
-			}
-			return themeFg("muted", "read ") + text;
-		}
-		case "write": {
-			const rawPath = (args.file_path || args.path || "...") as string;
-			const filePath = shortenPath(rawPath);
-			const content = (args.content || "") as string;
-			const lines = content.split("\n").length;
-			let text = themeFg("muted", "write ") + themeFg("accent", filePath);
-			if (lines > 1) text += themeFg("dim", ` (${lines} lines)`);
-			return text;
-		}
-		case "edit": {
-			const rawPath = (args.file_path || args.path || "...") as string;
-			return themeFg("muted", "edit ") + themeFg("accent", shortenPath(rawPath));
-		}
-		case "ls": {
-			const rawPath = (args.path || ".") as string;
-			return themeFg("muted", "ls ") + themeFg("accent", shortenPath(rawPath));
-		}
-		case "find": {
-			const pattern = (args.pattern || "*") as string;
-			const rawPath = (args.path || ".") as string;
-			return themeFg("muted", "find ") + themeFg("accent", pattern) + themeFg("dim", ` in ${shortenPath(rawPath)}`);
-		}
-		case "grep": {
-			const pattern = (args.pattern || "") as string;
-			const rawPath = (args.path || ".") as string;
-			return (
-				themeFg("muted", "grep ") +
-				themeFg("accent", `/${pattern}/`) +
-				themeFg("dim", ` in ${shortenPath(rawPath)}`)
-			);
-		}
-		default: {
-			const argsStr = JSON.stringify(args);
-			const preview = argsStr.length > 50 ? `${argsStr.slice(0, 50)}...` : argsStr;
-			return themeFg("accent", toolName) + themeFg("dim", ` ${preview}`);
-		}
-	}
-}
 
 interface UsageStats {
 	input: number;
@@ -433,11 +335,6 @@ interface DispatchDefaults {
 	supervise?: SupervisorHandler;
 }
 
-/**
- * The child inherits this process's environment, so it also loads this extension and can call
- * the tool again. One level of delegation is useful; a tree of them multiplies cost silently.
- */
-const DEPTH_ENV_VAR = "PI_SUBAGENT_DEPTH";
 /** Directory the child writes supervisor requests into and reads replies from. */
 const IPC_ENV_VAR = "PI_SUBAGENT_IPC_DIR";
 /** A supervisor request waits on a human, so the ceiling is generous; it exists to avoid a hang. */
@@ -452,12 +349,6 @@ interface SupervisorRequest {
 	reason: SupervisorReason;
 	message: string;
 	agent: string;
-}
-const MAX_SUBAGENT_DEPTH = 1;
-
-function currentDepth(): number {
-	const raw = Number.parseInt(process.env[DEPTH_ENV_VAR] ?? "0", 10);
-	return Number.isFinite(raw) && raw > 0 ? raw : 0;
 }
 
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -599,79 +490,6 @@ function resolveFanOutLimit(userValue: unknown, projectValue: unknown, fallback:
 	const effective = parseFanOutLimit(userValue) ?? fallback;
 	const project = parseFanOutLimit(projectValue);
 	return project !== undefined && fanOutRank(project) < fanOutRank(effective) ? project : effective;
-}
-
-/**
- * Copy a session transcript for forking, dropping provider-private reasoning blocks.
- *
- * A `thinkingSignature` names a reasoning item belonging to the response chain that produced it —
- * `rs_…` on OpenAI, a signed blob on Anthropic. Replayed from a branch it refers to something the
- * new chain never emitted, which providers reject. The child keeps its own thinking level and
- * reasons from its first turn, so removing the inherited blocks costs nothing.
- */
-function isReasoningBlock(value: unknown): boolean {
-	const type = (value as { type?: unknown } | null)?.type;
-	return type === "thinking" || type === "redacted_thinking";
-}
-
-/**
- * Strip reasoning in place, anywhere it appears. Blocks do not only sit on `message.content`:
- * this tool stores each child's transcript under `message.details`, so a session that dispatched
- * subagents carries nested copies too. Walking the whole entry is the only way to be sure.
- */
-function stripReasoning(node: unknown): number {
-	let stripped = 0;
-	if (Array.isArray(node)) {
-		for (let i = node.length - 1; i >= 0; i--) {
-			if (isReasoningBlock(node[i])) {
-				node.splice(i, 1);
-				stripped++;
-			} else {
-				stripped += stripReasoning(node[i]);
-			}
-		}
-		return stripped;
-	}
-	if (node && typeof node === "object") {
-		const record = node as Record<string, unknown>;
-		if ("thinkingSignature" in record) {
-			delete record.thinkingSignature;
-			stripped++;
-		}
-		for (const value of Object.values(record)) stripped += stripReasoning(value);
-	}
-	return stripped;
-}
-
-/**
- * Copy a session transcript for forking, dropping provider-private reasoning.
- *
- * A `thinkingSignature` names a reasoning item belonging to the response chain that produced it —
- * `rs_…` on OpenAI, a signed blob on Anthropic. Replayed from a branch it refers to something the
- * new chain never emitted, which providers reject. The child keeps its own thinking level and
- * reasons from its first turn, so removing the inherited reasoning costs nothing.
- */
-function sanitizeSessionForFork(sourceFile: string, destFile: string): number {
-	const lines = fs.readFileSync(sourceFile, "utf8").split("\n");
-	let stripped = 0;
-	const out: string[] = [];
-	for (const line of lines) {
-		if (!line.trim()) continue;
-		let entry: unknown;
-		try {
-			entry = JSON.parse(line);
-		} catch {
-			// A half-written trailing line is normal for a session still being appended to.
-			continue;
-		}
-		stripped += stripReasoning(entry);
-		// An assistant turn whose only content was reasoning would replay as an empty message.
-		const content = (entry as { message?: { content?: unknown } })?.message?.content;
-		if (Array.isArray(content) && content.length === 0) continue;
-		out.push(JSON.stringify(entry));
-	}
-	fs.writeFileSync(destFile, `${out.join("\n")}\n`, "utf8");
-	return stripped;
 }
 
 /** Index into THINKING_LEVELS, which is ordered least to most thinking. */
