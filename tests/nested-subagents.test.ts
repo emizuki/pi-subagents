@@ -500,11 +500,12 @@ async function startCoordinatorThenSigkillIt(pidFile: string): Promise<number> {
 		process.kill(coordinatorPid, "SIGKILL");
 		await running;
 		return coordinatorPid;
-	} finally {
+	} catch (error) {
 		if (coordinatorPid !== undefined && isProcessAlive(coordinatorPid)) process.kill(coordinatorPid, "SIGKILL");
 		if (grandchildPid !== undefined && isProcessAlive(grandchildPid)) process.kill(grandchildPid, "SIGKILL");
 		controller.abort();
 		await running;
+		throw error;
 	}
 }
 
