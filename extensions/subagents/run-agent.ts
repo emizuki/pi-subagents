@@ -238,10 +238,6 @@ export async function runSingleAgent(
 	// `errorMessage || stderr`, so a delegation note written before the run would lead the model's
 	// error text and bury the actual failure — and `currentResult` does not exist this far up.
 	const delegationNotes: string[] = [];
-	// Decide authority against the same set the coordinator will itself discover. Using the
-	// dispatch scope would let a checkout supply the very definition the ceiling is checked
-	// against, and would let root and child resolve one name to two different files.
-	const authorityAgents = discoverAgents(cwd ?? defaultCwd, "user", { projectTrusted: false }).agents;
 	// Only the root decides authority. A coordinator running at depth 1 emits nothing, so its
 	// grandchild cannot be handed a third level however the tree is arranged.
 	const nestedLimits = dispatchDefaults.nested;
@@ -252,6 +248,10 @@ export async function runSingleAgent(
 		nestedLimits.maxSpawns > 0;
 	let envelope = "";
 	if (coordinating) {
+		// Decide authority against the same set the coordinator will itself discover. Using the
+		// dispatch scope would let a checkout supply the very definition the ceiling is checked
+		// against, and would let root and child resolve one name to two different files.
+		const authorityAgents = discoverAgents(cwd ?? defaultCwd, "user", { projectTrusted: false }).agents;
 		const { allowed, dropped } = resolveAllowedAgents(agent, authorityAgents);
 		for (const drop of dropped) {
 			delegationNotes.push(`Nested delegation: dropped "${drop.name}" — ${drop.reason}.`);
@@ -508,7 +508,10 @@ export async function runSingleAgent(
 		});
 
 		currentResult.exitCode = exitCode;
-		if (delegationNotes.length > 0) currentResult.stderr += `${delegationNotes.join("\n")}\n`;
+		if (delegationNotes.length > 0) {
+			currentResult.outputNotes = delegationNotes;
+			currentResult.stderr += `${delegationNotes.join("\n")}\n`;
+		}
 		if (wasAborted) {
 			currentResult.stopReason = "aborted";
 			currentResult.errorMessage = "Subagent was aborted.";

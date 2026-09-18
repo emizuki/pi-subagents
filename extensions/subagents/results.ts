@@ -24,6 +24,8 @@ export interface SingleResult {
 	exitCode: number;
 	messages: Message[];
 	stderr: string;
+	/** Coordinator diagnostics that must remain visible even when the child exits successfully. */
+	outputNotes?: string[];
 	usage: UsageStats;
 	model?: string;
 	stopReason?: string;
@@ -212,11 +214,18 @@ export function isFailedResult(result: SingleResult): boolean {
 	return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
 }
 
+function appendOutputNotes(output: string, notes: string[] | undefined): string {
+	if (!notes || notes.length === 0) return output;
+	const noteBlock = `[Nested delegation notes]\n${notes.map((note) => `- ${note}`).join("\n")}`;
+	return output ? `${output}\n\n${noteBlock}` : noteBlock;
+}
+
 export function getResultOutput(result: SingleResult): string {
+	const output = appendOutputNotes(getFinalOutput(result.messages), result.outputNotes);
 	if (isFailedResult(result)) {
-		return result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
+		return result.errorMessage || result.stderr || output || "(no output)";
 	}
-	return getFinalOutput(result.messages) || "(no output)";
+	return output || "(no output)";
 }
 
 /**

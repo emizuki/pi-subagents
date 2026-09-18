@@ -613,7 +613,7 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 					content: [
 						{
 							type: "text",
-							text: `${getFinalOutput(result.messages) || "(no output)"}${result.runId ? `\n\n(run ${result.runId})` : ""}`,
+							text: `${getResultOutput(result)}${result.runId ? `\n\n(run ${result.runId})` : ""}`,
 						},
 					],
 					details: makeDetails("single")([result]),

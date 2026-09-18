@@ -123,7 +123,7 @@ const originalIpc = process.env.PI_SUBAGENT_IPC_DIR;
 const originalOwner = process.env[OWNER_PID_ENV_VAR];
 const originalAgent = process.env.PI_SUBAGENT_AGENT;
 
-function makeContext(): ExtensionContext {
+function makeContext(cwd = root): ExtensionContext {
 	const model = {
 		provider: "test-provider",
 		id: "cheap",
@@ -132,7 +132,7 @@ function makeContext(): ExtensionContext {
 		cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
 	};
 	const value: TestContext = {
-		cwd: root,
+		cwd,
 		model,
 		thinkingLevel: "low",
 		scopedModels: [],
@@ -151,6 +151,7 @@ function makeContext(): ExtensionContext {
 function writeAgentFile(
 	name: string,
 	options: { allowNestedSubagents?: boolean; allowedSubagents?: string; tools?: string } = {},
+	directory = path.join(agentDir, "agents"),
 ): string {
 	const fields = [
 		`name: ${name}`,
@@ -159,7 +160,7 @@ function writeAgentFile(
 		options.allowNestedSubagents ? "allowNestedSubagents: true" : undefined,
 		options.allowedSubagents === undefined ? undefined : `allowedSubagents: ${options.allowedSubagents}`,
 	].filter((field): field is string => field !== undefined);
-	const target = path.join(agentDir, "agents", `${name}.md`);
+	const target = path.join(directory, `${name}.md`);
 	mkdirSync(path.dirname(target), { recursive: true });
 	writeFileSync(target, `---\n${fields.join("\n")}\n---\nYou are a test agent.\n`);
 	return target;
@@ -209,19 +210,25 @@ function optionValue(args: string[], option: string): string | undefined {
 	return index === -1 ? undefined : args[index + 1];
 }
 
-function resultStderr(result: unknown): string {
+function resultText(result: unknown): string {
 	if (typeof result !== "object" || result === null) return "";
-	const details = (result as { details?: unknown }).details;
-	if (typeof details !== "object" || details === null) return "";
-	const results = (details as { results?: unknown }).results;
-	if (!Array.isArray(results) || results.length === 0) return "";
-	const stderr = (results[0] as { stderr?: unknown }).stderr;
-	return typeof stderr === "string" ? stderr : "";
+	const content = (result as { content?: unknown }).content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.map((part: unknown) => {
+			if (typeof part !== "object" || part === null) return "";
+			const text = (part as { type?: unknown; text?: unknown });
+			return text.type === "text" && typeof text.text === "string" ? text.text : "";
+		})
+		.join("\n");
 }
 
-async function runSubagent(params: Record<string, unknown>): Promise<unknown> {
-	await harness.refresh(context);
-	return harness.execute(params, context);
+async function runSubagent(
+	params: Record<string, unknown>,
+	dispatchContext: ExtensionContext = context,
+): Promise<unknown> {
+	await harness.refresh(dispatchContext);
+	return harness.execute(params, dispatchContext);
 }
 
 before(async () => {
@@ -815,7 +822,10 @@ test("a coordinator whose allowlist resolves empty launches as an ordinary child
 		const result = await runSubagent({ agent: "lonely", task: "go" });
 		const seen = capturedEnvironment(capture)[0];
 		assert.equal(seen.runtime, "", "nothing survived resolution, so nothing is granted");
-		assert.match(resultStderr(result), /nobody/, "the drop must be reported, not swallowed");
+		const output = resultText(result);
+		assert.match(output, /\[Nested delegation notes\]/, "delegation notes must reach the visible output");
+		assert.match(output, /Nested delegation: dropped "nobody"/, "the drop must be reported visibly");
+		assert.match(output, /nothing survived, running as an ordinary agent/, "the fallback must be reported visibly");
 		assert.equal(capturedEnvironment(capture).length, 1, "no second process may start");
 	} finally {
 		delete process.env.FAKE_PI_ENV_CAPTURE;
@@ -841,5 +851,56 @@ test("a grandchild's environment carries no authority at all", async () => {
 		assert.notEqual(grandchild.owner, String(process.pid), "owned by its coordinator, not by the root");
 	} finally {
 		delete process.env.FAKE_PI_ENV_CAPTURE;
+	}
+});
+
+test("coordinator authority resolves against the user scope, not project shadows", async () => {
+	writeCoordinatorFixtures();
+	const project = path.join(root, "authority-scope-project");
+	const projectAgents = path.join(project, ".pi", "agents");
+	writeAgentFile("recon", { tools: "read,write" }, projectAgents);
+	const capture = path.join(root, "authority-scope-env.jsonl");
+	const argvCapture = path.join(root, "authority-scope-argv.jsonl");
+	process.env.FAKE_PI_ENV_CAPTURE = capture;
+	setFakeMode("normal", argvCapture);
+	try {
+		await runSubagent(
+			{ agent: "reviewer", task: "review this", agentScope: "both" },
+			makeContext(project),
+		);
+		const seen = capturedEnvironment(capture)[0];
+		const runtime = parseNestedRuntime(seen.runtime || undefined);
+		assert.ok(runtime, "the user-scope delegate must survive project shadowing");
+		assert.deepEqual(runtime.allowedAgents, ["recon"]);
+	} finally {
+		delete process.env.FAKE_PI_ENV_CAPTURE;
+	}
+});
+
+test("a depth-1 process emits no envelope for its own child", async () => {
+	writeAgentFile("depth-one-coordinator", {
+		allowNestedSubagents: true,
+		allowedSubagents: "recon",
+		tools: "read,grep,find,ls,bash",
+	});
+	const capture = path.join(root, "depth-one-env.jsonl");
+	const argvCapture = path.join(root, "depth-one-argv.jsonl");
+	const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+	const previousRuntime = process.env[RUNTIME_ENV_VAR];
+	process.env.PI_SUBAGENT_DEPTH = "1";
+	process.env[RUNTIME_ENV_VAR] = gateEnvelope;
+	process.env.FAKE_PI_ENV_CAPTURE = capture;
+	setFakeMode("normal", argvCapture);
+	try {
+		await runSubagent({ agent: "depth-one-coordinator", task: "child" });
+		const seen = capturedEnvironment(capture)[0];
+		assert.equal(seen.depth, "2");
+		assert.equal(seen.runtime, "", "only the root may emit an envelope");
+	} finally {
+		delete process.env.FAKE_PI_ENV_CAPTURE;
+		if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+		else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+		if (previousRuntime === undefined) delete process.env[RUNTIME_ENV_VAR];
+		else process.env[RUNTIME_ENV_VAR] = previousRuntime;
 	}
 });
