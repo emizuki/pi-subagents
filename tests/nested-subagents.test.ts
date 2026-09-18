@@ -4,12 +4,16 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
 import extension from "../extensions/subagents/index.ts";
+import type { AgentConfig } from "../extensions/subagents/agents.ts";
 import {
 	encodeNestedRuntime,
+	intersectModelCeiling,
 	type NestedRuntimeV1,
 	parseNestedRuntime,
 	OWNER_PID_ENV_VAR,
+	resolveAllowedAgents,
 	RUNTIME_ENV_VAR,
+	withinToolCeiling,
 } from "../extensions/subagents/nested-runtime.ts";
 import {
 	DEFAULT_MAX_NESTED_CONCURRENCY,
@@ -354,4 +358,109 @@ test("an envelope with no allowed agents registers no subagent tool", () => {
 		budget: { maxSpawns: 4, maxConcurrency: 2 },
 	});
 	assert.deepEqual([...registerAt("1", empty)], ["contact_supervisor"]);
+});
+
+test("tool ceiling: a child may never exceed its coordinator", () => {
+	// Row 1: explicit coordinator, explicit subset child.
+	assert.equal(withinToolCeiling(["read", "grep", "bash"], ["read", "grep"]), true);
+	assert.equal(withinToolCeiling(["read", "grep"], ["read", "grep"]), true);
+	// Row 2: explicit coordinator, child reaching beyond it.
+	assert.equal(withinToolCeiling(["read", "grep"], ["read", "write"]), false);
+	// Row 3: omitted child tools mean Pi's full default set, which is broader than any allowlist.
+	assert.equal(withinToolCeiling(["read", "grep"], undefined), false);
+	// Row 4: an unrestricted coordinator may coordinate anything; it already held everything.
+	assert.equal(withinToolCeiling(undefined, undefined), true);
+	assert.equal(withinToolCeiling(undefined, ["read", "write", "bash"]), true);
+	// The internal tools are injected by the extension and are not part of the comparison.
+	assert.equal(withinToolCeiling(["read"], ["read", "contact_supervisor"]), true);
+	assert.equal(withinToolCeiling(["read"], ["read", "subagent"]), true);
+	// An empty child allowlist is a subset of everything.
+	assert.equal(withinToolCeiling(["read"], []), true);
+});
+
+function agent(over: Partial<AgentConfig> & { name: string }): AgentConfig {
+	return {
+		aliases: [],
+		description: "d",
+		inheritSkills: false,
+		inheritProjectContext: true,
+		suggest: true,
+		allowNestedSubagents: false,
+		allowedSubagents: [],
+		systemPrompt: "p",
+		source: "builtin",
+		filePath: `/fake/${over.name}.md`,
+		...over,
+	};
+}
+
+test("allowlist resolution keeps survivors and reports every drop", () => {
+	const reviewer = agent({
+		name: "reviewer",
+		tools: ["read", "grep"],
+		allowNestedSubagents: true,
+		allowedSubagents: ["recon", "reviewer", "ghost", "twin", "general-purpose", "writer"],
+	});
+	const agents = [
+		reviewer,
+		agent({ name: "recon", tools: ["read", "grep"] }),
+		agent({ name: "general-purpose" }), // no tools: the full default set
+		agent({ name: "writer", tools: ["read", "write"] }), // reaches beyond the ceiling
+		agent({ name: "twin-a", aliases: ["twin"], tools: ["read"] }),
+		agent({ name: "twin-b", aliases: ["twin"], tools: ["read"] }),
+	];
+	const { allowed, dropped } = resolveAllowedAgents(reviewer, agents);
+	assert.deepEqual(allowed, ["recon"]);
+	const reasons = new Map(dropped.map((d) => [d.name, d.reason]));
+	assert.match(reasons.get("reviewer") ?? "", /itself/i);
+	assert.match(reasons.get("ghost") ?? "", /not found/i);
+	assert.match(reasons.get("twin") ?? "", /ambiguous|not found/i);
+	assert.match(reasons.get("general-purpose") ?? "", /tool/i);
+	assert.match(reasons.get("writer") ?? "", /tool/i);
+});
+
+test("a coordinator that allow-lists only itself resolves to nothing", () => {
+	// A lazy coordinator handing its whole task to another instance of itself passes a tool-ceiling
+	// check perfectly: the two tool sets are identical by construction. The allowlist is the only
+	// mechanism that can catch it.
+	const reviewer = agent({ name: "reviewer", tools: ["read"], allowNestedSubagents: true, allowedSubagents: ["reviewer"] });
+	const { allowed, dropped } = resolveAllowedAgents(reviewer, [reviewer]);
+	assert.deepEqual(allowed, []);
+	assert.equal(dropped.length, 1);
+});
+
+test("self-reference is dropped by identity, not by spelling", () => {
+	const reviewer = agent({
+		name: "reviewer",
+		aliases: ["review", "auditor"],
+		tools: ["read"],
+		allowNestedSubagents: true,
+		allowedSubagents: ["auditor"],
+	});
+	assert.deepEqual(resolveAllowedAgents(reviewer, [reviewer]).allowed, []);
+});
+
+test("resolution canonicalises an alias to the agent's real name", () => {
+	const boss = agent({ name: "boss", tools: ["read"], allowNestedSubagents: true, allowedSubagents: ["scout"] });
+	const recon = agent({ name: "recon", aliases: ["scout"], tools: ["read"] });
+	assert.deepEqual(resolveAllowedAgents(boss, [boss, recon]).allowed, ["recon"]);
+});
+
+test("duplicate names resolve once", () => {
+	const boss = agent({ name: "boss", tools: ["read"], allowNestedSubagents: true, allowedSubagents: ["recon", "recon"] });
+	const recon = agent({ name: "recon", tools: ["read"] });
+	assert.deepEqual(resolveAllowedAgents(boss, [boss, recon]).allowed, ["recon"]);
+});
+
+test("model ceiling intersects, preserves order, and distinguishes null from empty", () => {
+	const cheap = { provider: "p", id: "cheap", name: "C", cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 } };
+	const dear = { provider: "p", id: "dear", name: "D", cost: { input: 9, output: 9, cacheRead: 0, cacheWrite: 0 } };
+	const choices = [cheap, dear];
+	// null means the root was unscoped: everything local stays selectable.
+	assert.deepEqual(intersectModelCeiling(choices, null), choices);
+	assert.deepEqual(intersectModelCeiling(choices, ["p/cheap"]), [cheap]);
+	// An empty ceiling means nothing is selectable. It must never be read as "unrestricted".
+	assert.deepEqual(intersectModelCeiling(choices, []), []);
+	// A ceiling naming something absent locally yields nothing rather than falling back.
+	assert.deepEqual(intersectModelCeiling(choices, ["p/absent"]), []);
 });

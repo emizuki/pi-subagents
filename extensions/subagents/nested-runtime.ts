@@ -9,6 +9,8 @@
  */
 
 import { MAX_NESTED_CONCURRENCY, MAX_NESTED_SPAWNS, parseBoundedInt } from "./settings.ts";
+import type { AgentConfig } from "./agents.ts";
+import { type ModelLike, modelKey } from "./models.ts";
 
 export const RUNTIME_ENV_VAR = "PI_SUBAGENT_RUNTIME_V1";
 /** Task 4 uses this variable for the parent-process ownership guard. */
@@ -78,4 +80,80 @@ export function parseNestedRuntime(raw: string | undefined): NestedRuntimeV1 | u
 
 export function readNestedRuntime(): NestedRuntimeV1 | undefined {
 	return parseNestedRuntime(process.env[RUNTIME_ENV_VAR]);
+}
+
+/** Injected by the extension rather than declared in frontmatter, so never part of a comparison. */
+const INTERNAL_TOOLS = new Set(["subagent", "contact_supervisor"]);
+
+/**
+ * Whether a child's declared tools stay inside the coordinator's own allowlist.
+ *
+ * An omitted child list is Pi's full default set, including edit and write, which is broader than
+ * any restricted coordinator — so omission is refused rather than treated as "inherits the parent".
+ * An omitted coordinator list is itself unrestricted, and an unrestricted agent coordinating an
+ * unrestricted child gains nothing it did not already hold.
+ */
+export function withinToolCeiling(coordinatorTools: string[] | undefined, childTools: string[] | undefined): boolean {
+	if (coordinatorTools === undefined) return true;
+	if (childTools === undefined) return false;
+	const ceiling = new Set(coordinatorTools.filter((tool) => !INTERNAL_TOOLS.has(tool)));
+	return childTools.every((tool) => INTERNAL_TOOLS.has(tool) || ceiling.has(tool));
+}
+
+function matchAgents(agents: AgentConfig[], wanted: string): AgentConfig[] {
+	const needle = wanted.trim().toLowerCase();
+	if (!needle) return [];
+	const byName = agents.filter((a) => a.name.toLowerCase() === needle);
+	if (byName.length > 0) return byName;
+	return agents.filter((a) => a.aliases.some((alias) => alias.toLowerCase() === needle));
+}
+
+/**
+ * Turn a coordinator's declared `allowedSubagents` into the canonical names the root is willing to
+ * authorize. Every rejection is reported rather than silently swallowed, because this runs for an
+ * agent that ships enabled by default and a silent empty result looks identical to a bug.
+ */
+export function resolveAllowedAgents(
+	coordinator: AgentConfig,
+	agents: AgentConfig[],
+): { allowed: string[]; dropped: Array<{ name: string; reason: string }> } {
+	const allowed: string[] = [];
+	const dropped: Array<{ name: string; reason: string }> = [];
+	const seen = new Set<string>();
+	for (const wanted of coordinator.allowedSubagents) {
+		const matches = matchAgents(agents, wanted);
+		if (matches.length === 0) {
+			dropped.push({ name: wanted, reason: "not found in the user scope" });
+			continue;
+		}
+		if (matches.length > 1) {
+			dropped.push({ name: wanted, reason: "ambiguous: matches more than one agent" });
+			continue;
+		}
+		const child = matches[0];
+		// Identity, not spelling: an alias of the coordinator is still the coordinator.
+		if (child.filePath === coordinator.filePath || child.name === coordinator.name) {
+			dropped.push({ name: wanted, reason: "an agent may not delegate to itself" });
+			continue;
+		}
+		if (!withinToolCeiling(coordinator.tools, child.tools)) {
+			dropped.push({ name: wanted, reason: "its tools exceed the coordinator's own" });
+			continue;
+		}
+		if (seen.has(child.name)) continue;
+		seen.add(child.name);
+		allowed.push(child.name);
+	}
+	return { allowed, dropped };
+}
+
+/**
+ * `null` means the root was unscoped and everything local stays selectable. An empty array means
+ * nothing is selectable, and is never read as "unrestricted" — that conflation is exactly how a
+ * model ceiling turns into no ceiling.
+ */
+export function intersectModelCeiling(choices: ModelLike[], ceiling: string[] | null): ModelLike[] {
+	if (ceiling === null) return choices;
+	const permitted = new Set(ceiling.map((key) => key.toLowerCase()));
+	return choices.filter((choice) => permitted.has(modelKey(choice).toLowerCase()));
 }
