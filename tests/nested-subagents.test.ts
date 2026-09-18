@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { after, before, test } from "node:test";
+import { after, before, beforeEach, test } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import extension from "../extensions/subagents/index.ts";
+import { __resetNestedSpawnBudget } from "../extensions/subagents/dispatch.ts";
 import type { AgentConfig } from "../extensions/subagents/agents.ts";
 import { writeFakePi } from "./fake-pi.ts";
 import {
@@ -74,15 +75,19 @@ type CapturedEnvironment = {
 
 const cheapModel = { provider: "p", id: "cheap", cost: { input: 1 } };
 const dearModel = { provider: "p", id: "dear", cost: { input: 9 } };
-const nestedGuardRuntime = encodeNestedRuntime({
-	version: 1,
-	depth: 1,
-	agent: "reviewer",
-	allowedAgents: ["recon"],
-	toolCeiling: null,
-	modelCeiling: null,
-	budget: { maxSpawns: 4, maxConcurrency: 2 },
-});
+function envelopeWith(budget: NestedRuntimeV1["budget"]): string {
+	return encodeNestedRuntime({
+		version: 1,
+		depth: 1,
+		agent: "reviewer",
+		allowedAgents: ["recon"],
+		toolCeiling: null,
+		modelCeiling: null,
+		budget,
+	});
+}
+
+const nestedGuardRuntime = envelopeWith({ maxSpawns: 4, maxConcurrency: 2 });
 
 class NestedHarness {
 	readonly handlers = new Map<string, TestHandler[]>();
@@ -137,6 +142,8 @@ const originalRuntime = process.env[RUNTIME_ENV_VAR];
 const originalIpc = process.env.PI_SUBAGENT_IPC_DIR;
 const originalOwner = process.env[OWNER_PID_ENV_VAR];
 const originalAgent = process.env.PI_SUBAGENT_AGENT;
+
+beforeEach(() => __resetNestedSpawnBudget());
 
 function makeContext(cwd = root, scoped = false): ExtensionContext {
 	const model = {
@@ -225,6 +232,26 @@ async function waitForSpawnCount(file: string, expected: number): Promise<void> 
 	assert.equal(spawnCount(file), expected, `expected ${expected} child spawn(s) in ${file}`);
 }
 
+function setConcurrencyProbe(captureFile: string, holdMs: number): void {
+	process.env.FAKE_PI_CONCURRENCY_CAPTURE = captureFile;
+	process.env.FAKE_PI_HOLD_MS = String(holdMs);
+}
+
+function peakConcurrency(captureFile: string): number {
+	if (!existsSync(captureFile)) return 0;
+	let live = 0;
+	let peak = 0;
+	for (const event of readFileSync(captureFile, "utf8").trim().split("\n").filter(Boolean)) {
+		if (event === "start") {
+			live++;
+			peak = Math.max(peak, live);
+		} else {
+			live--;
+		}
+	}
+	return peak;
+}
+
 function capturedEnvironment(file: string): CapturedEnvironment[] {
 	return readFileSync(file, "utf8")
 		.trim()
@@ -295,11 +322,11 @@ async function runSubagent(
 	return harness.execute(params, dispatchContext);
 }
 
-async function executeNested(params: Record<string, unknown>): Promise<unknown> {
+async function executeNested(params: Record<string, unknown>, runtime = nestedGuardRuntime): Promise<unknown> {
 	const previousDepth = process.env.PI_SUBAGENT_DEPTH;
 	const previousRuntime = process.env[RUNTIME_ENV_VAR];
 	process.env.PI_SUBAGENT_DEPTH = "1";
-	process.env[RUNTIME_ENV_VAR] = nestedGuardRuntime;
+	process.env[RUNTIME_ENV_VAR] = runtime;
 	try {
 		await harness.refresh(context);
 		return await harness.execute(params, context);
@@ -915,6 +942,135 @@ test("nested registration wires the model ceiling into the registered schema", a
 		else process.env.PI_SUBAGENT_DEPTH = previousDepth;
 		if (previousRuntime === undefined) delete process.env[RUNTIME_ENV_VAR];
 		else process.env[RUNTIME_ENV_VAR] = previousRuntime;
+	}
+});
+
+test("the counter stops a coordinator after maxSpawns", async () => {
+	const runtime = envelopeWith({ maxSpawns: 2, maxConcurrency: 2 });
+	const capture = path.join(root, "nested-budget-capture.jsonl");
+	setFakeMode("normal", capture);
+	try {
+		assert.match(resultText(await executeNested({ agent: "recon", task: "one" }, runtime)), /ok/);
+		assert.match(resultText(await executeNested({ agent: "recon", task: "two" }, runtime)), /ok/);
+		const third = await executeNested({ agent: "recon", task: "three" }, runtime);
+		assert.match(resultText(third), /budget/i);
+		assert.equal(spawnCount(capture), 2, "the third call must not reach spawn");
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
+test("a failed spawn still consumes its claim", async () => {
+	const runtime = envelopeWith({ maxSpawns: 1, maxConcurrency: 1 });
+	const restorePath = process.env.PATH;
+	process.env.PATH = path.join(tempRoot(), "empty");
+	try {
+		const failed = await executeNested({ agent: "recon", task: "cannot start" }, runtime);
+		assert.match(resultText(failed), /failed|start/i, "the first dispatch must fail to start");
+	} finally {
+		process.env.PATH = restorePath;
+	}
+	const second = await executeNested({ agent: "recon", task: "retry" }, runtime);
+	assert.match(resultText(second), /budget/i);
+});
+
+test("a parallel call over budget is rejected whole, before any child starts", async () => {
+	const runtime = envelopeWith({ maxSpawns: 3, maxConcurrency: 2 });
+	const capture = path.join(root, "nested-budget-parallel-capture.jsonl");
+	setFakeMode("normal", capture);
+	try {
+		const result = await executeNested(
+			{
+				tasks: [
+					{ agent: "recon", task: "a" },
+					{ agent: "recon", task: "b" },
+					{ agent: "recon", task: "c" },
+					{ agent: "recon", task: "d" },
+				],
+			},
+			runtime,
+		);
+		assert.match(resultText(result), /3/, "the message must state what remains");
+		assert.equal(spawnCount(capture), 0, "nothing may start when the call is refused");
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
+test("a coordinator's nested budget bypasses the root parallel admission cap", async () => {
+	const runtime = envelopeWith({ maxSpawns: 2, maxConcurrency: 2 });
+	const capture = path.join(root, "nested-budget-root-cap-capture.jsonl");
+	writeUserSettings({ maxParallelTasks: 1 });
+	setFakeMode("normal", capture);
+	try {
+		const result = await executeNested(
+			{
+				tasks: [
+					{ agent: "recon", task: "a" },
+					{ agent: "recon", task: "b" },
+				],
+			},
+			runtime,
+		);
+		assert.match(resultText(result), /Parallel: 2\/2 succeeded/);
+		assert.equal(spawnCount(capture), 2);
+	} finally {
+		clearUserSettings();
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
+test("nested parallel concurrency is min(maxConcurrency, remaining budget)", async () => {
+	const runtime = envelopeWith({ maxSpawns: 6, maxConcurrency: 2 });
+	const capture = path.join(root, "nested-concurrency-capture.jsonl");
+	const probeFile = path.join(root, "nested-concurrency.jsonl");
+	setFakeMode("normal", capture);
+	setConcurrencyProbe(probeFile, 60);
+	try {
+		await executeNested(
+			{
+				tasks: [
+					{ agent: "recon", task: "a" },
+					{ agent: "recon", task: "b" },
+					{ agent: "recon", task: "c" },
+					{ agent: "recon", task: "d" },
+				],
+			},
+			runtime,
+		);
+		assert.equal(peakConcurrency(probeFile), 2);
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+		delete process.env.FAKE_PI_CONCURRENCY_CAPTURE;
+		delete process.env.FAKE_PI_HOLD_MS;
+	}
+});
+
+test("a refused call consumes no budget", async () => {
+	const runtime = envelopeWith({ maxSpawns: 1, maxConcurrency: 1 });
+	const capture = path.join(root, "nested-refused-budget-capture.jsonl");
+	setFakeMode("normal", capture);
+	try {
+		const refused = await executeNested({ agent: "not-on-the-list", task: "probe" }, runtime);
+		assert.match(resultText(refused), /not callable/i);
+		assert.match(resultText(await executeNested({ agent: "recon", task: "probe" }, runtime)), /ok/);
+		assert.equal(spawnCount(capture), 1, "the refused call must not reach spawn");
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
+test("a forbidden nested call consumes no budget", async () => {
+	const runtime = envelopeWith({ maxSpawns: 1, maxConcurrency: 1 });
+	const capture = path.join(root, "nested-forbidden-budget-capture.jsonl");
+	setFakeMode("normal", capture);
+	try {
+		const refused = await executeNested({ agent: "recon", task: "probe", action: "status" }, runtime);
+		assert.match(resultText(refused), /cannot be used here/i);
+		assert.match(resultText(await executeNested({ agent: "recon", task: "probe" }, runtime)), /ok/);
+		assert.equal(spawnCount(capture), 1, "the forbidden call must not reach spawn");
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
 	}
 });
 

@@ -18,6 +18,22 @@ import { type AsyncRun, asyncRuns, describeAsyncRun, newRunId, type RetainedRun,
 import { buildGuidelines, makeNestedSubagentParams, makeSubagentParams } from "./schema.ts";
 import { readSubagentSettings, trustedProjectSettings } from "./settings.ts";
 
+/**
+ * Nested spawns already claimed by this coordinator process, for its whole life.
+ *
+ * In memory and per process, deliberately: a file-backed budget would be shared by sibling
+ * coordinators that have nothing to do with each other, and would be wiped by the retention
+ * sweep on /new. Incremented before spawn and never decremented, so a failed spawn consumes its
+ * claim and retrying cannot convert failures into fan-out.
+ */
+let nestedSpawnsUsed = 0;
+
+/** Test-only. `node --test` isolates per file, so without this every budget test after the
+ * first would run against an exhausted counter and pass for the wrong reason. */
+export function __resetNestedSpawnBudget(): void {
+	nestedSpawnsUsed = 0;
+}
+
 export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, runtime?: NestedRuntimeV1) {
 	const current = ctx.model ? modelKey(ctx.model) : undefined;
 	const localChoices = modelChoices(ctx);
@@ -347,6 +363,23 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 				}
 			}
 
+			const requested = params.tasks?.length ?? 1;
+			if (runtime) {
+				const remaining = runtime.budget.maxSpawns - nestedSpawnsUsed;
+				if (requested > remaining) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Nested spawn budget exhausted: ${remaining} of ${runtime.budget.maxSpawns} remaining, ${requested} requested. Do the rest yourself.`,
+							},
+						],
+						failed: true,
+					};
+				}
+				nestedSpawnsUsed += requested;
+			}
+
 			if (params.chain && params.chain.length > 0) {
 				const results: SingleResult[] = [];
 				let previousOutput = "";
@@ -425,7 +458,7 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 					ctx.cwd,
 					dispatchDefaults.trustedProjectSettings,
 				);
-				if (maxParallelTasks !== "unbounded" && params.tasks.length > maxParallelTasks)
+				if (!runtime && maxParallelTasks !== "unbounded" && params.tasks.length > maxParallelTasks)
 					return {
 						content: [
 							{
@@ -466,7 +499,11 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 					}
 				};
 
-				const concurrency = maxConcurrency === "unbounded" ? params.tasks.length : maxConcurrency;
+				const concurrency = runtime
+					? Math.min(runtime.budget.maxConcurrency, requested)
+					: maxConcurrency === "unbounded"
+						? params.tasks.length
+						: maxConcurrency;
 				const results = await mapWithConcurrencyLimit(params.tasks, concurrency, async (t, index) => {
 					const result = await runSingleAgent(
 						ctx.cwd,
