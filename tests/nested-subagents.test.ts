@@ -820,7 +820,6 @@ test("Windows termination invokes taskkill for a live coordinator", () => {
 				exitCode: null,
 				signalCode: null,
 				kill: () => true,
-				once: () => undefined,
 			},
 			1,
 		);
@@ -851,7 +850,6 @@ test("Windows termination falls back to SIGTERM when taskkill fails", () => {
 				if (signal === "SIGTERM") proc.exitCode = 0;
 				return true;
 			},
-			once: () => undefined,
 		};
 		childProcess.spawnSync = (() => result) as unknown as typeof childProcess.spawnSync;
 		syncBuiltinESMExports();
@@ -881,7 +879,6 @@ test("an exited coordinator is never signalled through its former group", () => 
 				exitCode: 0,
 				signalCode: null,
 				kill: () => true,
-				once: () => undefined,
 			},
 			1,
 		);
@@ -905,7 +902,6 @@ test("an alive coordinator escalates its process group after the grace period", 
 				exitCode: null,
 				signalCode: null,
 				kill: () => true,
-				once: () => undefined,
 			},
 			10,
 		);

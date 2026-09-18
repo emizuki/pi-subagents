@@ -36,7 +36,7 @@ export function windowsTreeKillCommand(pid: number): { command: string; args: st
  * process as "already succeeded" is not enough — the signal must not be sent at all.
  */
 export function terminateOwnedTree(
-	proc: { pid?: number; exitCode: number | null; signalCode: NodeJS.Signals | null; kill(signal?: NodeJS.Signals): boolean; once(event: "exit", listener: () => void): unknown },
+	proc: { pid?: number; exitCode: number | null; signalCode: NodeJS.Signals | null; kill(signal?: NodeJS.Signals): boolean },
 	graceMs: number,
 ): void {
 	const pid = proc.pid;
