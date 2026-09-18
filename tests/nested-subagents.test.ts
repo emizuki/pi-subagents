@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
@@ -10,6 +10,7 @@ import { writeFakePi } from "./fake-pi.ts";
 import {
 	encodeNestedRuntime,
 	intersectModelCeiling,
+	nestedRegistrationAllowed,
 	type NestedRuntimeV1,
 	parseNestedRuntime,
 	OWNER_PID_ENV_VAR,
@@ -17,6 +18,7 @@ import {
 	RUNTIME_ENV_VAR,
 	withinToolCeiling,
 } from "../extensions/subagents/nested-runtime.ts";
+import { makeNestedSubagentParams } from "../extensions/subagents/schema.ts";
 import {
 	DEFAULT_MAX_NESTED_CONCURRENCY,
 	DEFAULT_MAX_NESTED_SPAWNS,
@@ -69,6 +71,9 @@ type CapturedEnvironment = {
 	pid: number;
 	pgrp: number | null;
 };
+
+const cheapModel = { provider: "p", id: "cheap", cost: { input: 1 } };
+const dearModel = { provider: "p", id: "dear", cost: { input: 9 } };
 
 class NestedHarness {
 	readonly handlers = new Map<string, TestHandler[]>();
@@ -196,6 +201,10 @@ function capturedArgs(file: string): string[][] {
 		.split("\n")
 		.filter(Boolean)
 		.map((line) => JSON.parse(line) as string[]);
+}
+
+function spawnCount(file: string): number {
+	return existsSync(file) ? capturedArgs(file).length : 0;
 }
 
 function capturedEnvironment(file: string): CapturedEnvironment[] {
@@ -783,6 +792,41 @@ test("model ceiling intersects, preserves order, and distinguishes null from emp
 	assert.deepEqual(intersectModelCeiling(choices, ["p/absent"]), []);
 });
 
+test("the coordinator schema cannot express the modes it must not use", () => {
+	const params = makeNestedSubagentParams([cheapModel], "p/cheap");
+	const keys = Object.keys(params.properties);
+	// typebox 1.x declares TSchema as an empty interface, so the runtime shape is not on the type.
+	// The existing suite gets away with `.enum` because harness.tools is a Map<string, any>;
+	// calling the builder directly is typed, and a bare `.enum` will not compile.
+	for (const forbidden of ["chain", "async", "action", "id", "resume", "agentScope", "confirmProjectAgents", "cwd"])
+		assert.ok(!keys.includes(forbidden), `${forbidden} must be absent from the nested schema`);
+	for (const required of ["agent", "task", "tasks", "model", "thinking", "context"])
+		assert.ok(keys.includes(required), `${required} must remain available`);
+	// A nested task item must not reintroduce cwd through the back door.
+	assert.ok(!Object.keys(params.properties.tasks.items.properties).includes("cwd"));
+});
+
+test("the nested model enum is the root's scope, not the local catalogue", () => {
+	// This is the evidence the model ceiling is load-bearing. A coordinator is spawned with
+	// --model and never --models, so its own ctx.scopedModels is empty and modelChoices() would
+	// otherwise hand it the entire catalogue one level down from a scoped root.
+	const local = [cheapModel, dearModel];
+	const params = makeNestedSubagentParams(intersectModelCeiling(local, ["p/cheap"]), "p/cheap");
+	assert.deepEqual((params.properties.model as unknown as { enum?: string[] }).enum, ["p/cheap"]);
+});
+
+test("an empty model ceiling refuses rather than falling back to free-form", () => {
+	// modelSchema falls back to an unconstrained Type.String when `choices` is empty, and
+	// run-agent's execution-time check guards on `scopedModels?.length` — falsy for []. So an
+	// empty intersection would fail OPEN at both layers: no enum, and no backstop. The spec says
+	// the opposite in as many words: an empty array is never read as "unrestricted".
+	assert.equal((makeNestedSubagentParams([], undefined).properties.model as unknown as { enum?: string[] }).enum, undefined);
+	// Therefore the empty case must never reach schema construction; Step 4 refuses it upstream.
+	assert.equal(nestedRegistrationAllowed({ localChoices: [cheapModel], ceiling: ["p/absent"] }), false);
+	assert.equal(nestedRegistrationAllowed({ localChoices: [cheapModel], ceiling: ["p/cheap"] }), true);
+	assert.equal(nestedRegistrationAllowed({ localChoices: [cheapModel], ceiling: null }), true);
+});
+
 test("an ordinary depth-1 child gets no envelope and no owner pid", async () => {
 	const capture = path.join(root, "ordinary-env.jsonl");
 	const argvCapture = path.join(root, "ordinary-argv.jsonl");
@@ -828,6 +872,57 @@ test("a coordinator receives an envelope naming exactly its resolved delegates",
 		assert.ok(optionValue(args, "--tools")?.split(",").includes("subagent"));
 	} finally {
 		delete process.env.FAKE_PI_ENV_CAPTURE;
+	}
+});
+
+test("a coordinator cannot be dispatched async from the root", async () => {
+	writeCoordinatorFixtures();
+	const capture = path.join(root, "coordinator-async-capture.jsonl");
+	setFakeMode("normal", capture);
+	try {
+		const result = await runSubagent({ agent: "reviewer", task: "review", async: true });
+		assert.match(resultText(result), /synchronously/);
+		assert.equal(spawnCount(capture), 0);
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
+test("the coordinator re-checks the tool ceiling against the file it actually resolved", async () => {
+	writeAgentFile("reviewer", {
+		allowNestedSubagents: true,
+		allowedSubagents: "recon",
+		tools: "read,grep",
+	});
+	writeAgentFile("recon", { tools: "read,grep" });
+	const runtime = encodeNestedRuntime({
+		version: 1,
+		depth: 1,
+		agent: "reviewer",
+		allowedAgents: ["recon"],
+		toolCeiling: ["read", "grep"],
+		modelCeiling: null,
+		budget: { maxSpawns: 4, maxConcurrency: 2 },
+	});
+	const capture = path.join(root, "nested-ceiling-capture.jsonl");
+	const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+	process.env.PI_SUBAGENT_DEPTH = "1";
+	process.env[RUNTIME_ENV_VAR] = runtime;
+	setFakeMode("normal", capture);
+	try {
+		await harness.refresh(context);
+		const registered = harness.tools.get("subagent") as { description?: string } | undefined;
+		assert.match(registered?.description ?? "", /bounded verification probe/);
+		// Root validated recon at launch. Between then and the nested dispatch, recon gains `write`.
+		writeAgentFile("recon", { tools: "read,grep,write" });
+		const result = await harness.execute({ agent: "recon", task: "probe" }, context);
+		assert.match(resultText(result), /beyond this run's ceiling/);
+		assert.equal(spawnCount(capture), 0);
+	} finally {
+		if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+		else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+		delete process.env[RUNTIME_ENV_VAR];
+		delete process.env.FAKE_PI_CAPTURE;
 	}
 });
 
@@ -985,8 +1080,17 @@ test("a depth-1 process emits no envelope for its own child", async () => {
 	const argvCapture = path.join(root, "depth-one-argv.jsonl");
 	const previousDepth = process.env.PI_SUBAGENT_DEPTH;
 	const previousRuntime = process.env[RUNTIME_ENV_VAR];
+	const depthOneRuntime = encodeNestedRuntime({
+		version: 1,
+		depth: 1,
+		agent: "depth-one-coordinator",
+		allowedAgents: ["depth-one-coordinator"],
+		toolCeiling: null,
+		modelCeiling: null,
+		budget: { maxSpawns: 4, maxConcurrency: 2 },
+	});
 	process.env.PI_SUBAGENT_DEPTH = "1";
-	process.env[RUNTIME_ENV_VAR] = gateEnvelope;
+	process.env[RUNTIME_ENV_VAR] = depthOneRuntime;
 	process.env.FAKE_PI_ENV_CAPTURE = capture;
 	setFakeMode("normal", argvCapture);
 	try {

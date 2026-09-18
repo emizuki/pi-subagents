@@ -4,37 +4,61 @@ import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionContext, getAgentDir 
 import { describeAgent, findAgent, isRepoControlledAgent, repoControlledSource } from "./agent-select.ts";
 import { type AgentScope, discoverAgents } from "./agents.ts";
 import { modelChoices, modelKey, splitModelKey } from "./models.ts";
-import type { NestedRuntimeV1 } from "./nested-runtime.ts";
+import {
+	intersectModelCeiling,
+	nestedRegistrationAllowed,
+	type NestedRuntimeV1,
+	withinToolCeiling,
+} from "./nested-runtime.ts";
 import { renderSubagentCall, renderSubagentResult } from "./render.ts";
 import { finalizeToolResult, getFinalOutput, getResultOutput, isFailedResult, isRunningResult, type SingleResult, type SubagentDetails, type ToolResultDraft } from "./results.ts";
 import { type DispatchDefaults, mapWithConcurrencyLimit, type OnUpdateCallback, runSingleAgent } from "./run-agent.ts";
 import { type AsyncRun, asyncRuns, describeAsyncRun, newRunId, type RetainedRun, retainedRuns, runsInFlight, truncateForListing } from "./runs.ts";
-import { buildGuidelines, makeSubagentParams } from "./schema.ts";
+import { buildGuidelines, makeNestedSubagentParams, makeSubagentParams } from "./schema.ts";
 import { readSubagentSettings, trustedProjectSettings } from "./settings.ts";
 
 export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, runtime?: NestedRuntimeV1) {
-	// `runtime` is accepted here and consumed in Task 6, which narrows the schema and intersects
-	// the model enum. Registration must gate on it before the schema can depend on it.
-	void runtime;
 	const current = ctx.model ? modelKey(ctx.model) : undefined;
-	const choices = modelChoices(ctx);
-	const discoveryOptions = { projectTrusted: ctx.isProjectTrusted() };
+	const localChoices = modelChoices(ctx);
+	// A coordinator is spawned with --model, never --models, so its own scope is empty and the
+	// local catalogue is the whole thing. The root's scope arrives in the envelope instead.
+	const choices = runtime ? intersectModelCeiling(localChoices, runtime.modelCeiling) : localChoices;
+	// Fail closed on an empty intersection: a coordinator that can select no model has nothing to
+	// delegate with. Returning here leaves the tool unregistered; `contact_supervisor` is already
+	// registered by index.ts's gate before this function is called, so there is nothing to re-register
+	// and no "contact-supervisor-only" helper to write.
+	if (runtime && !nestedRegistrationAllowed({ localChoices, ceiling: runtime.modelCeiling })) return;
+	const discoveryOptions = { projectTrusted: runtime ? false : ctx.isProjectTrusted() };
 	const agents = discoverAgents(ctx.cwd, "user", discoveryOptions).agents;
-	const SubagentParams = makeSubagentParams(choices, current);
+	// Declared wide, registered narrow. Pi validates against what it was handed, so on the nested
+	// path the extra keys are always undefined at runtime — which is precisely what Step 5's
+	// defence-in-depth guard already assumes. Without this pin, the shared execute body that reads
+	// params.action and friends cannot typecheck against the narrowed schema.
+	const SubagentParams = (
+		runtime ? makeNestedSubagentParams(choices, current) : makeSubagentParams(choices, current)
+	) as ReturnType<typeof makeSubagentParams>;
 	const promptGuidelines = buildGuidelines(choices, ctx.model, agents);
 
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
-		description: [
-			"Delegate tasks to specialized subagents with isolated context.",
-			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
-			agents.length > 0
-				? `Available agents: ${agents.map(describeAgent).join(", ")}.`
-				: `No agents found in ${path.join(getAgentDir(), "agents")}.`,
-			`Default agent scope is "user": bundled agents, agents declared by user-installed packages, and ${path.join(getAgentDir(), "agents")}.`,
-			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
-		].join(" "),
+		description: runtime
+			? [
+					"Delegate a bounded verification probe to a leaf subagent.",
+					"Modes: single (agent + task) and parallel (tasks array). Both are synchronous.",
+					`Callable agents: ${runtime.allowedAgents.join(", ")}.`,
+					`Budget: ${runtime.budget.maxSpawns} probes for this whole run, ${runtime.budget.maxConcurrency} at a time.`,
+					"Do not delegate work you can do directly, and do not delegate your own task wholesale.",
+				].join(" ")
+			: [
+					"Delegate tasks to specialized subagents with isolated context.",
+					"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+					agents.length > 0
+						? `Available agents: ${agents.map(describeAgent).join(", ")}.`
+						: `No agents found in ${path.join(getAgentDir(), "agents")}.`,
+					`Default agent scope is "user": bundled agents, agents declared by user-installed packages, and ${path.join(getAgentDir(), "agents")}.`,
+					`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
+				].join(" "),
 		promptGuidelines,
 		parameters: SubagentParams,
 
@@ -49,8 +73,9 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 			const dispatchDefaults: DispatchDefaults = {
 				model: ctx.model ? modelKey(ctx.model) : undefined,
 				thinkingLevel: ctx.thinkingLevel,
-				scopedModels:
-					ctx.scopedModels.length > 0
+				scopedModels: runtime
+					? choices.map((model) => ({ model, thinkingLevel: undefined }))
+					: ctx.scopedModels.length > 0
 						? ctx.scopedModels.map(({ model, thinkingLevel }) => ({ model, thinkingLevel }))
 						: undefined,
 				trustedProjectSettings: ctx.isProjectTrusted() ? trustedProjectSettings(ctx.cwd) : undefined,
@@ -79,10 +104,56 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 						}
 					: undefined,
 			};
-			const discovery = discoverAgents(ctx.cwd, agentScope, {
-				projectTrusted: ctx.isProjectTrusted(),
+			const discovery = discoverAgents(ctx.cwd, runtime ? "user" : agentScope, {
+				projectTrusted: runtime ? false : ctx.isProjectTrusted(),
 			});
 			const agents = discovery.agents;
+
+			if (runtime) {
+				const forbidden = ["chain", "async", "action", "id", "resume", "agentScope", "confirmProjectAgents", "cwd"] as const;
+				const used = forbidden.filter((key) => (params as Record<string, unknown>)[key] !== undefined);
+				if (used.length > 0) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Nested delegation supports single and parallel only; ${used.join(", ")} cannot be used here.`,
+							},
+						],
+						failed: true,
+					};
+				}
+				const unknown = (params.tasks?.map((t) => t.agent) ?? [])
+					.concat(params.agent ? [params.agent] : [])
+					.filter((name) => !runtime.allowedAgents.includes(name));
+				if (unknown.length > 0) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Not callable from here: ${unknown.join(", ")}. Callable: ${runtime.allowedAgents.join(", ")}.`,
+							},
+						],
+						failed: true,
+					};
+				}
+				// The root validated these names against the files that existed then. Re-check what we
+				// actually resolved now: fail closed on both sides, never widen on either. Per task, not
+				// just the first — the parallel path has many, and checking one would let the rest through.
+				const requested = new Set<string>(params.tasks?.map((t) => t.agent) ?? []);
+				if (params.agent) requested.add(params.agent);
+				for (const name of requested) {
+					const resolved = findAgent(agents, name);
+					if (!resolved) continue; // an unknown name is refused by the existing path
+					if (!withinToolCeiling(runtime.toolCeiling ?? undefined, resolved.tools)) {
+						return {
+							content: [{ type: "text", text: `Agent "${resolved.name}" now declares tools beyond this run's ceiling.` }],
+							failed: true,
+						};
+					}
+				}
+			}
+
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
 
 			if (params.action) {
@@ -525,6 +596,21 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 					return {
 						content: [{ type: "text", text: "Canceled: project-local agent resume not approved." }],
 						details: makeDetails("single")([]),
+						failed: true,
+					};
+				}
+			}
+
+			// A coordinator leads its own process group so it can signal its children as a group.
+			// Detaching it as well would leave a two-level tree with no path from the terminal.
+			if (params.async) {
+				const targetAgent = params.agent ? findAgent(agents, params.agent) : undefined;
+				// A resumed run's authority lives on the record, not on any agent file (Task 5).
+				const coordinates = targetAgent?.allowNestedSubagents || (resumeTarget?.allowedAgents?.length ?? 0) > 0;
+				if (coordinates) {
+					const name = targetAgent?.name ?? resumeTarget?.agent ?? "that agent";
+					return {
+						content: [{ type: "text", text: `"${name}" coordinates other agents and must run synchronously. Drop async.` }],
 						failed: true,
 					};
 				}

@@ -159,3 +159,15 @@ export function intersectModelCeiling(choices: ModelLike[], ceiling: string[] | 
 	const permitted = new Set(ceiling.map((key) => key.toLowerCase()));
 	return choices.filter((choice) => permitted.has(modelKey(choice).toLowerCase()));
 }
+
+/**
+ * Whether a coordinator may register `subagent` at all, given what its model ceiling leaves it.
+ *
+ * `null` is unrestricted and always passes. A non-empty ceiling that intersects to nothing must
+ * fail closed: `modelSchema` falls back to a free-form `Type.String` when handed no choices, and
+ * `runSingleAgent`'s execution-time check guards on `scopedModels?.length` — falsy for `[]` — so an
+ * empty intersection would remove both layers at once and read as unrestricted.
+ */
+export function nestedRegistrationAllowed(args: { localChoices: ModelLike[]; ceiling: string[] | null }): boolean {
+	return intersectModelCeiling(args.localChoices, args.ceiling).length > 0;
+}

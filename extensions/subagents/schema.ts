@@ -108,3 +108,37 @@ export function makeSubagentParams(choices: ModelLike[], current: string | undef
 		id: Type.Optional(Type.String({ description: "Run id, for status or stop" })),
 	});
 }
+
+/**
+ * The coordinator's parameter set: synchronous single and parallel, nothing else.
+ *
+ * The modes a coordinator must not use are absent rather than rejected. A model that cannot
+ * express a request needs no error path for it, and removing `cwd` bounds a grandchild to the
+ * coordinator's working directory with no code at all.
+ */
+export function makeNestedSubagentParams(choices: ModelLike[], current: string | undefined) {
+	const model = Type.Optional(modelSchema(choices, current));
+	const thinking = Type.Optional(thinkingSchema(choices));
+	const context = Type.Optional(
+		StringEnum(["fresh", "fork"] as const, {
+			description: 'Child context. "fresh" (default) starts from the task alone; "fork" branches this session\'s transcript.',
+		}),
+	);
+
+	const TaskItem = Type.Object({
+		agent: Type.String({ description: "Name of the agent to invoke" }),
+		task: Type.String({ description: "Task to delegate to the agent" }),
+		model,
+		thinking,
+		context,
+	});
+
+	return Type.Object({
+		agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
+		task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
+		tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} to run in parallel" })),
+		model,
+		thinking,
+		context,
+	});
+}
