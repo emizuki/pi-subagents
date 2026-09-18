@@ -244,7 +244,7 @@ export async function runSingleAgent(
 	const nestingEnabled = currentDepth() === 0 && nestedLimits !== undefined && nestedLimits.maxSpawns > 0;
 	let envelope = "";
 	let contract: { allowedAgents: string[]; toolCeiling: string[] | null; modelCeiling: string[] | null } | undefined;
-	if (nestingEnabled && nestedLimits !== undefined) {
+	if (nestingEnabled) {
 		if (resuming) {
 			// Authority travels with the run, not with the file. An agent file edited between the
 			// launch and the resume must not widen — or narrow — what was already granted.
@@ -546,9 +546,9 @@ export async function runSingleAgent(
 				// Fall back to the stored values on a resume. Without the fallback, resuming while
 				// maxNestedSpawns is 0 leaves `contract` undefined and erases the stored authority for
 				// good — re-enabling nesting afterwards would not bring it back.
-				allowedAgents: contract?.allowedAgents ?? resuming?.allowedAgents,
-				toolCeiling: contract?.toolCeiling ?? resuming?.toolCeiling,
-				modelCeiling: contract?.modelCeiling ?? resuming?.modelCeiling,
+				allowedAgents: contract ? contract.allowedAgents : resuming?.allowedAgents,
+				toolCeiling: contract ? contract.toolCeiling : resuming?.toolCeiling,
+				modelCeiling: contract ? contract.modelCeiling : resuming?.modelCeiling,
 				inheritSkills: agent.inheritSkills,
 				inheritProjectContext: agent.inheritProjectContext,
 				defaultContext: agent.defaultContext,

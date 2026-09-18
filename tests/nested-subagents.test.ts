@@ -45,7 +45,7 @@ type TestContext = {
 		cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
 	};
 	thinkingLevel: string;
-	scopedModels: [];
+	scopedModels: Array<{ model: TestContext["model"]; thinkingLevel?: string }>;
 	modelRegistry: {
 		getAvailable: () => TestContext["model"][];
 		find: () => TestContext["model"];
@@ -124,7 +124,7 @@ const originalIpc = process.env.PI_SUBAGENT_IPC_DIR;
 const originalOwner = process.env[OWNER_PID_ENV_VAR];
 const originalAgent = process.env.PI_SUBAGENT_AGENT;
 
-function makeContext(cwd = root): ExtensionContext {
+function makeContext(cwd = root, scoped = false): ExtensionContext {
 	const model = {
 		provider: "test-provider",
 		id: "cheap",
@@ -136,7 +136,7 @@ function makeContext(cwd = root): ExtensionContext {
 		cwd,
 		model,
 		thinkingLevel: "low",
-		scopedModels: [],
+		scopedModels: scoped ? [{ model, thinkingLevel: "low" }] : [],
 		modelRegistry: {
 			getAvailable: () => [model],
 			find: () => model,
@@ -916,7 +916,8 @@ test("coordinator authority resolves against the user scope, not project shadows
 
 test("a resumed coordinator keeps its original allowlist after its agent file changes", async () => {
 	writeCoordinatorFixtures();
-	const first = await runSubagent({ agent: "reviewer", task: "review" });
+	const coordinatorContext = makeContext(root, true);
+	const first = await runSubagent({ agent: "reviewer", task: "review" }, coordinatorContext);
 	const runId = runIdOf(first);
 	writeAgentFile("reviewer", { allowNestedSubagents: true, allowedSubagents: "general-purpose", tools: "read" });
 	const capture = path.join(tempRoot(), "env.jsonl");
@@ -924,10 +925,12 @@ test("a resumed coordinator keeps its original allowlist after its agent file ch
 	process.env.FAKE_PI_ENV_CAPTURE = capture;
 	setFakeMode("normal", argvCapture);
 	try {
-		await runSubagent({ resume: runId, task: "carry on" });
+		await runSubagent({ resume: runId, task: "carry on" }, coordinatorContext);
 		const seen = JSON.parse(readFileSync(capture, "utf8").trim().split("\n")[0]) as { runtime: string };
 		const runtime = parseNestedRuntime(seen.runtime);
 		assert.deepEqual(runtime?.allowedAgents, ["recon"], "authority comes from the stored contract, not the file");
+		assert.deepEqual(runtime?.toolCeiling, ["read", "grep", "find", "ls", "bash"]);
+		assert.deepEqual(runtime?.modelCeiling, ["test-provider/cheap"]);
 	} finally {
 		delete process.env.FAKE_PI_ENV_CAPTURE;
 	}
