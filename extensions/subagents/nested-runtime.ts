@@ -8,7 +8,10 @@
  * on corruption, and that depth 2 never consults it at all.
  */
 
+import { MAX_NESTED_CONCURRENCY, MAX_NESTED_SPAWNS, parseBoundedInt } from "./settings.ts";
+
 export const RUNTIME_ENV_VAR = "PI_SUBAGENT_RUNTIME_V1";
+/** Task 4 uses this variable for the parent-process ownership guard. */
 export const OWNER_PID_ENV_VAR = "PI_SUBAGENT_OWNER_PID";
 
 export interface NestedRuntimeV1 {
@@ -31,10 +34,6 @@ function isStringArray(value: unknown): value is string[] {
 
 function isNullableStringArray(value: unknown): value is string[] | null {
 	return value === null || isStringArray(value);
-}
-
-function isBoundedInt(value: unknown, min: number, max: number): value is number {
-	return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
 }
 
 export function encodeNestedRuntime(runtime: NestedRuntimeV1): string {
@@ -63,7 +62,9 @@ export function parseNestedRuntime(raw: string | undefined): NestedRuntimeV1 | u
 	const budget = candidate.budget;
 	if (typeof budget !== "object" || budget === null || Array.isArray(budget)) return undefined;
 	const { maxSpawns, maxConcurrency } = budget as Record<string, unknown>;
-	if (!isBoundedInt(maxSpawns, 0, 16) || !isBoundedInt(maxConcurrency, 1, 8)) return undefined;
+	const parsedMaxSpawns = parseBoundedInt(maxSpawns, 0, MAX_NESTED_SPAWNS);
+	const parsedMaxConcurrency = parseBoundedInt(maxConcurrency, 1, MAX_NESTED_CONCURRENCY);
+	if (parsedMaxSpawns === undefined || parsedMaxConcurrency === undefined) return undefined;
 	return {
 		version: 1,
 		depth: 1,
@@ -71,7 +72,7 @@ export function parseNestedRuntime(raw: string | undefined): NestedRuntimeV1 | u
 		allowedAgents: candidate.allowedAgents,
 		toolCeiling: candidate.toolCeiling,
 		modelCeiling: candidate.modelCeiling,
-		budget: { maxSpawns, maxConcurrency },
+		budget: { maxSpawns: parsedMaxSpawns, maxConcurrency: parsedMaxConcurrency },
 	};
 }
 

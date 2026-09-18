@@ -8,11 +8,14 @@ import {
 	encodeNestedRuntime,
 	type NestedRuntimeV1,
 	parseNestedRuntime,
+	OWNER_PID_ENV_VAR,
 	RUNTIME_ENV_VAR,
 } from "../extensions/subagents/nested-runtime.ts";
 import {
 	DEFAULT_MAX_NESTED_CONCURRENCY,
 	DEFAULT_MAX_NESTED_SPAWNS,
+	MAX_NESTED_CONCURRENCY,
+	MAX_NESTED_SPAWNS,
 	parseBoundedInt,
 	readSubagentSettings,
 } from "../extensions/subagents/settings.ts";
@@ -132,6 +135,8 @@ test("envelope round-trips and rejects every malformed shape", () => {
 		["allowedAgents holds a non-string", { ...runtime, allowedAgents: ["recon", 7] }],
 		["allowedAgents holds an empty string", { ...runtime, allowedAgents: [""] }],
 		["toolCeiling neither array nor null", { ...runtime, toolCeiling: "read" }],
+		["modelCeiling neither array nor null", { ...runtime, modelCeiling: "gpt-5" }],
+		["modelCeiling holds a non-string", { ...runtime, modelCeiling: [7] }],
 		["budget missing", { ...runtime, budget: undefined }],
 		["maxSpawns out of range", { ...runtime, budget: { maxSpawns: 99, maxConcurrency: 2 } }],
 		["maxConcurrency zero", { ...runtime, budget: { maxSpawns: 4, maxConcurrency: 0 } }],
@@ -163,6 +168,80 @@ test("an empty allowedAgents array parses but grants nothing", () => {
 	assert.deepEqual(parseNestedRuntime(encodeNestedRuntime(runtime))?.allowedAgents, []);
 });
 
+test("nested runtime and settings share budget bounds", () => {
+	const root = tempRoot();
+	const agentDir = path.join(root, "agent-home");
+	mkdirSync(agentDir, { recursive: true });
+	const previous = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	const runtime: NestedRuntimeV1 = {
+		version: 1,
+		depth: 1,
+		agent: "reviewer",
+		allowedAgents: ["recon"],
+		toolCeiling: null,
+		modelCeiling: null,
+		budget: { maxSpawns: MAX_NESTED_SPAWNS, maxConcurrency: MAX_NESTED_CONCURRENCY },
+	};
+	try {
+		assert.deepEqual(parseNestedRuntime(encodeNestedRuntime(runtime))?.budget, runtime.budget);
+		assert.equal(
+			parseNestedRuntime(
+				encodeNestedRuntime({
+					...runtime,
+					budget: { maxSpawns: MAX_NESTED_SPAWNS + 1, maxConcurrency: MAX_NESTED_CONCURRENCY },
+				}),
+			),
+			undefined,
+			"runtime rejects a spawn count above the settings bound",
+		);
+		assert.equal(
+			parseNestedRuntime(
+				encodeNestedRuntime({
+					...runtime,
+					budget: { maxSpawns: MAX_NESTED_SPAWNS, maxConcurrency: MAX_NESTED_CONCURRENCY + 1 },
+				}),
+			),
+			undefined,
+			"runtime rejects concurrency above the settings bound",
+		);
+
+		const settingsFile = path.join(agentDir, "settings.json");
+		writeFileSync(
+			settingsFile,
+			JSON.stringify({
+				subagents: { maxNestedSpawns: MAX_NESTED_SPAWNS, maxNestedConcurrency: MAX_NESTED_CONCURRENCY },
+			}),
+		);
+		const atLimits = readSubagentSettings(root, undefined);
+		assert.equal(atLimits.maxNestedSpawns, MAX_NESTED_SPAWNS);
+		assert.equal(atLimits.maxNestedConcurrency, MAX_NESTED_CONCURRENCY);
+
+		writeFileSync(
+			settingsFile,
+			JSON.stringify({
+				subagents: { maxNestedSpawns: MAX_NESTED_SPAWNS + 1, maxNestedConcurrency: MAX_NESTED_CONCURRENCY },
+			}),
+		);
+		const aboveSpawns = readSubagentSettings(root, undefined);
+		assert.equal(aboveSpawns.maxNestedSpawns, DEFAULT_MAX_NESTED_SPAWNS);
+		assert.equal(aboveSpawns.maxNestedConcurrency, MAX_NESTED_CONCURRENCY);
+
+		writeFileSync(
+			settingsFile,
+			JSON.stringify({
+				subagents: { maxNestedSpawns: MAX_NESTED_SPAWNS, maxNestedConcurrency: MAX_NESTED_CONCURRENCY + 1 },
+			}),
+		);
+		const aboveConcurrency = readSubagentSettings(root, undefined);
+		assert.equal(aboveConcurrency.maxNestedSpawns, MAX_NESTED_SPAWNS);
+		assert.equal(aboveConcurrency.maxNestedConcurrency, DEFAULT_MAX_NESTED_CONCURRENCY);
+	} finally {
+		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previous;
+	}
+});
+
 type GateHandler = (...args: unknown[]) => unknown;
 type Extension = Parameters<typeof extension>[0];
 
@@ -188,8 +267,8 @@ function registerAt(depth: string | undefined, envelope: string | undefined): Se
 	// Task 8 makes extension(pi) start an owner guard that can call process.exit(0). An inherited
 	// PI_SUBAGENT_OWNER_PID naming a dead process would end this test run at exit code 0, which
 	// reads as a pass. Delete it here and restore it in the finally alongside the other two.
-	const previousOwner = process.env.PI_SUBAGENT_OWNER_PID;
-	delete process.env.PI_SUBAGENT_OWNER_PID;
+	const previousOwner = process.env[OWNER_PID_ENV_VAR];
+	delete process.env[OWNER_PID_ENV_VAR];
 	// registerSubagentTool calls discoverAgents, whose user directory is getAgentDir()/agents.
 	// Without this redirect the test reads the developer's real agent directory and its outcome
 	// depends on whatever they happen to have installed.
@@ -211,8 +290,8 @@ function registerAt(depth: string | undefined, envelope: string | undefined): Se
 		else process.env[RUNTIME_ENV_VAR] = previousRuntime;
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-		if (previousOwner === undefined) delete process.env.PI_SUBAGENT_OWNER_PID;
-		else process.env.PI_SUBAGENT_OWNER_PID = previousOwner;
+		if (previousOwner === undefined) delete process.env[OWNER_PID_ENV_VAR];
+		else process.env[OWNER_PID_ENV_VAR] = previousOwner;
 	}
 	return names;
 }

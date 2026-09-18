@@ -8,6 +8,8 @@ export const DEFAULT_MAX_PARALLEL_TASKS = 8;
 export const DEFAULT_MAX_CONCURRENCY = 4;
 export const DEFAULT_MAX_NESTED_SPAWNS = 4;
 export const DEFAULT_MAX_NESTED_CONCURRENCY = 2;
+export const MAX_NESTED_SPAWNS = 16;
+export const MAX_NESTED_CONCURRENCY = 8;
 
 export type ForkContext = "fresh" | "fork";
 
@@ -135,14 +137,14 @@ export function readSubagentSettings(
 			userRaw?.maxNestedSpawns,
 			projectRaw?.maxNestedSpawns,
 			DEFAULT_MAX_NESTED_SPAWNS,
-			(value) => parseBoundedInt(value, 0, 16),
+			(value) => parseBoundedInt(value, 0, MAX_NESTED_SPAWNS),
 			(limit) => limit,
 		),
 		maxNestedConcurrency: resolveLowerableLimit(
 			userRaw?.maxNestedConcurrency,
 			projectRaw?.maxNestedConcurrency,
 			DEFAULT_MAX_NESTED_CONCURRENCY,
-			(value) => parseBoundedInt(value, 1, 8),
+			(value) => parseBoundedInt(value, 1, MAX_NESTED_CONCURRENCY),
 			(limit) => limit,
 		),
 	};
