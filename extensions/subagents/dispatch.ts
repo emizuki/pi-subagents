@@ -170,9 +170,9 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 				// The root validated these names against the files that existed then. Re-check what we
 				// actually resolved now: fail closed on both sides, never widen on either. Per task, not
 				// just the first — the parallel path has many, and checking one would let the rest through.
-				const requested = new Set<string>(params.tasks?.map((t) => t.agent) ?? []);
-				if (params.agent) requested.add(params.agent);
-				for (const name of requested) {
+				const requestedAgentNamesForCeiling = new Set<string>(params.tasks?.map((t) => t.agent) ?? []);
+				if (params.agent) requestedAgentNamesForCeiling.add(params.agent);
+				for (const name of requestedAgentNamesForCeiling) {
 					const resolved = findAgent(agents, name);
 					if (!resolved) continue; // an unknown name is refused by the existing path
 					if (!withinToolCeiling(runtime.toolCeiling ?? undefined, resolved.tools)) {
@@ -363,7 +363,7 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 				}
 			}
 
-			const requested = params.tasks?.length ?? 1;
+			const requested = hasTasks ? params.tasks!.length : 1;
 			if (runtime) {
 				const remaining = runtime.budget.maxSpawns - nestedSpawnsUsed;
 				if (requested > remaining) {

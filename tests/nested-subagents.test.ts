@@ -945,6 +945,68 @@ test("nested registration wires the model ceiling into the registered schema", a
 	}
 });
 
+test("an empty tasks array still consumes one nested spawn budget claim", async () => {
+	const runtime = envelopeWith({ maxSpawns: 1, maxConcurrency: 1 });
+	const capture = path.join(root, "nested-empty-tasks-budget-capture.jsonl");
+	setFakeMode("normal", capture);
+	try {
+		const results: unknown[] = [];
+		for (let i = 0; i < 4; i++) {
+			results.push(await executeNested({ agent: "recon", task: `empty-${i}`, tasks: [] }, runtime));
+		}
+		assert.deepEqual(
+			{
+				statuses: results.map((result) => (/budget/i.test(resultText(result)) ? "budget" : "ok")),
+				spawns: spawnCount(capture),
+			},
+			{ statuses: ["ok", "budget", "budget", "budget"], spawns: 1 },
+		);
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
+test("parallel claims consume the task count across calls and shapes", async () => {
+	const runtime = envelopeWith({ maxSpawns: 3, maxConcurrency: 2 });
+	const capture = path.join(root, "nested-cumulative-budget-capture.jsonl");
+	setFakeMode("normal", capture);
+	try {
+		const first = await executeNested(
+			{
+				tasks: [
+					{ agent: "recon", task: "parallel-a" },
+					{ agent: "recon", task: "parallel-b" },
+				],
+			},
+			runtime,
+		);
+		assert.match(resultText(first), /Parallel: 2\/2 succeeded/);
+
+		const refused = await executeNested(
+			{
+				tasks: [
+					{ agent: "recon", task: "parallel-c" },
+					{ agent: "recon", task: "parallel-d" },
+				],
+			},
+			runtime,
+		);
+		assert.match(resultText(refused), /budget/i);
+
+		const emptyArraySingle = await executeNested(
+			{ agent: "recon", task: "empty-array-single", tasks: [] },
+			runtime,
+		);
+		assert.match(resultText(emptyArraySingle), /ok/);
+
+		const exhausted = await executeNested({ agent: "recon", task: "after-budget" }, runtime);
+		assert.match(resultText(exhausted), /budget/i);
+		assert.equal(spawnCount(capture), 3);
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
 test("the counter stops a coordinator after maxSpawns", async () => {
 	const runtime = envelopeWith({ maxSpawns: 2, maxConcurrency: 2 });
 	const capture = path.join(root, "nested-budget-capture.jsonl");
