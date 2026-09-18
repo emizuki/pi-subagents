@@ -217,6 +217,14 @@ function spawnCount(file: string): number {
 	return existsSync(file) ? capturedArgs(file).length : 0;
 }
 
+async function waitForSpawnCount(file: string, expected: number): Promise<void> {
+	for (let attempt = 0; attempt < 100; attempt++) {
+		if (spawnCount(file) >= expected) return;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	assert.equal(spawnCount(file), expected, `expected ${expected} child spawn(s) in ${file}`);
+}
+
 function capturedEnvironment(file: string): CapturedEnvironment[] {
 	return readFileSync(file, "utf8")
 		.trim()
@@ -1008,23 +1016,74 @@ test("nested model validation leaves an unscoped root's model behavior unchanged
 	}
 });
 
+test("nested model ceilings reject a leaf frontmatter model outside the root scope", async () => {
+	writeAgentFile("recon", { model: "test-provider/dear", tools: "read" });
+	const coordinatorContext = makeContext();
+	const contextValue = coordinatorContext as unknown as TestContext;
+	const dear = {
+		...contextValue.model,
+		id: "dear",
+		name: "Dear",
+		cost: { input: 9, output: 9, cacheRead: 0, cacheWrite: 0 },
+	};
+	contextValue.modelRegistry = {
+		getAvailable: () => [contextValue.model],
+		find: (provider, id) =>
+			provider === "test-provider" && id === "dear" ? dear : provider === "test-provider" && id === "cheap" ? contextValue.model : undefined,
+	};
+	const runtime = encodeNestedRuntime({
+		version: 1,
+		depth: 1,
+		agent: "reviewer",
+		allowedAgents: ["recon"],
+		toolCeiling: null,
+		modelCeiling: ["test-provider/cheap"],
+		budget: { maxSpawns: 4, maxConcurrency: 2 },
+	});
+	const capture = path.join(root, "nested-scoped-frontmatter-model-capture.jsonl");
+	const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+	const previousRuntime = process.env[RUNTIME_ENV_VAR];
+	process.env.PI_SUBAGENT_DEPTH = "1";
+	process.env[RUNTIME_ENV_VAR] = runtime;
+	setFakeMode("normal", capture);
+	try {
+		await harness.refresh(coordinatorContext);
+		const result = await harness.execute({ agent: "recon", task: "probe" }, coordinatorContext);
+		assert.match(resultText(result), /outside the configured model scope/);
+		assert.equal(spawnCount(capture), 0);
+	} finally {
+		if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+		else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+		if (previousRuntime === undefined) delete process.env[RUNTIME_ENV_VAR];
+		else process.env[RUNTIME_ENV_VAR] = previousRuntime;
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
 test("async detaches only agents with a live nested envelope", async () => {
 	writeCoordinatorFixtures();
 	const capture = path.join(root, "async-without-envelope-capture.jsonl");
 	setFakeMode("normal", capture);
 	writeUserSettings({ maxNestedSpawns: 0 });
 	try {
-		const disabled = await runSubagent({ agent: "reviewer", task: "review", async: true });
+		const disabled = await runSubagent({ agent: "reviewer", task: "review-disabled", async: true });
 		assert.match(resultText(disabled), /Started .*detached/);
+		await waitForSpawnCount(capture, 1);
 	} finally {
 		clearUserSettings();
 	}
 
 	writeAgentFile("lonely", { allowNestedSubagents: true, allowedSubagents: "nobody", tools: "read" });
 	try {
-		const empty = await runSubagent({ agent: "lonely", task: "review", async: true });
+		const empty = await runSubagent({ agent: "lonely", task: "review-empty", async: true });
 		assert.match(resultText(empty), /Started .*detached/);
+		await waitForSpawnCount(capture, 2);
 	} finally {
+		assert.equal(spawnCount(capture), 2);
+		assert.deepEqual(
+			capturedArgs(capture).map((args) => args[args.length - 1]).sort(),
+			["Task: review-disabled", "Task: review-empty"],
+		);
 		delete process.env.FAKE_PI_CAPTURE;
 	}
 });
@@ -1053,7 +1112,9 @@ test("a coordinator does not inherit trusted project subagent defaults", async (
 		await harness.refresh(coordinatorContext);
 		const result = await harness.execute({ agent: "recon", task: "probe" }, coordinatorContext);
 		assert.match(resultText(result), /ok/);
-		const args = capturedArgs(capture)[0];
+		const matches = capturedArgs(capture).filter((args) => args[args.length - 1] === "Task: probe");
+		assert.equal(matches.length, 1, "the test must inspect its own child capture entry");
+		const args = matches[0];
 		assert.equal(optionValue(args, "--fork"), undefined);
 		assert.equal(optionValue(args, "--thinking"), "low");
 	} finally {
