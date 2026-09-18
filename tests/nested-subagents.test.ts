@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { after, test } from "node:test";
+import { after, before, test } from "node:test";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import extension from "../extensions/subagents/index.ts";
 import type { AgentConfig } from "../extensions/subagents/agents.ts";
+import { writeFakePi } from "./fake-pi.ts";
 import {
 	encodeNestedRuntime,
 	intersectModelCeiling,
@@ -30,7 +32,241 @@ function tempRoot(): string {
 	roots.push(root);
 	return root;
 }
-after(() => {
+
+type TestHandler = (event: unknown, ctx: unknown) => unknown | Promise<unknown>;
+type TestContext = {
+	cwd: string;
+	model: {
+		provider: string;
+		id: string;
+		name: string;
+		reasoning: boolean;
+		cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+	};
+	thinkingLevel: string;
+	scopedModels: [];
+	modelRegistry: {
+		getAvailable: () => TestContext["model"][];
+		find: () => TestContext["model"];
+	};
+	sessionManager: { getSessionFile: () => undefined };
+	hasUI: boolean;
+	isProjectTrusted: () => boolean;
+	ui: {
+		notify: () => void;
+		input: () => Promise<undefined>;
+		confirm: () => Promise<boolean>;
+	};
+};
+
+type CapturedEnvironment = {
+	depth: string | null;
+	runtime: string | null;
+	ipc: string | null;
+	owner: string | null;
+	agent: string | null;
+	pid: number;
+	pgrp: number | null;
+};
+
+class NestedHarness {
+	readonly handlers = new Map<string, TestHandler[]>();
+	readonly tools = new Map<string, unknown>();
+
+	constructor() {
+		const pi = {
+			registerTool: (definition: { name: string }) => this.tools.set(definition.name, definition),
+			unregisterTool: (name: string) => this.tools.delete(name),
+			on: (event: string, handler: TestHandler) => {
+				const handlers = this.handlers.get(event) ?? [];
+				handlers.push(handler);
+				this.handlers.set(event, handlers);
+			},
+		};
+		extension(pi as unknown as ExtensionAPI);
+	}
+
+	async register(ctx: ExtensionContext): Promise<void> {
+		for (const handler of this.handlers.get("session_start") ?? []) await handler({}, ctx);
+	}
+
+	async refresh(ctx: ExtensionContext): Promise<void> {
+		for (const handler of this.handlers.get("model_select") ?? []) await handler({}, ctx);
+	}
+
+	async execute(params: Record<string, unknown>, ctx: ExtensionContext): Promise<unknown> {
+		const definition = this.tools.get("subagent");
+		assert.ok(definition && typeof definition === "object", "subagent tool should be registered");
+		const execute = (definition as { execute?: unknown }).execute;
+		assert.equal(typeof execute, "function", "subagent tool should be executable");
+		return (execute as (
+			toolCallId: string,
+			params: Record<string, unknown>,
+			signal: AbortSignal,
+			onUpdate: undefined,
+			ctx: ExtensionContext,
+		) => Promise<unknown>)("test-call", params, new AbortController().signal, undefined, ctx);
+	}
+}
+
+let root: string;
+let agentDir: string;
+let binDir: string;
+let harness: NestedHarness;
+let context: ExtensionContext;
+const originalArgv1 = process.argv[1];
+const originalPath = process.env.PATH;
+const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+const originalDepth = process.env.PI_SUBAGENT_DEPTH;
+const originalRuntime = process.env[RUNTIME_ENV_VAR];
+const originalIpc = process.env.PI_SUBAGENT_IPC_DIR;
+const originalOwner = process.env[OWNER_PID_ENV_VAR];
+const originalAgent = process.env.PI_SUBAGENT_AGENT;
+
+function makeContext(): ExtensionContext {
+	const model = {
+		provider: "test-provider",
+		id: "cheap",
+		name: "Cheap",
+		reasoning: true,
+		cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+	};
+	const value: TestContext = {
+		cwd: root,
+		model,
+		thinkingLevel: "low",
+		scopedModels: [],
+		modelRegistry: {
+			getAvailable: () => [model],
+			find: () => model,
+		},
+		sessionManager: { getSessionFile: () => undefined },
+		hasUI: false,
+		isProjectTrusted: () => false,
+		ui: { notify: () => {}, input: async () => undefined, confirm: async () => true },
+	};
+	return value as unknown as ExtensionContext;
+}
+
+function writeAgentFile(
+	name: string,
+	options: { allowNestedSubagents?: boolean; allowedSubagents?: string; tools?: string } = {},
+): string {
+	const fields = [
+		`name: ${name}`,
+		`description: ${name} test agent`,
+		options.tools === undefined ? undefined : `tools: ${options.tools}`,
+		options.allowNestedSubagents ? "allowNestedSubagents: true" : undefined,
+		options.allowedSubagents === undefined ? undefined : `allowedSubagents: ${options.allowedSubagents}`,
+	].filter((field): field is string => field !== undefined);
+	const target = path.join(agentDir, "agents", `${name}.md`);
+	mkdirSync(path.dirname(target), { recursive: true });
+	writeFileSync(target, `---\n${fields.join("\n")}\n---\nYou are a test agent.\n`);
+	return target;
+}
+
+function writeCoordinatorFixtures(): void {
+	writeAgentFile("reviewer", {
+		allowNestedSubagents: true,
+		allowedSubagents: "recon",
+		tools: "read,grep,find,ls,bash",
+	});
+	writeAgentFile("recon", { tools: "read,grep,find,ls,bash" });
+}
+
+function writeUserSettings(subagents: Record<string, unknown>): void {
+	writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ subagents }));
+}
+
+function clearUserSettings(): void {
+	rmSync(path.join(agentDir, "settings.json"), { force: true });
+}
+
+function setFakeMode(mode: string, captureFile: string): void {
+	process.env.FAKE_PI_MODE = mode;
+	process.env.FAKE_PI_CAPTURE = captureFile;
+	process.env.FAKE_PI_TEXT = "ok";
+}
+
+function capturedArgs(file: string): string[][] {
+	return readFileSync(file, "utf8")
+		.trim()
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line) as string[]);
+}
+
+function capturedEnvironment(file: string): CapturedEnvironment[] {
+	return readFileSync(file, "utf8")
+		.trim()
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line) as CapturedEnvironment);
+}
+
+function optionValue(args: string[], option: string): string | undefined {
+	const index = args.indexOf(option);
+	return index === -1 ? undefined : args[index + 1];
+}
+
+function resultStderr(result: unknown): string {
+	if (typeof result !== "object" || result === null) return "";
+	const details = (result as { details?: unknown }).details;
+	if (typeof details !== "object" || details === null) return "";
+	const results = (details as { results?: unknown }).results;
+	if (!Array.isArray(results) || results.length === 0) return "";
+	const stderr = (results[0] as { stderr?: unknown }).stderr;
+	return typeof stderr === "string" ? stderr : "";
+}
+
+async function runSubagent(params: Record<string, unknown>): Promise<unknown> {
+	await harness.refresh(context);
+	return harness.execute(params, context);
+}
+
+before(async () => {
+	root = tempRoot();
+	agentDir = path.join(root, "agent-home");
+	binDir = path.join(root, "bin");
+	mkdirSync(path.join(agentDir, "agents"), { recursive: true });
+	mkdirSync(binDir, { recursive: true });
+	writeAgentFile("general-purpose");
+	writeFakePi(binDir);
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	process.env.PATH = `${binDir}:${originalPath ?? ""}`;
+	process.argv[1] = "/$bunfs/root/pi";
+	delete process.env.PI_SUBAGENT_DEPTH;
+	delete process.env[RUNTIME_ENV_VAR];
+	delete process.env.PI_SUBAGENT_IPC_DIR;
+	delete process.env[OWNER_PID_ENV_VAR];
+	delete process.env.PI_SUBAGENT_AGENT;
+	harness = new NestedHarness();
+	context = makeContext();
+	await harness.register(context);
+});
+
+after(async () => {
+	process.argv[1] = originalArgv1;
+	process.env.PATH = originalPath;
+	if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+	else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+	for (const [key, value] of [
+		["PI_SUBAGENT_DEPTH", originalDepth],
+		[RUNTIME_ENV_VAR, originalRuntime],
+		["PI_SUBAGENT_IPC_DIR", originalIpc],
+		[OWNER_PID_ENV_VAR, originalOwner],
+		["PI_SUBAGENT_AGENT", originalAgent],
+	] as const) {
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
+	for (const key of [
+		"FAKE_PI_MODE",
+		"FAKE_PI_CAPTURE",
+		"FAKE_PI_TEXT",
+		"FAKE_PI_ENV_CAPTURE",
+	])
+		delete process.env[key];
 	for (const root of roots) rmSync(root, { recursive: true, force: true });
 });
 
@@ -501,4 +737,109 @@ test("model ceiling intersects, preserves order, and distinguishes null from emp
 	assert.deepEqual(intersectModelCeiling(choices, []), []);
 	// A ceiling naming something absent locally yields nothing rather than falling back.
 	assert.deepEqual(intersectModelCeiling(choices, ["p/absent"]), []);
+});
+
+test("an ordinary depth-1 child gets no envelope and no owner pid", async () => {
+	const capture = path.join(root, "ordinary-env.jsonl");
+	const argvCapture = path.join(root, "ordinary-argv.jsonl");
+	const previousRuntime = process.env[RUNTIME_ENV_VAR];
+	process.env[RUNTIME_ENV_VAR] = "ambient-stale-envelope";
+	process.env.FAKE_PI_ENV_CAPTURE = capture;
+	setFakeMode("normal", argvCapture);
+	try {
+		await runSubagent({ agent: "general-purpose", task: "anything" });
+		const seen = capturedEnvironment(capture)[0];
+		assert.equal(seen.depth, "1");
+		assert.equal(seen.runtime, "", "the envelope must be explicitly cleared, not merely absent");
+		assert.equal(seen.owner, null, "an ordinary child is not owned and survives a root crash today");
+		assert.equal(seen.agent, "general-purpose");
+		const args = capturedArgs(argvCapture)[0];
+		assert.equal(optionValue(args, "--tools"), undefined);
+		assert.equal(optionValue(args, "--model"), "test-provider/cheap");
+		assert.equal(optionValue(args, "--thinking"), "low");
+	} finally {
+		delete process.env.FAKE_PI_ENV_CAPTURE;
+		if (previousRuntime === undefined) delete process.env[RUNTIME_ENV_VAR];
+		else process.env[RUNTIME_ENV_VAR] = previousRuntime;
+	}
+});
+
+test("a coordinator receives an envelope naming exactly its resolved delegates", async () => {
+	writeCoordinatorFixtures();
+	const capture = path.join(root, "coordinator-env.jsonl");
+	const argvCapture = path.join(root, "coordinator-argv.jsonl");
+	process.env.FAKE_PI_ENV_CAPTURE = capture;
+	setFakeMode("normal", argvCapture);
+	try {
+		await runSubagent({ agent: "reviewer", task: "review this" });
+		const seen = capturedEnvironment(capture)[0];
+		assert.equal(seen.depth, "1");
+		const runtime = parseNestedRuntime(seen.runtime || undefined);
+		assert.ok(runtime, "the coordinator must receive a well-formed envelope");
+		assert.equal(runtime.agent, "reviewer");
+		assert.deepEqual(runtime.allowedAgents, ["recon"]);
+		assert.equal(seen.owner, String(process.pid), "a coordinator is owned by the root");
+		const args = capturedArgs(argvCapture)[0];
+		assert.ok(args.includes("--tools"), "a coordinator must receive an explicit tool allowlist");
+		assert.ok(optionValue(args, "--tools")?.split(",").includes("subagent"));
+	} finally {
+		delete process.env.FAKE_PI_ENV_CAPTURE;
+	}
+});
+
+test("maxNestedSpawns: 0 emits no envelope at all", async () => {
+	writeCoordinatorFixtures();
+	writeUserSettings({ maxNestedSpawns: 0 });
+	const capture = path.join(root, "kill-switch-env.jsonl");
+	const argvCapture = path.join(root, "kill-switch-argv.jsonl");
+	process.env.FAKE_PI_ENV_CAPTURE = capture;
+	setFakeMode("normal", argvCapture);
+	try {
+		await runSubagent({ agent: "reviewer", task: "review this" });
+		const seen = capturedEnvironment(capture)[0];
+		assert.equal(seen.runtime, "");
+		assert.equal(seen.owner, null, "with nesting off there is no coordinator subtree to own");
+	} finally {
+		clearUserSettings();
+		delete process.env.FAKE_PI_ENV_CAPTURE;
+	}
+});
+
+test("a coordinator whose allowlist resolves empty launches as an ordinary child", async () => {
+	writeAgentFile("lonely", { allowNestedSubagents: true, allowedSubagents: "nobody", tools: "read" });
+	const capture = path.join(root, "empty-allowlist-env.jsonl");
+	const argvCapture = path.join(root, "empty-allowlist-argv.jsonl");
+	process.env.FAKE_PI_ENV_CAPTURE = capture;
+	setFakeMode("normal", argvCapture);
+	try {
+		const result = await runSubagent({ agent: "lonely", task: "go" });
+		const seen = capturedEnvironment(capture)[0];
+		assert.equal(seen.runtime, "", "nothing survived resolution, so nothing is granted");
+		assert.match(resultStderr(result), /nobody/, "the drop must be reported, not swallowed");
+		assert.equal(capturedEnvironment(capture).length, 1, "no second process may start");
+	} finally {
+		delete process.env.FAKE_PI_ENV_CAPTURE;
+	}
+});
+
+test("a grandchild's environment carries no authority at all", async () => {
+	writeCoordinatorFixtures();
+	const capture = path.join(root, "grandchild-env.jsonl");
+	const argvCapture = path.join(root, "grandchild-argv.jsonl");
+	process.env.FAKE_PI_ENV_CAPTURE = capture;
+	setFakeMode("delegate", argvCapture);
+	try {
+		await runSubagent({ agent: "reviewer", task: "verify" });
+		const lines = capturedEnvironment(capture);
+		const coordinator = lines.find((line) => line.agent === "reviewer");
+		const grandchild = lines.find((line) => line.agent === "recon");
+		assert.ok(coordinator && grandchild, "both levels must have launched");
+		assert.equal(grandchild.depth, "2");
+		assert.equal(grandchild.runtime, "", "an inherited envelope is how depth 2 would become depth 3");
+		assert.equal(grandchild.ipc, "", "a grandchild has no channel to the operator");
+		assert.notEqual(grandchild.owner, null);
+		assert.notEqual(grandchild.owner, String(process.pid), "owned by its coordinator, not by the root");
+	} finally {
+		delete process.env.FAKE_PI_ENV_CAPTURE;
+	}
 });

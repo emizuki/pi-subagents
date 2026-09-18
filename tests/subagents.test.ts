@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
@@ -12,6 +12,7 @@ import {
 import { Type } from "typebox";
 import extension from "../extensions/subagents/index.ts";
 import { discoverAgents } from "../extensions/subagents/agents.ts";
+import { writeFakePi } from "./fake-pi.ts";
 
 const model = {
 	provider: "test-provider",
@@ -103,6 +104,7 @@ const originalArgv1 = process.argv[1];
 const originalPath = process.env.PATH;
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 const originalSubagentDepth = process.env.PI_SUBAGENT_DEPTH;
+const originalSubagentOwner = process.env.PI_SUBAGENT_OWNER_PID;
 const originalSubagentIpc = process.env.PI_SUBAGENT_IPC_DIR;
 const originalSubagentAgent = process.env.PI_SUBAGENT_AGENT;
 
@@ -246,57 +248,12 @@ before(async () => {
 	writeAgent(path.join(agentDir, "agents"), "general-purpose.md", { name: "general-purpose" });
 	writeAgent(path.join(agentDir, "agents"), "no-tools.md", { name: "no-tools", tools: "[]" });
 
-	const fakePi = path.join(binDir, "pi");
-	writeFileSync(
-		fakePi,
-		`#!/usr/bin/env node
-import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
-import path from "node:path";
-const args = process.argv.slice(2);
-if (process.env.FAKE_PI_CAPTURE) appendFileSync(process.env.FAKE_PI_CAPTURE, JSON.stringify(args) + "\\n");
-if (process.env.FAKE_PI_CWD_CAPTURE) appendFileSync(process.env.FAKE_PI_CWD_CAPTURE, process.cwd() + "\\n");
-if (process.env.FAKE_PI_CONCURRENCY_CAPTURE) appendFileSync(process.env.FAKE_PI_CONCURRENCY_CAPTURE, "start\\n");
-const sessionDirIndex = args.indexOf("--session-dir");
-if (sessionDirIndex !== -1) {
-  const sessionDir = args[sessionDirIndex + 1];
-  mkdirSync(sessionDir, { recursive: true });
-  writeFileSync(path.join(sessionDir, "fake-" + process.pid + ".jsonl"), JSON.stringify({ type: "session", version: 3, id: "fake" }) + "\\n");
-}
-if (process.env.FAKE_PI_MODE === "sigkill") process.kill(process.pid, "SIGKILL");
-if (process.env.FAKE_PI_MODE === "wait") setInterval(() => {}, 1000);
-let content;
-if (process.env.FAKE_PI_MODE === "multi-text") {
-  content = [{ type: "text", text: "first" }, { type: "text", text: "second" }];
-} else {
-  content = [{ type: "text", text: process.env.FAKE_PI_TEXT ?? "ok" }];
-}
-const events = process.env.FAKE_PI_MODE === "empty-final"
-  ? [
-      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "stale" }], stopReason: "toolUse" } },
-      { type: "message_end", message: { role: "assistant", content: [], stopReason: "end" } },
-    ]
-  : [{ type: "message_end", message: { role: "assistant", content, stopReason: "end" } }];
-const bytes = Buffer.from(events.map((event) => JSON.stringify(event)).join("\\n") + "\\n", "utf8");
-const emit = () => {
-  if (process.env.FAKE_PI_CONCURRENCY_CAPTURE) appendFileSync(process.env.FAKE_PI_CONCURRENCY_CAPTURE, "end\\n");
-  if (process.env.FAKE_PI_MODE === "split-utf8") {
-    const emoji = Buffer.from("🙂", "utf8");
-    const start = bytes.indexOf(emoji);
-    process.stdout.write(bytes.subarray(0, start + 2));
-    setTimeout(() => process.stdout.write(bytes.subarray(start + 2)), 20);
-  } else {
-    process.stdout.write(bytes);
-  }
-};
-const holdMs = Number(process.env.FAKE_PI_HOLD_MS ?? 0);
-if (holdMs > 0) setTimeout(emit, holdMs); else emit();
-`,
-	);
-	chmodSync(fakePi, 0o755);
+	writeFakePi(binDir);
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	process.env.PATH = `${binDir}:${originalPath ?? ""}`;
 	process.argv[1] = "/$bunfs/root/pi";
 	delete process.env.PI_SUBAGENT_DEPTH;
+	delete process.env.PI_SUBAGENT_OWNER_PID;
 	delete process.env.PI_SUBAGENT_IPC_DIR;
 	delete process.env.PI_SUBAGENT_AGENT;
 	harness = new ExtensionHarness();
@@ -311,6 +268,7 @@ after(async () => {
 	else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
 	for (const [key, value] of [
 		["PI_SUBAGENT_DEPTH", originalSubagentDepth],
+		["PI_SUBAGENT_OWNER_PID", originalSubagentOwner],
 		["PI_SUBAGENT_IPC_DIR", originalSubagentIpc],
 		["PI_SUBAGENT_AGENT", originalSubagentAgent],
 	] as const) {
@@ -322,6 +280,7 @@ after(async () => {
 		"FAKE_PI_CAPTURE",
 		"FAKE_PI_TEXT",
 		"FAKE_PI_CWD_CAPTURE",
+		"FAKE_PI_ENV_CAPTURE",
 		"FAKE_PI_CONCURRENCY_CAPTURE",
 		"FAKE_PI_HOLD_MS",
 	])

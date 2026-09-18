@@ -42,6 +42,10 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 			return finalizeToolResult(
 				await (async (): Promise<ToolResultDraft<unknown>> => {
 			const agentScope: AgentScope = params.agentScope ?? "user";
+			const nestedSettings = readSubagentSettings(
+				ctx.cwd,
+				ctx.isProjectTrusted() ? trustedProjectSettings(ctx.cwd) : undefined,
+			);
 			const dispatchDefaults: DispatchDefaults = {
 				model: ctx.model ? modelKey(ctx.model) : undefined,
 				thinkingLevel: ctx.thinkingLevel,
@@ -54,6 +58,10 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 				lookupModel: (key) => {
 					const parts = splitModelKey(key);
 					return parts ? ctx.modelRegistry.find(parts.provider, parts.id) : undefined;
+				},
+				nested: {
+					maxSpawns: nestedSettings.maxNestedSpawns,
+					maxConcurrency: nestedSettings.maxNestedConcurrency,
 				},
 				// Without a UI there is no operator to ask, so the channel is not offered at all
 				// rather than handing children a question that can only time out.

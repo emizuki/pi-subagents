@@ -6,9 +6,10 @@ import type { AgentToolResult, ThinkingLevel } from "@earendil-works/pi-agent-co
 import type { Message } from "@earendil-works/pi-ai";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { describeAgent, findAgent } from "./agent-select.ts";
-import type { AgentConfig } from "./agents.ts";
+import { type AgentConfig, discoverAgents } from "./agents.ts";
 import { currentDepth, DEPTH_ENV_VAR } from "./depth.ts";
 import { findScopedModel, isThinkingLevel, modelKey, type ModelLike, splitThinkingSuffix, supportedThinking, thinkingRank } from "./models.ts";
+import { encodeNestedRuntime, OWNER_PID_ENV_VAR, resolveAllowedAgents, RUNTIME_ENV_VAR } from "./nested-runtime.ts";
 import { getFinalOutput, type SingleResult, type SubagentDetails } from "./results.ts";
 import { findSessionFile, type RetainedRun, retainedRuns, retentionRoot, runsInFlight } from "./runs.ts";
 import { sanitizeSessionForFork } from "./session-fork.ts";
@@ -79,6 +80,8 @@ export interface DispatchDefaults {
 	parentSessionFile?: string;
 	/** Answers the child's supervisor requests; absent when the parent cannot reach an operator. */
 	supervise?: SupervisorHandler;
+	/** Nested limits resolved once per dispatch, so every child does not re-read settings. */
+	nested?: { maxSpawns: number; maxConcurrency: number };
 }
 
 export interface TaskOverrides {
@@ -231,11 +234,50 @@ export async function runSingleAgent(
 	}
 	if (model) args.push("--model", model);
 	if (thinking) args.push("--thinking", thinking);
+	// Collected here and flushed after the child exits (Step 7b). getResultOutput returns
+	// `errorMessage || stderr`, so a delegation note written before the run would lead the model's
+	// error text and bury the actual failure — and `currentResult` does not exist this far up.
+	const delegationNotes: string[] = [];
+	// Decide authority against the same set the coordinator will itself discover. Using the
+	// dispatch scope would let a checkout supply the very definition the ceiling is checked
+	// against, and would let root and child resolve one name to two different files.
+	const authorityAgents = discoverAgents(cwd ?? defaultCwd, "user", { projectTrusted: false }).agents;
+	// Only the root decides authority. A coordinator running at depth 1 emits nothing, so its
+	// grandchild cannot be handed a third level however the tree is arranged.
+	const nestedLimits = dispatchDefaults.nested;
+	const coordinating =
+		currentDepth() === 0 &&
+		agent.allowNestedSubagents &&
+		nestedLimits !== undefined &&
+		nestedLimits.maxSpawns > 0;
+	let envelope = "";
+	if (coordinating) {
+		const { allowed, dropped } = resolveAllowedAgents(agent, authorityAgents);
+		for (const drop of dropped) {
+			delegationNotes.push(`Nested delegation: dropped "${drop.name}" — ${drop.reason}.`);
+		}
+		if (allowed.length > 0) {
+			envelope = encodeNestedRuntime({
+				version: 1,
+				depth: 1,
+				agent: agent.name,
+				allowedAgents: allowed,
+				toolCeiling: agent.tools ?? null,
+				modelCeiling: dispatchDefaults.scopedModels?.map((entry) => modelKey(entry.model)) ?? null,
+				budget: { maxSpawns: nestedLimits.maxSpawns, maxConcurrency: nestedLimits.maxConcurrency },
+			});
+		} else {
+			delegationNotes.push("Nested delegation: nothing survived, running as an ordinary agent.");
+		}
+	}
 	// An agent with an explicit allowlist would otherwise be unable to reach the channel at all.
+	// A coordinator needs the delegation tool on its own allowlist, exactly as every restricted
+	// agent needs the supervisor channel on it. --tools filters extension-registered tools too, so
+	// omitting this registers `subagent` in the child and strips it on the same tick.
 	const childTools = resuming
 		? resuming.tools
 		: agent.tools !== undefined
-			? [...new Set([...agent.tools, SUPERVISOR_TOOL])]
+			? [...new Set([...agent.tools, SUPERVISOR_TOOL, ...(envelope ? ["subagent"] : [])])]
 			: undefined;
 	if (childTools !== undefined) args.push("--tools", childTools.join(","));
 	// A child that rediscovers the whole skill catalogue pays for it on every dispatch, and the
@@ -354,6 +396,12 @@ export async function runSingleAgent(
 					// Explicitly cleared when not supervising: an inherited stale value would point the
 					// child at a directory nobody polls, where it would wait out the full timeout.
 					[IPC_ENV_VAR]: ipcDir ?? "",
+					// Cleared for everyone who is not an authorized coordinator. A grandchild inheriting
+					// its parent's envelope is precisely how depth 2 would become depth 3.
+					[RUNTIME_ENV_VAR]: envelope,
+					// An owner guard only for processes inside a coordinator subtree. Ordinary children
+					// keep today's behaviour, including surviving a root crash.
+					...(envelope || currentDepth() > 0 ? { [OWNER_PID_ENV_VAR]: String(process.pid) } : {}),
 				},
 			});
 			if (ipcDir && dispatchDefaults.supervise) {
@@ -460,6 +508,7 @@ export async function runSingleAgent(
 		});
 
 		currentResult.exitCode = exitCode;
+		if (delegationNotes.length > 0) currentResult.stderr += `${delegationNotes.join("\n")}\n`;
 		if (wasAborted) {
 			currentResult.stopReason = "aborted";
 			currentResult.errorMessage = "Subagent was aborted.";
