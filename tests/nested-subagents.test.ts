@@ -372,6 +372,18 @@ function detailsOf(result: unknown): NestedUsageDetails {
 	return details as NestedUsageDetails;
 }
 
+function succeeded(result: unknown): boolean {
+	if (typeof result !== "object" || result === null) return false;
+	const details = (result as { details?: unknown }).details;
+	if (typeof details !== "object" || details === null) return false;
+	const results = (details as { results?: unknown }).results;
+	if (!Array.isArray(results) || results.length === 0) return false;
+	return results.every((item) => {
+		if (typeof item !== "object" || item === null) return false;
+		return (item as { exitCode?: unknown }).exitCode === 0;
+	});
+}
+
 function runIdOf(result: unknown): string {
 	if (typeof result !== "object" || result === null) throw new Error("subagent result is not an object");
 	const details = (result as { details?: unknown }).details;
@@ -589,6 +601,29 @@ test("a non-subagent tool result does not inflate the total", async () => {
 		assert.equal(detailsOf(result).results[0].usage.input, 7);
 	} finally {
 		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
+test("reviewer delegates a probe to recon end to end", async () => {
+	const capture = path.join(tempRoot(), "argv.jsonl");
+	const environmentCapture = path.join(tempRoot(), "environment.jsonl");
+	process.env.FAKE_PI_ENV_CAPTURE = environmentCapture;
+	setFakeMode("delegate", capture); // coordinator emits a nested subagent tool call, then finishes
+	try {
+		const result = await runSubagent({ agent: "reviewer", task: "verify the claim in this diff" });
+		const invocations = readFileSync(capture, "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as string[]);
+		const environments = capturedEnvironment(environmentCapture);
+		const child = environments.find((entry) => entry.agent === "reviewer");
+		const grandchild = environments.find((entry) => entry.agent === "recon");
+		assert.equal(invocations.length, 2, "both levels must have been launched");
+		assert.ok(child && grandchild, "reviewer and recon must both have been launched");
+		assert.ok(succeeded(result));
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+		delete process.env.FAKE_PI_ENV_CAPTURE;
 	}
 });
 

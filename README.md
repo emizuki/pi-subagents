@@ -306,11 +306,47 @@ on session shutdown. Retention is per parent session and does not survive a rest
 
 ## Depth limit
 
-A subagent inherits this process's environment, so it loads the same packages and would
-otherwise be offered the tool again — subagents spawning subagents, multiplying cost with
-nothing in the transcript to explain it. Each spawn sets `PI_SUBAGENT_DEPTH`, and the tool
-is not registered at all once that reaches `MAX_SUBAGENT_DEPTH` (1). One level of delegation
-is useful; a tree of it is a bill.
+A root process starts at depth 0. An ordinary depth-1 child gets the existing supervisor channel
+but no delegation tool. An authorized coordinator is a depth-1 child with a valid runtime
+contract; it may use that contract to make bounded, synchronous probes. Every grandchild is depth
+2 and cannot register `subagent`: depth 2 is a hard ceiling, not a configurable setting. The gate
+uses exact depth and envelope validity, so a malformed, absent, or inherited envelope cannot add a
+third level.
+
+## Nested delegation
+
+Delegation is opt-in per agent. The shipped `reviewer` is the coordinator example: it may send a
+specific verification lookup to the builtin `recon` agent while keeping the review and its final
+judgement in `reviewer`:
+
+```yaml
+# agents/reviewer.md
+allowNestedSubagents: true
+allowedSubagents: recon
+```
+
+`allowNestedSubagents` enables the coordinator path only when its allowlist resolves, and
+`allowedSubagents` names the candidates it may call. Resolution is fail-closed: a coordinator
+cannot delegate to itself, an absent or ambiguous name is dropped, a child with tools broader than
+the coordinator's own tools is dropped, and nested model choices are intersected with the root's
+model scope. Nested discovery uses the user/builtin scope, so a project-scoped agent cannot be
+reached by the coordinator. The coordinator-side checks repeat the tool and model ceilings before
+launch, so edits after root validation cannot widen the run.
+
+The two nested settings live under `subagents` in user settings. `maxNestedSpawns` accepts an
+integer from `0` through `16`, defaults to `4`, and `0` disables nesting entirely.
+`maxNestedConcurrency` accepts an integer from `1` through `8` and defaults to `2`. A trusted
+project may lower either limit but cannot raise it; user settings are the authority for raising
+them.
+
+Authority is pinned at first launch, not at any launch. A run first launched while
+`maxNestedSpawns` was `0` stores no contract, so re-enabling nesting later never grants it
+delegation on resume — only a fresh launch can.
+
+A nested child exits when the process that owns it disappears, detected by polling. If the owner's
+process id is recycled by the operating system within the lifetime of a run, that check cannot tell
+the difference and the child will not exit on its own. There is no portable fix: a process's start
+time, which would disambiguate, is readable on Linux and not on macOS.
 
 ## Frontmatter
 
@@ -326,6 +362,8 @@ is useful; a tree of it is a bill.
 | `inheritProjectContext` | `true` | Whether the child loads `AGENTS.md` / `CLAUDE.md` from its cwd |
 | `defaultContext` | `fresh` | `fork` makes this agent prefer a branched transcript, degrading to fresh when the parent has none |
 | `suggest` | `true` | Whether the tool's guidance offers this agent as a general read-only choice. Set `false` for a specialist that expects a particular input |
+| `allowNestedSubagents` | `false` | Whether this agent may coordinate bounded nested probes when its allowlist resolves |
+| `allowedSubagents` | none | Candidate agent names for bounded nested probes; invalid, ambiguous, self, broader-tool, and out-of-scope candidates are dropped |
 
 `aliases` exists because callers reach for habitual names. Superpowers, for instance, hardcodes
 `Subagent (general-purpose):` in its dispatch templates, and models improvise around it with
@@ -396,7 +434,7 @@ one and nothing more, and an untrusted project is ignored entirely. A repository
 authorization boundary for how many processes the machine runs, and a checkout that could raise
 the limit would amplify anything that reaches the dispatching model through the files it reads.
 A value that is neither a positive integer nor `"unbounded"` is ignored, falling back to the
-default. Neither setting affects the depth limit: children still cannot spawn children.
+default. Neither setting changes the hard depth-2 ceiling: only an authorized depth-1 coordinator may spawn, and no grandchild may spawn again.
 
 ## Agent definitions
 
