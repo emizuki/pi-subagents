@@ -42,10 +42,22 @@ import {
 } from "./agents.ts";
 import { currentDepth, DEPTH_ENV_VAR, MAX_SUBAGENT_DEPTH } from "./depth.ts";
 import { formatToolCall, formatTokens, formatUsageStats } from "./format.ts";
+import {
+	findScopedModel,
+	isThinkingLevel,
+	modelChoices,
+	modelKey,
+	modelSchema,
+	type ModelLike,
+	splitModelKey,
+	splitThinkingSuffix,
+	supportedThinking,
+	thinkingRank,
+	thinkingSchema,
+} from "./models.ts";
 import { sanitizeSessionForFork } from "./session-fork.ts";
+import { type ForkContext, readSubagentSettings, trustedProjectSettings } from "./settings.ts";
 
-const DEFAULT_MAX_PARALLEL_TASKS = 8;
-const DEFAULT_MAX_CONCURRENCY = 4;
 /** How long a child gets to exit on SIGTERM before SIGKILL. */
 const SIGKILL_GRACE_MS = 5_000;
 const COLLAPSED_ITEM_COUNT = 10;
@@ -351,53 +363,10 @@ interface SupervisorRequest {
 	agent: string;
 }
 
-const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
-
 interface TaskOverrides {
 	model?: string;
 	thinking?: ThinkingLevel;
 	context?: ForkContext;
-}
-
-/**
- * `--model` accepts an optional `:<thinking>` suffix (e.g. `sonnet:high`). Only split it off when
- * the tail is a real thinking level, so model ids that legitimately contain a colon (`llama3:8b`)
- * survive untouched.
- */
-function splitThinkingSuffix(spec: string): { model: string; thinking?: ThinkingLevel } {
-	const i = spec.lastIndexOf(":");
-	if (i === -1) return { model: spec };
-	const tail = spec.slice(i + 1);
-	return (THINKING_LEVELS as readonly string[]).includes(tail)
-		? { model: spec.slice(0, i), thinking: tail as ThinkingLevel }
-		: { model: spec };
-}
-
-/**
- * Structural view of a model entry. `thinkingLevelMap` is documented for models.json but is not
- * part of the documented extension surface, so treat it as optional and degrade gracefully.
- */
-interface ModelLike {
-	provider: string;
-	id: string;
-	reasoning?: boolean;
-	thinkingLevelMap?: Partial<Record<ThinkingLevel, string | null>>;
-	cost?: { input: number };
-}
-
-/**
- * Thinking levels a model actually accepts. Per pi-models.md: a missing key means the level works
- * through `high` but leaves `xhigh`/`max` unsupported; an explicit `null` means unsupported.
- */
-function supportedThinking(model: ModelLike): ThinkingLevel[] {
-	if (model.reasoning === false) return ["off"];
-	const map = model.thinkingLevelMap;
-	return THINKING_LEVELS.filter((level) => {
-		const mapped = map?.[level];
-		if (mapped === null) return false;
-		if (mapped === undefined) return level !== "xhigh" && level !== "max";
-		return true;
-	});
 }
 
 /**
@@ -449,126 +418,6 @@ function isRepoControlledAgent(agent: AgentConfig | undefined): agent is AgentCo
 function repoControlledSource(agent: AgentConfig, projectAgentsDir: string | null): string {
 	if (agent.source === "project") return projectAgentsDir ?? "(unknown)";
 	return agent.packageRoot ?? agent.packageName ?? "(unknown package)";
-}
-
-type ForkContext = "fresh" | "fork";
-
-/** A parallel fan-out limit: a positive integer, or an explicit opt-out of the cap. */
-type FanOutLimit = number | "unbounded";
-
-interface SubagentSettings {
-	defaultThinking?: ThinkingLevel;
-	maxThinking?: ThinkingLevel;
-	defaultContext?: ForkContext;
-	/** Admission limit for one parallel call. Always resolved, defaulting to DEFAULT_MAX_PARALLEL_TASKS. */
-	maxParallelTasks: FanOutLimit;
-	/** Children alive at once within one parallel call. Always resolved, defaulting to DEFAULT_MAX_CONCURRENCY. */
-	maxConcurrency: FanOutLimit;
-}
-
-/**
- * Anything that is not a positive integer or `"unbounded"` is ignored, so a typo in settings
- * falls back to the default rather than silently uncapping or crippling dispatch.
- */
-function parseFanOutLimit(value: unknown): FanOutLimit | undefined {
-	if (value === "unbounded") return "unbounded";
-	if (typeof value === "number" && Number.isInteger(value) && value >= 1) return value;
-	return undefined;
-}
-
-function fanOutRank(limit: FanOutLimit): number {
-	return limit === "unbounded" ? Number.POSITIVE_INFINITY : limit;
-}
-
-/**
- * Only the operator's own settings may raise a limit. A repository is not an authorization
- * boundary for how many processes the machine runs, so a trusted project may lower one and
- * nothing more: a checkout that could raise it would be a fan-out amplifier for anything that
- * reaches the dispatching model, and prompt injection reaches it through the files it reads.
- */
-function resolveFanOutLimit(userValue: unknown, projectValue: unknown, fallback: number): FanOutLimit {
-	const effective = parseFanOutLimit(userValue) ?? fallback;
-	const project = parseFanOutLimit(projectValue);
-	return project !== undefined && fanOutRank(project) < fanOutRank(effective) ? project : effective;
-}
-
-/** Index into THINKING_LEVELS, which is ordered least to most thinking. */
-function readSettingsFile(file: string): Record<string, unknown> | undefined {
-	try {
-		return JSON.parse(fs.readFileSync(file, "utf8"));
-	} catch {
-		return undefined;
-	}
-}
-
-/** Walk up for the project settings file, the way project agents are already discovered. */
-function findProjectSettings(cwd: string): string | undefined {
-	let dir = path.resolve(cwd);
-	for (;;) {
-		const candidate = path.join(dir, CONFIG_DIR_NAME, "settings.json");
-		if (fs.existsSync(candidate)) return candidate;
-		const parent = path.dirname(dir);
-		if (parent === dir) return undefined;
-		dir = parent;
-	}
-}
-
-function canonicalPath(value: string): string {
-	try {
-		return fs.realpathSync(value);
-	} catch {
-		return path.resolve(value);
-	}
-}
-
-function isWithinProject(cwd: string, root: string): boolean {
-	const relative = path.relative(canonicalPath(root), canonicalPath(cwd));
-	return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
-}
-
-function trustedProjectSettings(cwd: string): { file: string; root: string } | undefined {
-	const file = findProjectSettings(cwd);
-	return file ? { file, root: path.dirname(path.dirname(file)) } : undefined;
-}
-
-/** `subagents` settings, project overriding user only after Pi approved that project. */
-function readSubagentSettings(
-	cwd: string,
-	trustedProject: { file: string; root: string } | undefined,
-): SubagentSettings {
-	const readSubagents = (file: string) => readSettingsFile(file)?.subagents as Record<string, unknown> | undefined;
-	const userRaw = readSubagents(path.join(getAgentDir(), "settings.json"));
-	const projectRaw =
-		trustedProject && isWithinProject(cwd, trustedProject.root) ? readSubagents(trustedProject.file) : undefined;
-	const merged: SubagentSettings = {
-		maxParallelTasks: resolveFanOutLimit(
-			userRaw?.maxParallelTasks,
-			projectRaw?.maxParallelTasks,
-			DEFAULT_MAX_PARALLEL_TASKS,
-		),
-		maxConcurrency: resolveFanOutLimit(userRaw?.maxConcurrency, projectRaw?.maxConcurrency, DEFAULT_MAX_CONCURRENCY),
-	};
-	for (const raw of [userRaw, projectRaw]) {
-		if (!raw) continue;
-		for (const key of ["defaultThinking", "maxThinking"] as const) {
-			const value = raw[key];
-			if (typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value)) {
-				merged[key] = value as ThinkingLevel;
-			}
-		}
-		if (raw.defaultContext === "fork" || raw.defaultContext === "fresh") {
-			merged.defaultContext = raw.defaultContext;
-		}
-	}
-	return merged;
-}
-
-function isThinkingLevel(value: unknown): value is ThinkingLevel {
-	return typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value);
-}
-
-function thinkingRank(level: ThinkingLevel): number {
-	return THINKING_LEVELS.indexOf(level);
 }
 
 type SupervisorHandler = (request: SupervisorRequest) => Promise<string>;
@@ -796,35 +645,6 @@ async function drainSupervisorRequests(dir: string, handle: SupervisorHandler): 
 			// The child timed out and its directory is gone; nothing left to answer.
 		}
 	}
-}
-
-function modelKey(model: ModelLike): string {
-	return `${model.provider}/${model.id}`;
-}
-
-/** Split `provider/id` on the FIRST slash: ids themselves may contain slashes. */
-function splitModelKey(key: string): { provider: string; id: string } | undefined {
-	const i = key.indexOf("/");
-	return i === -1 ? undefined : { provider: key.slice(0, i), id: key.slice(i + 1) };
-}
-
-function normalizeModelReference(spec: string): string {
-	const trimmed = spec.trim();
-	const slash = trimmed.indexOf("/");
-	if (slash === -1) return trimmed.toLowerCase();
-	return `${trimmed.slice(0, slash).trim()}/${trimmed.slice(slash + 1).trim()}`.toLowerCase();
-}
-
-function findScopedModel(
-	scopedModels: Array<{ model: ModelLike; thinkingLevel?: ThinkingLevel }> | undefined,
-	spec: string,
-): { model: ModelLike; thinkingLevel?: ThinkingLevel } | undefined {
-	if (!scopedModels?.length) return undefined;
-	const normalized = normalizeModelReference(spec);
-	const exact = scopedModels.find((entry) => normalizeModelReference(modelKey(entry.model)) === normalized);
-	if (exact) return exact;
-	const byId = scopedModels.filter((entry) => entry.model.id.toLowerCase() === normalized);
-	return byId.length === 1 ? byId[0] : undefined;
 }
 
 function signalExitCode(signal: NodeJS.Signals | null): number {
@@ -1264,44 +1084,6 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 	description: 'Which agent directories to use. Default: "user". Use "both" to include project-local agents.',
 	default: "user",
 });
-
-/** Models offered to the LLM, honoring the current session scope when one is configured. */
-function modelChoices(ctx: ExtensionContext): ModelLike[] {
-	const pool =
-		ctx.scopedModels.length > 0
-			? ctx.scopedModels.map(({ model }) => model)
-			: ctx.modelRegistry.getAvailable();
-	const seen = new Set<string>();
-	const unique = pool.filter((m) => !seen.has(modelKey(m)) && seen.add(modelKey(m)));
-	// Cheapest first, unpriced last: the order is the only pricing signal the model gets, and
-	// naming one model in a guideline would pin it to a choice its account may not even allow.
-	return unique.sort((a, b) => (a.cost?.input ?? Number.POSITIVE_INFINITY) - (b.cost?.input ?? Number.POSITIVE_INFINITY));
-}
-
-function modelSchema(choices: ModelLike[], current: string | undefined) {
-	const description = `Model for the subagent, ordered cheapest first. Omit to inherit the dispatching session's model${
-		current ? ` (${current})` : ""
-	}.`;
-	const keys = choices.map(modelKey);
-	// StringEnum needs a non-empty list; with nothing to choose from, accept a free-form id.
-	return keys.length > 0
-		? StringEnum(keys as [string, ...string[]], { description })
-		: Type.String({ description });
-}
-
-/**
- * Thinking levels are per-model, but the model is picked in the same call, so the schema can only
- * offer the union across the offered models. `runSingleAgent` rejects a pair the resolved model
- * does not actually accept.
- */
-function thinkingSchema(choices: ModelLike[]) {
-	const union = THINKING_LEVELS.filter((level) => choices.some((m) => supportedThinking(m).includes(level)));
-	const levels = union.length > 0 ? union : THINKING_LEVELS;
-	return StringEnum(levels as unknown as [ThinkingLevel, ...ThinkingLevel[]], {
-		description:
-			"Thinking level for the subagent. Overrides a level pinned on the agent's model. Not every model accepts every level.",
-	});
-}
 
 /**
  * Without a nudge the model leaves `model` unset, because omitting it is the documented default.
