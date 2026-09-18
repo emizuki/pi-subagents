@@ -25,6 +25,7 @@ import {
 	parseBoundedInt,
 	readSubagentSettings,
 } from "../extensions/subagents/settings.ts";
+import { retainedRuns } from "../extensions/subagents/runs.ts";
 
 const roots: string[] = [];
 function tempRoot(): string {
@@ -221,6 +222,42 @@ function resultText(result: unknown): string {
 			return text.type === "text" && typeof text.text === "string" ? text.text : "";
 		})
 		.join("\n");
+}
+
+function runIdOf(result: unknown): string {
+	if (typeof result !== "object" || result === null) throw new Error("subagent result is not an object");
+	const details = (result as { details?: unknown }).details;
+	if (typeof details !== "object" || details === null) throw new Error("subagent result has no details");
+	const results = (details as { results?: unknown }).results;
+	if (!Array.isArray(results) || results.length === 0) throw new Error("subagent result has no child result");
+	const runId = (results[0] as { runId?: unknown }).runId;
+	if (typeof runId !== "string") throw new Error("subagent result has no run id");
+	return runId;
+}
+
+function retainRunWithoutContract(agent: string): string {
+	const id = "legacy-no-contract";
+	const runDir = path.join(root, id);
+	const sessionFile = path.join(runDir, "session.jsonl");
+	mkdirSync(runDir, { recursive: true });
+	writeFileSync(sessionFile, "{\"type\":\"session\"}\n");
+	retainedRuns.set(id, {
+		id,
+		agent,
+		agentSource: "user",
+		agentFilePath: path.join(agentDir, "agents", `${agent}.md`),
+		model: "test-provider/cheap",
+		thinking: "low",
+		tools: ["read"],
+		inheritSkills: false,
+		inheritProjectContext: true,
+		systemPrompt: "You are a retained test agent.",
+		cwd: root,
+		runDir,
+		sessionFile,
+		resumable: true,
+	});
+	return id;
 }
 
 async function runSubagent(
@@ -872,6 +909,64 @@ test("coordinator authority resolves against the user scope, not project shadows
 		const runtime = parseNestedRuntime(seen.runtime || undefined);
 		assert.ok(runtime, "the user-scope delegate must survive project shadowing");
 		assert.deepEqual(runtime.allowedAgents, ["recon"]);
+	} finally {
+		delete process.env.FAKE_PI_ENV_CAPTURE;
+	}
+});
+
+test("a resumed coordinator keeps its original allowlist after its agent file changes", async () => {
+	writeCoordinatorFixtures();
+	const first = await runSubagent({ agent: "reviewer", task: "review" });
+	const runId = runIdOf(first);
+	writeAgentFile("reviewer", { allowNestedSubagents: true, allowedSubagents: "general-purpose", tools: "read" });
+	const capture = path.join(tempRoot(), "env.jsonl");
+	const argvCapture = path.join(root, "resume-contract-argv.jsonl");
+	process.env.FAKE_PI_ENV_CAPTURE = capture;
+	setFakeMode("normal", argvCapture);
+	try {
+		await runSubagent({ resume: runId, task: "carry on" });
+		const seen = JSON.parse(readFileSync(capture, "utf8").trim().split("\n")[0]) as { runtime: string };
+		const runtime = parseNestedRuntime(seen.runtime);
+		assert.deepEqual(runtime?.allowedAgents, ["recon"], "authority comes from the stored contract, not the file");
+	} finally {
+		delete process.env.FAKE_PI_ENV_CAPTURE;
+	}
+});
+
+test("a run retained without a stored contract resumes with no delegation", async () => {
+	const runId = retainRunWithoutContract("reviewer");
+	const capture = path.join(tempRoot(), "env.jsonl");
+	const argvCapture = path.join(root, "legacy-resume-argv.jsonl");
+	process.env.FAKE_PI_ENV_CAPTURE = capture;
+	setFakeMode("normal", argvCapture);
+	try {
+		await runSubagent({ resume: runId, task: "carry on" });
+		const seen = JSON.parse(readFileSync(capture, "utf8").trim().split("\n")[0]) as { runtime: string };
+		assert.equal(seen.runtime, "");
+	} finally {
+		delete process.env.FAKE_PI_ENV_CAPTURE;
+	}
+});
+
+test("a resumed coordinator keeps its stored authority while nesting is disabled", async () => {
+	writeCoordinatorFixtures();
+	const first = await runSubagent({ agent: "reviewer", task: "review" });
+	const runId = runIdOf(first);
+	writeUserSettings({ maxNestedSpawns: 0 });
+	try {
+		await runSubagent({ resume: runId, task: "carry on while disabled" });
+	} finally {
+		clearUserSettings();
+	}
+	const capture = path.join(tempRoot(), "reenabled-env.jsonl");
+	const argvCapture = path.join(root, "reenabled-argv.jsonl");
+	process.env.FAKE_PI_ENV_CAPTURE = capture;
+	setFakeMode("normal", argvCapture);
+	try {
+		await runSubagent({ resume: runId, task: "carry on again" });
+		const seen = JSON.parse(readFileSync(capture, "utf8").trim().split("\n")[0]) as { runtime: string };
+		const runtime = parseNestedRuntime(seen.runtime);
+		assert.deepEqual(runtime?.allowedAgents, ["recon"]);
 	} finally {
 		delete process.env.FAKE_PI_ENV_CAPTURE;
 	}

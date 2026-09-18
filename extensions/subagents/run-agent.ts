@@ -125,8 +125,8 @@ export async function runSingleAgent(
 				inheritProjectContext: resuming.inheritProjectContext,
 				defaultContext: resuming.defaultContext,
 				suggest: false,
-				allowNestedSubagents: false,
-				allowedSubagents: [],
+				allowNestedSubagents: (resuming.allowedAgents?.length ?? 0) > 0,
+				allowedSubagents: resuming.allowedAgents ?? [],
 				systemPrompt: resuming.systemPrompt,
 				source: resuming.agentSource,
 				filePath: resuming.agentFilePath,
@@ -241,33 +241,45 @@ export async function runSingleAgent(
 	// Only the root decides authority. A coordinator running at depth 1 emits nothing, so its
 	// grandchild cannot be handed a third level however the tree is arranged.
 	const nestedLimits = dispatchDefaults.nested;
-	const coordinating =
-		currentDepth() === 0 &&
-		agent.allowNestedSubagents &&
-		nestedLimits !== undefined &&
-		nestedLimits.maxSpawns > 0;
+	const nestingEnabled = currentDepth() === 0 && nestedLimits !== undefined && nestedLimits.maxSpawns > 0;
 	let envelope = "";
-	if (coordinating) {
-		// Decide authority against the same set the coordinator will itself discover. Using the
-		// dispatch scope would let a checkout supply the very definition the ceiling is checked
-		// against, and would let root and child resolve one name to two different files.
-		const authorityAgents = discoverAgents(cwd ?? defaultCwd, "user", { projectTrusted: false }).agents;
-		const { allowed, dropped } = resolveAllowedAgents(agent, authorityAgents);
-		for (const drop of dropped) {
-			delegationNotes.push(`Nested delegation: dropped "${drop.name}" — ${drop.reason}.`);
+	let contract: { allowedAgents: string[]; toolCeiling: string[] | null; modelCeiling: string[] | null } | undefined;
+	if (nestingEnabled && nestedLimits !== undefined) {
+		if (resuming) {
+			// Authority travels with the run, not with the file. An agent file edited between the
+			// launch and the resume must not widen — or narrow — what was already granted.
+			if (resuming.allowedAgents && resuming.allowedAgents.length > 0) {
+				contract = {
+					allowedAgents: resuming.allowedAgents,
+					toolCeiling: resuming.toolCeiling ?? null,
+					modelCeiling: resuming.modelCeiling ?? null,
+				};
+			}
+		} else if (agent.allowNestedSubagents) {
+			// `authorityAgents`, not the `agents` parameter. Task 4 Step 7 argues this at length: the
+			// dispatch scope can contain project agents under `agentScope: "both"`, which would let a
+			// checkout supply the very definition the tool ceiling is checked against.
+			const authorityAgents = discoverAgents(cwd ?? defaultCwd, "user", { projectTrusted: false }).agents;
+			const { allowed, dropped } = resolveAllowedAgents(agent, authorityAgents);
+			for (const drop of dropped) delegationNotes.push(`Nested delegation: dropped "${drop.name}" — ${drop.reason}.`);
+			if (allowed.length > 0) {
+				contract = {
+					allowedAgents: allowed,
+					toolCeiling: agent.tools ?? null,
+					modelCeiling: dispatchDefaults.scopedModels?.map((entry) => modelKey(entry.model)) ?? null,
+				};
+			} else {
+				delegationNotes.push("Nested delegation: nothing survived, running as an ordinary agent.");
+			}
 		}
-		if (allowed.length > 0) {
+		if (contract) {
 			envelope = encodeNestedRuntime({
 				version: 1,
 				depth: 1,
 				agent: agent.name,
-				allowedAgents: allowed,
-				toolCeiling: agent.tools ?? null,
-				modelCeiling: dispatchDefaults.scopedModels?.map((entry) => modelKey(entry.model)) ?? null,
+				...contract,
 				budget: { maxSpawns: nestedLimits.maxSpawns, maxConcurrency: nestedLimits.maxConcurrency },
 			});
-		} else {
-			delegationNotes.push("Nested delegation: nothing survived, running as an ordinary agent.");
 		}
 	}
 	// An agent with an explicit allowlist would otherwise be unable to reach the channel at all.
@@ -531,6 +543,12 @@ export async function runSingleAgent(
 				model,
 				thinking,
 				tools: childTools,
+				// Fall back to the stored values on a resume. Without the fallback, resuming while
+				// maxNestedSpawns is 0 leaves `contract` undefined and erases the stored authority for
+				// good — re-enabling nesting afterwards would not bring it back.
+				allowedAgents: contract?.allowedAgents ?? resuming?.allowedAgents,
+				toolCeiling: contract?.toolCeiling ?? resuming?.toolCeiling,
+				modelCeiling: contract?.modelCeiling ?? resuming?.modelCeiling,
 				inheritSkills: agent.inheritSkills,
 				inheritProjectContext: agent.inheritProjectContext,
 				defaultContext: agent.defaultContext,

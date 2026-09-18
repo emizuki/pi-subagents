@@ -45,6 +45,13 @@ export interface RetainedRun {
 	model?: string;
 	thinking?: ThinkingLevel;
 	tools?: string[];
+	/**
+	 * Coordinator authority, resolved once at first launch. Absent for ordinary runs and for runs
+	 * retained before nesting existed, both of which resume without delegation.
+	 */
+	allowedAgents?: string[];
+	toolCeiling?: string[] | null;
+	modelCeiling?: string[] | null;
 	inheritSkills: boolean;
 	inheritProjectContext: boolean;
 	defaultContext?: ForkContext;
