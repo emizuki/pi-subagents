@@ -27,9 +27,11 @@ export function windowsTreeKillCommand(pid: number): { command: string; args: st
 /**
  * Terminate a coordinator and everything under it.
  *
- * The group is signalled only while the process is demonstrably alive: once it has exited, its
- * process-group id may have been reused, and signalling it would hit an unrelated group. Treating
- * an exited process as "already succeeded" is not enough — the signal must not be sent at all.
+ * The initial group signal is sent only while the coordinator is demonstrably alive: once it has
+ * exited, its process-group id may have been reused, and signalling it would hit an unrelated
+ * group. After SIGTERM, the coordinator may exit while a descendant remains, so escalation probes
+ * the group itself instead of the coordinator. Treating an exited process as "already succeeded"
+ * is not enough — the signal must not be sent at all.
  */
 export function terminateOwnedTree(
 	proc: { pid?: number; exitCode: number | null; signalCode: NodeJS.Signals | null; kill(signal?: NodeJS.Signals): boolean; once(event: "exit", listener: () => void): unknown },
@@ -45,7 +47,8 @@ export function terminateOwnedTree(
 		// orphans the grandchildren before the walk can find them. SIGTERM already terminates
 		// immediately on Windows, so the grace period carries no meaning here.
 		const { command, args } = windowsTreeKillCommand(pid);
-		spawnSync(command, args, { stdio: "ignore", shell: false });
+		const result = spawnSync(command, args, { stdio: "ignore", shell: false });
+		if (result.error || result.status !== 0) proc.kill("SIGTERM");
 		return;
 	}
 
@@ -54,8 +57,16 @@ export function terminateOwnedTree(
 	} catch {
 		// The group is already gone, which is the outcome we wanted.
 	}
+	const groupAlive = () => {
+		try {
+			process.kill(-pid, 0);
+			return true;
+		} catch (error) {
+			return (error as NodeJS.ErrnoException)?.code === "EPERM";
+		}
+	};
 	const escalate = setTimeout(() => {
-		if (!alive()) return;
+		if (!groupAlive()) return;
 		try {
 			process.kill(-pid, "SIGKILL");
 		} catch {
@@ -63,7 +74,6 @@ export function terminateOwnedTree(
 		}
 	}, graceMs);
 	escalate.unref?.();
-	proc.once("exit", () => clearTimeout(escalate));
 }
 
 /**

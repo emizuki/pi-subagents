@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createRequire, syncBuiltinESMExports } from "node:module";
@@ -136,7 +137,9 @@ let root: string;
 let agentDir: string;
 let binDir: string;
 let treeBinDir: string;
+let treePiPath: string;
 let treeWaitScript: string;
+let treeIgnoreSigtermScript: string;
 let treeGuardScript: string;
 let harness: NestedHarness;
 let context: ExtensionContext;
@@ -217,6 +220,15 @@ function writeTreeFixture(): void {
 	mkdirSync(treeBinDir, { recursive: true });
 	treeWaitScript = path.join(root, "tree-wait-grandchild.mjs");
 	writeFileSync(treeWaitScript, "setInterval(() => {}, 1000);\n");
+	treeIgnoreSigtermScript = path.join(root, "tree-ignore-sigterm-grandchild.mjs");
+	writeFileSync(
+		treeIgnoreSigtermScript,
+		`import { writeFileSync } from "node:fs";
+process.on("SIGTERM", () => {});
+if (process.env.TREE_GRANDCHILD_READY_FILE) writeFileSync(process.env.TREE_GRANDCHILD_READY_FILE, "ready");
+setInterval(() => {}, 1000);
+`,
+	);
 	const extensionUrl = pathToFileURL(
 		path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../extensions/subagents/index.ts"),
 	).href;
@@ -238,9 +250,9 @@ if (shutdownFile) {
 setInterval(() => {}, 1000);
 `,
 	);
-	const treePi = path.join(treeBinDir, "pi");
+	treePiPath = path.join(treeBinDir, "pi");
 	writeFileSync(
-		treePi,
+		treePiPath,
 		`#!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
@@ -257,7 +269,7 @@ writeFileSync(grandchildPidFile, String(grandchild.pid));
 setInterval(() => {}, 1000);
 `,
 	);
-	chmodSync(treePi, 0o755);
+	chmodSync(treePiPath, 0o755);
 }
 
 function setFakeMode(mode: string, captureFile: string): void {
@@ -403,6 +415,28 @@ async function waitForFile(file: string): Promise<void> {
 	await waitUntil(() => existsSync(file));
 }
 
+async function waitForPidFile(file: string): Promise<void> {
+	await waitUntil(() => {
+		if (!existsSync(file)) return false;
+		try {
+			const pid = Number(readFileSync(file, "utf8").trim());
+			return Number.isInteger(pid) && pid > 0;
+		} catch {
+			return false;
+		}
+	});
+}
+
+function readPid(file: string): number {
+	const pid = Number(readFileSync(file, "utf8").trim());
+	assert.ok(Number.isInteger(pid) && pid > 0, `invalid pid in ${file}: ${JSON.stringify(String(pid))}`);
+	return pid;
+}
+
+function moduleUrl(relativePath: string): string {
+	return pathToFileURL(path.resolve(path.dirname(fileURLToPath(import.meta.url)), relativePath)).href;
+}
+
 async function runCoordinatorWithGrandchild(
 	pidFile: string,
 	signal: AbortSignal,
@@ -438,23 +472,40 @@ async function runCoordinatorWithGrandchild(
 	}
 }
 
+function beginCoordinatorWithGrandchild(
+	pidFile: string,
+	guarded = false,
+	coordinatorPidFile = path.join(root, "tree-coordinator.pid"),
+	guardShutdownFile?: string,
+): { controller: AbortController; running: Promise<unknown> } {
+	const controller = new AbortController();
+	return {
+		controller,
+		running: runCoordinatorWithGrandchild(pidFile, controller.signal, guarded, coordinatorPidFile, guardShutdownFile),
+	};
+}
+
 async function startCoordinatorThenSigkillIt(pidFile: string): Promise<number> {
 	const coordinatorPidFile = path.join(root, "abrupt-coordinator.pid");
-	const running = runCoordinatorWithGrandchild(
-		pidFile,
-		new AbortController().signal,
-		true,
-		coordinatorPidFile,
-	);
-	await waitForFile(coordinatorPidFile);
-	await waitForFile(pidFile);
-	const coordinatorPid = Number(readFileSync(coordinatorPidFile, "utf8").trim());
-	const grandchildPid = Number(readFileSync(pidFile, "utf8").trim());
-	assert.ok(isProcessAlive(coordinatorPid), "the coordinator must be alive before it is killed");
-	assert.ok(isProcessAlive(grandchildPid), "the grandchild must be alive before its owner is killed");
-	process.kill(coordinatorPid, "SIGKILL");
-	await running;
-	return coordinatorPid;
+	const { controller, running } = beginCoordinatorWithGrandchild(pidFile, true, coordinatorPidFile);
+	let coordinatorPid: number | undefined;
+	let grandchildPid: number | undefined;
+	try {
+		await waitForPidFile(coordinatorPidFile);
+		await waitForPidFile(pidFile);
+		coordinatorPid = readPid(coordinatorPidFile);
+		grandchildPid = readPid(pidFile);
+		assert.ok(isProcessAlive(coordinatorPid), "the coordinator must be alive before it is killed");
+		assert.ok(isProcessAlive(grandchildPid), "the grandchild must be alive before its owner is killed");
+		process.kill(coordinatorPid, "SIGKILL");
+		await running;
+		return coordinatorPid;
+	} finally {
+		if (coordinatorPid !== undefined && isProcessAlive(coordinatorPid)) process.kill(coordinatorPid, "SIGKILL");
+		if (grandchildPid !== undefined && isProcessAlive(grandchildPid)) process.kill(grandchildPid, "SIGKILL");
+		controller.abort();
+		await running;
+	}
 }
 
 async function executeNested(params: Record<string, unknown>, runtime = nestedGuardRuntime): Promise<unknown> {
@@ -527,9 +578,15 @@ test("windows tree-kill targets the whole tree and forces it", () => {
 });
 
 test("coordinator spawn options detach only on POSIX", () => {
-	const options = coordinatorSpawnOptions();
-	if (process.platform === "win32") assert.deepEqual(options, {});
-	else assert.deepEqual(options, { detached: true });
+	const originalPlatform = process.platform;
+	try {
+		Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+		assert.deepEqual(coordinatorSpawnOptions(), {});
+		Object.defineProperty(process, "platform", { configurable: true, value: "linux" });
+		assert.deepEqual(coordinatorSpawnOptions(), { detached: true });
+	} finally {
+		Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
+	}
 });
 
 test("Windows termination invokes taskkill for a live coordinator", () => {
@@ -539,7 +596,7 @@ test("Windows termination invokes taskkill for a live coordinator", () => {
 	const calls: Array<{ command: string; args: string[] }> = [];
 	childProcess.spawnSync = ((command: string, args: string[]) => {
 		calls.push({ command, args });
-		return undefined as never;
+		return { status: 0, error: undefined } as never;
 	}) as unknown as typeof childProcess.spawnSync;
 	syncBuiltinESMExports();
 	Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
@@ -560,6 +617,41 @@ test("Windows termination invokes taskkill for a live coordinator", () => {
 		syncBuiltinESMExports();
 	}
 	assert.deepEqual(calls, [{ command: "taskkill.exe", args: ["/PID", "4321", "/T", "/F"] }]);
+});
+
+test("Windows termination falls back to SIGTERM when taskkill fails", () => {
+	const childProcess = createRequire(import.meta.url)("node:child_process") as typeof import("node:child_process");
+	const originalSpawnSync = childProcess.spawnSync;
+	const originalPlatform = process.platform;
+	const results = [
+		{ status: 1, error: undefined },
+		{ status: null, error: new Error("taskkill missing") },
+	] as const;
+	for (const result of results) {
+		const signals: NodeJS.Signals[] = [];
+		const proc = {
+			pid: 4321,
+			exitCode: null as number | null,
+			signalCode: null as NodeJS.Signals | null,
+			kill: (signal?: NodeJS.Signals) => {
+				if (signal) signals.push(signal);
+				if (signal === "SIGTERM") proc.exitCode = 0;
+				return true;
+			},
+			once: () => undefined,
+		};
+		childProcess.spawnSync = (() => result) as unknown as typeof childProcess.spawnSync;
+		syncBuiltinESMExports();
+		Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+		try {
+			terminateOwnedTree(proc, 1);
+		} finally {
+			Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
+			childProcess.spawnSync = originalSpawnSync;
+			syncBuiltinESMExports();
+		}
+		assert.deepEqual(signals, ["SIGTERM"]);
+	}
 });
 
 test("an exited coordinator is never signalled through its former group", () => {
@@ -610,8 +702,49 @@ test("an alive coordinator escalates its process group after the grace period", 
 	}
 	assert.deepEqual(signals, [
 		{ pid: -4321, signal: "SIGTERM" },
+		{ pid: -4321, signal: 0 },
 		{ pid: -4321, signal: "SIGKILL" },
 	]);
+});
+
+test("group escalation kills a SIGTERM-ignoring descendant after the coordinator exits", { skip: process.platform === "win32" }, async () => {
+	const grandchildPidFile = path.join(tempRoot(), "ignoring-grandchild.pid");
+	const coordinatorPidFile = path.join(tempRoot(), "ignoring-coordinator.pid");
+	const grandchildReadyFile = path.join(tempRoot(), "ignoring-grandchild.ready");
+	const coordinator = spawn(treePiPath, [], {
+		detached: true,
+		stdio: ["ignore", "ignore", "ignore"],
+		env: {
+			...process.env,
+			TREE_COORDINATOR_PID_FILE: coordinatorPidFile,
+			TREE_GRANDCHILD_PID_FILE: grandchildPidFile,
+			TREE_GRANDCHILD_SCRIPT: treeIgnoreSigtermScript,
+			TREE_GRANDCHILD_READY_FILE: grandchildReadyFile,
+		},
+	});
+	let grandchildPid: number | undefined;
+	try {
+		await waitForPidFile(coordinatorPidFile);
+		await waitForPidFile(grandchildPidFile);
+		await waitForFile(grandchildReadyFile);
+		const coordinatorPid = readPid(coordinatorPidFile);
+		const descendantPid = readPid(grandchildPidFile);
+		grandchildPid = descendantPid;
+		assert.equal(coordinator.pid, coordinatorPid);
+		assert.notEqual(descendantPid, coordinatorPid);
+		assert.ok(isProcessAlive(coordinatorPid), "the coordinator must be alive before termination");
+		assert.ok(isProcessAlive(descendantPid), "the SIGTERM-ignoring descendant must be alive before termination");
+		terminateOwnedTree(coordinator, 500);
+		await waitUntil(() => !isProcessAlive(coordinatorPid), 1_000);
+		assert.ok(isProcessAlive(descendantPid), "the descendant must survive SIGTERM after the coordinator exits");
+		await waitUntil(() => !isProcessAlive(descendantPid), 2_000);
+	} finally {
+		if (grandchildPid !== undefined && isProcessAlive(grandchildPid)) process.kill(grandchildPid, "SIGKILL");
+		if (coordinator.exitCode === null && coordinator.signalCode === null) {
+			coordinator.kill("SIGKILL");
+			await new Promise<void>((resolve) => coordinator.once("close", () => resolve()));
+		}
+	}
 });
 
 test("the owner guard refuses values that would make it useless", () => {
@@ -619,7 +752,6 @@ test("the owner guard refuses values that would make it useless", () => {
 	assert.equal(startOwnerGuard(""), undefined);
 	assert.equal(startOwnerGuard("0"), undefined);
 	assert.equal(startOwnerGuard("-1"), undefined);
-	assert.equal(startOwnerGuard("not a number"), undefined);
 	// Guarding against yourself never fires and would look like protection that is not there.
 	assert.equal(startOwnerGuard(String(process.pid)), undefined);
 	// The positive case, without which every assertion above holds for a stub that returns undefined
@@ -628,6 +760,71 @@ test("the owner guard refuses values that would make it useless", () => {
 	const guard = startOwnerGuard(String(process.ppid));
 	assert.equal(typeof guard?.dispose, "function", "a live owner that is not us must produce a guard");
 	guard?.dispose();
+});
+
+test("invalid owner values are rejected in an isolated process", () => {
+	const child = spawnSync(
+		process.execPath,
+		[
+			"--input-type=module",
+			"-e",
+			`import { startOwnerGuard } from ${JSON.stringify(moduleUrl("../extensions/subagents/process-tree.ts"))};
+const guard = startOwnerGuard(process.env.TEST_OWNER_RAW);
+if (guard) guard.dispose();
+process.stdout.write("completed\\n");
+`,
+		],
+		{ encoding: "utf8", env: { ...process.env, TEST_OWNER_RAW: "not a number" } },
+	);
+	assert.equal(child.status, 0);
+	assert.equal(String(child.stdout).trim(), "completed");
+});
+
+test("an owner that is already dead exits before the first poll", async () => {
+	const readyFile = path.join(tempRoot(), "dead-owner-ready");
+	const goFile = path.join(tempRoot(), "dead-owner-go");
+	const survivedFile = path.join(tempRoot(), "dead-owner-survived");
+	const child = spawn(process.execPath, [
+		"--input-type=module",
+		"-e",
+		`import { existsSync, writeFileSync } from "node:fs";
+import { startOwnerGuard } from ${JSON.stringify(moduleUrl("../extensions/subagents/process-tree.ts"))};
+const readyFile = process.env.READY_FILE;
+const goFile = process.env.GO_FILE;
+writeFileSync(readyFile, "ready");
+const timer = setInterval(() => {
+  if (!existsSync(goFile)) return;
+  clearInterval(timer);
+  const hold = setInterval(() => {}, 1000);
+  startOwnerGuard("2147483647");
+  writeFileSync(process.env.SURVIVED_FILE, "survived");
+}, 1);
+`,
+	], {
+		stdio: ["ignore", "ignore", "ignore"],
+		env: { ...process.env, READY_FILE: readyFile, GO_FILE: goFile, SURVIVED_FILE: survivedFile },
+	});
+	const exited = new Promise<number | null>((resolve, reject) => {
+		child.once("close", (code: number | null) => resolve(code));
+		child.once("error", reject);
+	});
+	try {
+		await waitForFile(readyFile);
+		const startedAt = Date.now();
+		writeFileSync(goFile, "go");
+		const code = await Promise.race([
+			exited,
+			new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 1_500)),
+		]);
+		const elapsed = Date.now() - startedAt;
+		assert.notEqual(code, "timeout", "dead-owner child did not exit");
+		assert.equal(code, 0);
+		assert.equal(existsSync(survivedFile), false);
+		assert.ok(elapsed < 450, `dead-owner startup took ${elapsed}ms`);
+	} finally {
+		if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+		await exited;
+	}
 });
 
 test("parseBoundedInt accepts only integers inside the range", () => {
@@ -1670,18 +1867,18 @@ test("a coordinator leads its own process group", linuxOnly, async () => {
 test("aborting a coordinator run leaves no grandchild alive", { skip: process.platform === "win32" }, async () => {
 	const pidFile = path.join(tempRoot(), "grandchild.pid");
 	// A fixture grandchild records its pid and waits; the root call is then aborted.
-	const controller = new AbortController();
-	const running = runCoordinatorWithGrandchild(pidFile, controller.signal);
-	await waitForFile(pidFile);
-	const pid = Number(readFileSync(pidFile, "utf8").trim());
+	const { controller, running } = beginCoordinatorWithGrandchild(pidFile);
+	let pid: number | undefined;
 	try {
+		await waitForPidFile(pidFile);
+		pid = readPid(pidFile);
 		assert.ok(isProcessAlive(pid), "the grandchild must be alive before the abort");
 		controller.abort();
 		await running;
-		await waitUntil(() => !isProcessAlive(pid), 10_000);
+		await waitUntil(() => !isProcessAlive(pid as number), 10_000);
 	} finally {
 		controller.abort();
-		if (isProcessAlive(pid)) process.kill(pid, "SIGKILL");
+		if (pid !== undefined && isProcessAlive(pid)) process.kill(pid, "SIGKILL");
 		await running;
 	}
 });
@@ -1690,7 +1887,7 @@ test("a grandchild exits on its own when its coordinator dies abruptly", { skip:
 	// The owner guard, not the signal path: nothing signals this grandchild.
 	const pidFile = path.join(tempRoot(), "orphan.pid");
 	const coordinatorPid = await startCoordinatorThenSigkillIt(pidFile);
-	const pid = Number(readFileSync(pidFile, "utf8").trim());
+	const pid = readPid(pidFile);
 	try {
 		assert.notEqual(pid, coordinatorPid);
 		await waitUntil(() => !isProcessAlive(pid), 10_000);
@@ -1703,27 +1900,24 @@ test("session shutdown disposes the owner guard", { skip: process.platform === "
 	const pidFile = path.join(tempRoot(), "disposed-grandchild.pid");
 	const coordinatorPidFile = path.join(tempRoot(), "disposed-coordinator.pid");
 	const shutdownFile = path.join(tempRoot(), "guard-disposed");
-	const running = runCoordinatorWithGrandchild(
-		pidFile,
-		new AbortController().signal,
-		true,
-		coordinatorPidFile,
-		shutdownFile,
-	);
-	await waitForFile(shutdownFile);
-	await waitForFile(coordinatorPidFile);
-	await waitForFile(pidFile);
-	const coordinatorPid = Number(readFileSync(coordinatorPidFile, "utf8").trim());
-	const grandchildPid = Number(readFileSync(pidFile, "utf8").trim());
-	assert.ok(isProcessAlive(grandchildPid), "the guarded grandchild must be alive before shutdown");
+	const { controller, running } = beginCoordinatorWithGrandchild(pidFile, true, coordinatorPidFile, shutdownFile);
+	let coordinatorPid: number | undefined;
+	let grandchildPid: number | undefined;
 	try {
+		await waitForFile(shutdownFile);
+		await waitForPidFile(coordinatorPidFile);
+		await waitForPidFile(pidFile);
+		coordinatorPid = readPid(coordinatorPidFile);
+		grandchildPid = readPid(pidFile);
+		assert.ok(isProcessAlive(grandchildPid), "the guarded grandchild must be alive before shutdown");
 		process.kill(coordinatorPid, "SIGKILL");
 		await running;
 		await new Promise((resolve) => setTimeout(resolve, 750));
 		assert.ok(isProcessAlive(grandchildPid), "a disposed guard must not kill its child after owner death");
 	} finally {
-		if (isProcessAlive(coordinatorPid)) process.kill(coordinatorPid, "SIGKILL");
-		if (isProcessAlive(grandchildPid)) process.kill(grandchildPid, "SIGKILL");
+		if (coordinatorPid !== undefined && isProcessAlive(coordinatorPid)) process.kill(coordinatorPid, "SIGKILL");
+		if (grandchildPid !== undefined && isProcessAlive(grandchildPid)) process.kill(grandchildPid, "SIGKILL");
+		controller.abort();
 		await running;
 	}
 });
