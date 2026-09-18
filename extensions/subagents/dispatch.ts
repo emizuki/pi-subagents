@@ -301,6 +301,21 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 					results,
 				});
 
+			// At depth 0 (no runtime) this must stay off: publishing `usage` here would make pi add a
+			// child's tokens into the parent session's total a second time, on top of the rollup the
+			// child's own tool result already carried, and the probe-count sentence only means something
+			// once a coordinator exists to have spent the budget it describes. Every return site that
+			// reports a completed dispatch needs both pieces together, gated the same way — collapsed
+			// into one expression so the sites cannot drift out of sync with each other, as the three
+			// near-identical inline conditionals this replaced had already done.
+			const nestedExtras = (results: SingleResult[]): { text: string; usage: ReturnType<typeof toUsage> | undefined } =>
+				runtime
+					? {
+							text: `\n\nRan ${results.length} nested probe${results.length === 1 ? "" : "s"}.`,
+							usage: toUsage(aggregateUsage(results)),
+						}
+					: { text: "", usage: undefined };
+
 			if (modeCount !== 1) {
 				const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 				return {
@@ -545,18 +560,17 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 					const id = r.runId ? ` run ${r.runId}` : "";
 					return `### [${r.agent}]${id} ${status}\n\n${output}`;
 				});
+				const extras = nestedExtras(results);
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}${
-								runtime ? `\n\nRan ${results.length} nested probe${results.length === 1 ? "" : "s"}.` : ""
-							}`,
+							text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}${extras.text}`,
 						},
 					],
 					details: makeDetails("parallel")(results),
 					failed: successCount !== results.length,
-					...(runtime ? { usage: toUsage(aggregateUsage(results)) } : {}),
+					...(extras.usage !== undefined ? { usage: extras.usage } : {}),
 				};
 			}
 
@@ -753,6 +767,7 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 					makeDetails("single"),
 				);
 				const results = [result];
+				const extras = nestedExtras(results);
 				const isError = isFailedResult(result);
 				if (isError) {
 					const errorMsg = getResultOutput(result);
@@ -760,25 +775,23 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 						content: [
 							{
 								type: "text",
-								text: `Agent ${result.stopReason || "failed"}: ${errorMsg}${
-									runtime ? `\n\nRan ${results.length} nested probe${results.length === 1 ? "" : "s"}.` : ""
-								}`,
+								text: `Agent ${result.stopReason || "failed"}: ${errorMsg}${extras.text}`,
 							},
 						],
 						details: makeDetails("single")(results),
 						failed: true,
-						...(runtime ? { usage: toUsage(aggregateUsage(results)) } : {}),
+						...(extras.usage !== undefined ? { usage: extras.usage } : {}),
 					};
 				}
 				return {
 					content: [
 						{
 							type: "text",
-							text: `${getResultOutput(result)}${runtime ? `\n\nRan ${results.length} nested probe${results.length === 1 ? "" : "s"}.` : ""}${result.runId ? `\n\n(run ${result.runId})` : ""}`,
+							text: `${getResultOutput(result)}${extras.text}${result.runId ? `\n\n(run ${result.runId})` : ""}`,
 						},
 					],
 					details: makeDetails("single")(results),
-					...(runtime ? { usage: toUsage(aggregateUsage(results)) } : {}),
+					...(extras.usage !== undefined ? { usage: extras.usage } : {}),
 				};
 			}
 

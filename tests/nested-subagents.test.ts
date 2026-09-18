@@ -709,6 +709,18 @@ test("a root dispatch does not publish nested usage or a probe count", async () 
 	}
 });
 
+// Regression for the depth-0 `runtime ?` guard on the single-*failure* branch: unlike the
+// coordinator's own failed-probe case above, a root dispatch never carries a runtime, so this
+// must stay silent about usage and probe counts exactly like the successful root case does. No
+// child process is ever spawned here — an unknown agent name fails before the fake `pi` binary
+// would be invoked — so this needs no FAKE_PI_MODE.
+test("a failed root single dispatch does not publish nested usage or a probe count", async () => {
+	const result = await runSubagent({ agent: "no-such-agent", task: "ordinary probe" });
+	assert.match(resultText(result), /Agent failed: Unknown agent/);
+	assert.equal((result as { usage?: unknown }).usage, undefined);
+	assert.doesNotMatch(resultText(result), /Ran \d+ nested probes?\./);
+});
+
 test("a coordinator publishes aggregate usage for parallel probes", async () => {
 	setFakeMode("nested-usage", path.join(tempRoot(), "parallel-coordinator-usage.jsonl"));
 	try {
@@ -723,6 +735,25 @@ test("a coordinator publishes aggregate usage for parallel probes", async () => 
 		assert.equal(usage.input, 2 * (100 + 7));
 		assert.equal(usage.output, 2 * (50 + 3));
 		assert.match(resultText(result), /Ran 2 nested probes\./);
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
+// Regression for the depth-0 `runtime ?` guard on the *parallel* branch: a root parallel
+// dispatch never carries a runtime either, so it must stay just as silent as the root single
+// case above.
+test("a root parallel dispatch does not publish nested usage or a probe count", async () => {
+	setFakeMode("normal", path.join(tempRoot(), "root-parallel-usage.jsonl"));
+	try {
+		const result = await runSubagent({
+			tasks: [
+				{ agent: "general-purpose", task: "probe one" },
+				{ agent: "general-purpose", task: "probe two" },
+			],
+		});
+		assert.equal((result as { usage?: unknown }).usage, undefined);
+		assert.doesNotMatch(resultText(result), /Ran \d+ nested probes?\./);
 	} finally {
 		delete process.env.FAKE_PI_CAPTURE;
 	}
