@@ -10,6 +10,7 @@ import { type AgentConfig, discoverAgents } from "./agents.ts";
 import { currentDepth, DEPTH_ENV_VAR } from "./depth.ts";
 import { findScopedModel, isThinkingLevel, modelKey, type ModelLike, splitThinkingSuffix, supportedThinking, thinkingRank } from "./models.ts";
 import { encodeNestedRuntime, OWNER_PID_ENV_VAR, resolveAllowedAgents, RUNTIME_ENV_VAR } from "./nested-runtime.ts";
+import { coordinatorSpawnOptions, terminateOwnedTree } from "./process-tree.ts";
 import { getFinalOutput, type SingleResult, type SubagentDetails } from "./results.ts";
 import { findSessionFile, type RetainedRun, retainedRuns, retentionRoot, runsInFlight } from "./runs.ts";
 import { sanitizeSessionForFork } from "./session-fork.ts";
@@ -401,6 +402,7 @@ export async function runSingleAgent(
 				cwd: cwd ?? defaultCwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
+				...(envelope ? coordinatorSpawnOptions() : {}),
 				env: {
 					...process.env,
 					[DEPTH_ENV_VAR]: String(currentDepth() + 1),
@@ -505,6 +507,10 @@ export async function runSingleAgent(
 			if (signal) {
 				const killProc = () => {
 					wasAborted = true;
+					if (envelope) {
+						terminateOwnedTree(proc, SIGKILL_GRACE_MS);
+						return;
+					}
 					proc.kill("SIGTERM");
 					// `killed` only means a signal was delivered, not that the process is gone, so it is
 					// always true here and would make the escalation dead code. Exit state is the test.

@@ -16,11 +16,13 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { currentDepth } from "./depth.ts";
 import { registerSubagentTool } from "./dispatch.ts";
 import { readNestedRuntime } from "./nested-runtime.ts";
+import { startOwnerGuard } from "./process-tree.ts";
 import { toolResultMetadata } from "./results.ts";
 import { asyncRuns, abortAllAsyncRuns, clearRetainedRuns, sweepStaleTempDirs } from "./runs.ts";
 import { registerContactSupervisorTool, SUPERVISOR_TOOL } from "./supervisor.ts";
 
 export default function (pi: ExtensionAPI) {
+	const ownerGuard = startOwnerGuard();
 	// execute() cannot set AgentToolResult.isError because that field does not exist in Pi's API.
 	// Bridge our private details marker onto the mutable tool_result event instead.
 	pi.on("tool_result", (event) => {
@@ -53,6 +55,7 @@ export default function (pi: ExtensionAPI) {
 	// Detached children are separate processes: without this they survive /new, /resume, /fork and
 	// exit, still burning tokens against a session nobody is watching any more.
 	pi.on("session_shutdown", (_event, ctx) => {
+		ownerGuard?.dispose();
 		const stopped = abortAllAsyncRuns();
 		if (stopped > 0 && ctx.hasUI) {
 			ctx.ui.notify(`Stopped ${stopped} detached subagent run${stopped === 1 ? "" : "s"}.`, "info");

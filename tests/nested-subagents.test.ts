@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { createRequire, syncBuiltinESMExports } from "node:module";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 import { after, before, beforeEach, test } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -20,6 +22,7 @@ import {
 	withinToolCeiling,
 } from "../extensions/subagents/nested-runtime.ts";
 import { makeNestedSubagentParams } from "../extensions/subagents/schema.ts";
+import { coordinatorSpawnOptions, startOwnerGuard, terminateOwnedTree, windowsTreeKillCommand } from "../extensions/subagents/process-tree.ts";
 import {
 	DEFAULT_MAX_NESTED_CONCURRENCY,
 	DEFAULT_MAX_NESTED_SPAWNS,
@@ -28,7 +31,7 @@ import {
 	parseBoundedInt,
 	readSubagentSettings,
 } from "../extensions/subagents/settings.ts";
-import { retainedRuns } from "../extensions/subagents/runs.ts";
+import { isProcessAlive, retainedRuns } from "../extensions/subagents/runs.ts";
 
 const roots: string[] = [];
 function tempRoot(): string {
@@ -114,7 +117,7 @@ class NestedHarness {
 		for (const handler of this.handlers.get("model_select") ?? []) await handler({}, ctx);
 	}
 
-	async execute(params: Record<string, unknown>, ctx: ExtensionContext): Promise<unknown> {
+	async execute(params: Record<string, unknown>, ctx: ExtensionContext, signal = new AbortController().signal): Promise<unknown> {
 		const definition = this.tools.get("subagent");
 		assert.ok(definition && typeof definition === "object", "subagent tool should be registered");
 		const execute = (definition as { execute?: unknown }).execute;
@@ -125,13 +128,16 @@ class NestedHarness {
 			signal: AbortSignal,
 			onUpdate: undefined,
 			ctx: ExtensionContext,
-		) => Promise<unknown>)("test-call", params, new AbortController().signal, undefined, ctx);
+		) => Promise<unknown>)("test-call", params, signal, undefined, ctx);
 	}
 }
 
 let root: string;
 let agentDir: string;
 let binDir: string;
+let treeBinDir: string;
+let treeWaitScript: string;
+let treeGuardScript: string;
 let harness: NestedHarness;
 let context: ExtensionContext;
 const originalArgv1 = process.argv[1];
@@ -206,6 +212,54 @@ function clearUserSettings(): void {
 	rmSync(path.join(agentDir, "settings.json"), { force: true });
 }
 
+function writeTreeFixture(): void {
+	treeBinDir = path.join(root, "tree-bin");
+	mkdirSync(treeBinDir, { recursive: true });
+	treeWaitScript = path.join(root, "tree-wait-grandchild.mjs");
+	writeFileSync(treeWaitScript, "setInterval(() => {}, 1000);\n");
+	const extensionUrl = pathToFileURL(
+		path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../extensions/subagents/index.ts"),
+	).href;
+	treeGuardScript = path.join(root, "tree-guard-grandchild.mjs");
+	writeFileSync(
+		treeGuardScript,
+		`import { writeFileSync } from "node:fs";
+import extension from ${JSON.stringify(extensionUrl)};
+const handlers = new Map();
+const pi = { on(event, handler) { handlers.set(event, handler); } };
+extension(pi);
+const shutdownFile = process.env.TREE_GUARD_SHUTDOWN_FILE;
+if (shutdownFile) {
+  const shutdown = handlers.get("session_shutdown");
+  if (typeof shutdown !== "function") throw new Error("session shutdown handler was not registered");
+  shutdown({}, { hasUI: false });
+  writeFileSync(shutdownFile, "disposed");
+}
+setInterval(() => {}, 1000);
+`,
+	);
+	const treePi = path.join(treeBinDir, "pi");
+	writeFileSync(
+		treePi,
+		`#!/usr/bin/env node
+import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+const coordinatorPidFile = process.env.TREE_COORDINATOR_PID_FILE;
+const grandchildPidFile = process.env.TREE_GRANDCHILD_PID_FILE;
+const grandchildScript = process.env.TREE_GRANDCHILD_SCRIPT;
+if (!coordinatorPidFile || !grandchildPidFile || !grandchildScript) throw new Error("tree fixture is missing its paths");
+writeFileSync(coordinatorPidFile, String(process.pid));
+const grandchild = spawn(process.execPath, [grandchildScript], {
+  env: { ...process.env, PI_SUBAGENT_OWNER_PID: String(process.pid) },
+  stdio: "ignore",
+});
+writeFileSync(grandchildPidFile, String(grandchild.pid));
+setInterval(() => {}, 1000);
+`,
+	);
+	chmodSync(treePi, 0o755);
+}
+
 function setFakeMode(mode: string, captureFile: string): void {
 	process.env.FAKE_PI_MODE = mode;
 	process.env.FAKE_PI_CAPTURE = captureFile;
@@ -259,6 +313,14 @@ function capturedEnvironment(file: string): CapturedEnvironment[] {
 		.filter(Boolean)
 		.map((line) => JSON.parse(line) as CapturedEnvironment);
 }
+
+/** The calling test process's own process-group id, for comparison. Linux only. */
+function ownPgrp(): number {
+	const stat = readFileSync("/proc/self/stat", "utf8");
+	return Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[2]);
+}
+
+const linuxOnly = { skip: process.platform !== "linux" ? "requires /proc" : false };
 
 function optionValue(args: string[], option: string): string | undefined {
 	const index = args.indexOf(option);
@@ -322,6 +384,79 @@ async function runSubagent(
 	return harness.execute(params, dispatchContext);
 }
 
+async function runSubagentWithSignal(params: Record<string, unknown>, signal: AbortSignal): Promise<unknown> {
+	await harness.refresh(context);
+	return harness.execute(params, context, signal);
+}
+
+async function waitUntil(condition: () => boolean, timeoutMs = 10_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!condition()) {
+		if (Date.now() >= deadline) {
+			assert.fail(`condition did not become true within ${timeoutMs}ms`);
+		}
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	}
+}
+
+async function waitForFile(file: string): Promise<void> {
+	await waitUntil(() => existsSync(file));
+}
+
+async function runCoordinatorWithGrandchild(
+	pidFile: string,
+	signal: AbortSignal,
+	guarded = false,
+	coordinatorPidFile = path.join(root, "tree-coordinator.pid"),
+	guardShutdownFile?: string,
+): Promise<unknown> {
+	const previousPath = process.env.PATH;
+	const previousCoordinatorPid = process.env.TREE_COORDINATOR_PID_FILE;
+	const previousGrandchildPid = process.env.TREE_GRANDCHILD_PID_FILE;
+	const previousGrandchildScript = process.env.TREE_GRANDCHILD_SCRIPT;
+	const previousGuardShutdown = process.env.TREE_GUARD_SHUTDOWN_FILE;
+	writeCoordinatorFixtures();
+	process.env.PATH = `${treeBinDir}:${previousPath ?? ""}`;
+	process.env.TREE_COORDINATOR_PID_FILE = coordinatorPidFile;
+	process.env.TREE_GRANDCHILD_PID_FILE = pidFile;
+	process.env.TREE_GRANDCHILD_SCRIPT = guarded ? treeGuardScript : treeWaitScript;
+	if (guardShutdownFile === undefined) delete process.env.TREE_GUARD_SHUTDOWN_FILE;
+	else process.env.TREE_GUARD_SHUTDOWN_FILE = guardShutdownFile;
+	try {
+		return await runSubagentWithSignal({ agent: "reviewer", task: "process tree" }, signal);
+	} finally {
+		if (previousPath === undefined) delete process.env.PATH;
+		else process.env.PATH = previousPath;
+		if (previousCoordinatorPid === undefined) delete process.env.TREE_COORDINATOR_PID_FILE;
+		else process.env.TREE_COORDINATOR_PID_FILE = previousCoordinatorPid;
+		if (previousGrandchildPid === undefined) delete process.env.TREE_GRANDCHILD_PID_FILE;
+		else process.env.TREE_GRANDCHILD_PID_FILE = previousGrandchildPid;
+		if (previousGrandchildScript === undefined) delete process.env.TREE_GRANDCHILD_SCRIPT;
+		else process.env.TREE_GRANDCHILD_SCRIPT = previousGrandchildScript;
+		if (previousGuardShutdown === undefined) delete process.env.TREE_GUARD_SHUTDOWN_FILE;
+		else process.env.TREE_GUARD_SHUTDOWN_FILE = previousGuardShutdown;
+	}
+}
+
+async function startCoordinatorThenSigkillIt(pidFile: string): Promise<number> {
+	const coordinatorPidFile = path.join(root, "abrupt-coordinator.pid");
+	const running = runCoordinatorWithGrandchild(
+		pidFile,
+		new AbortController().signal,
+		true,
+		coordinatorPidFile,
+	);
+	await waitForFile(coordinatorPidFile);
+	await waitForFile(pidFile);
+	const coordinatorPid = Number(readFileSync(coordinatorPidFile, "utf8").trim());
+	const grandchildPid = Number(readFileSync(pidFile, "utf8").trim());
+	assert.ok(isProcessAlive(coordinatorPid), "the coordinator must be alive before it is killed");
+	assert.ok(isProcessAlive(grandchildPid), "the grandchild must be alive before its owner is killed");
+	process.kill(coordinatorPid, "SIGKILL");
+	await running;
+	return coordinatorPid;
+}
+
 async function executeNested(params: Record<string, unknown>, runtime = nestedGuardRuntime): Promise<unknown> {
 	const previousDepth = process.env.PI_SUBAGENT_DEPTH;
 	const previousRuntime = process.env[RUNTIME_ENV_VAR];
@@ -346,6 +481,7 @@ before(async () => {
 	mkdirSync(binDir, { recursive: true });
 	writeAgentFile("general-purpose");
 	writeFakePi(binDir);
+	writeTreeFixture();
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	process.env.PATH = `${binDir}:${originalPath ?? ""}`;
 	process.argv[1] = "/$bunfs/root/pi";
@@ -382,6 +518,116 @@ after(async () => {
 	])
 		delete process.env[key];
 	for (const root of roots) rmSync(root, { recursive: true, force: true });
+});
+
+test("windows tree-kill targets the whole tree and forces it", () => {
+	const { command, args } = windowsTreeKillCommand(4321);
+	assert.equal(command, "taskkill.exe");
+	assert.deepEqual(args, ["/PID", "4321", "/T", "/F"]);
+});
+
+test("coordinator spawn options detach only on POSIX", () => {
+	const options = coordinatorSpawnOptions();
+	if (process.platform === "win32") assert.deepEqual(options, {});
+	else assert.deepEqual(options, { detached: true });
+});
+
+test("Windows termination invokes taskkill for a live coordinator", () => {
+	const childProcess = createRequire(import.meta.url)("node:child_process") as typeof import("node:child_process");
+	const originalSpawnSync = childProcess.spawnSync;
+	const originalPlatform = process.platform;
+	const calls: Array<{ command: string; args: string[] }> = [];
+	childProcess.spawnSync = ((command: string, args: string[]) => {
+		calls.push({ command, args });
+		return undefined as never;
+	}) as unknown as typeof childProcess.spawnSync;
+	syncBuiltinESMExports();
+	Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+	try {
+		terminateOwnedTree(
+			{
+				pid: 4321,
+				exitCode: null,
+				signalCode: null,
+				kill: () => true,
+				once: () => undefined,
+			},
+			1,
+		);
+	} finally {
+		Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
+		childProcess.spawnSync = originalSpawnSync;
+		syncBuiltinESMExports();
+	}
+	assert.deepEqual(calls, [{ command: "taskkill.exe", args: ["/PID", "4321", "/T", "/F"] }]);
+});
+
+test("an exited coordinator is never signalled through its former group", () => {
+	let processKillCalls = 0;
+	const originalKill = process.kill;
+	process.kill = (() => {
+		processKillCalls++;
+		return true;
+	}) as typeof process.kill;
+	try {
+		terminateOwnedTree(
+			{
+				pid: 4321,
+				exitCode: 0,
+				signalCode: null,
+				kill: () => true,
+				once: () => undefined,
+			},
+			1,
+		);
+	} finally {
+		process.kill = originalKill;
+	}
+	assert.equal(processKillCalls, 0);
+});
+
+test("an alive coordinator escalates its process group after the grace period", { skip: process.platform === "win32" }, async () => {
+	const signals: Array<{ pid: number; signal?: NodeJS.Signals | number }> = [];
+	const originalKill = process.kill;
+	process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+		signals.push({ pid, signal });
+		return true;
+	}) as typeof process.kill;
+	try {
+		terminateOwnedTree(
+			{
+				pid: 4321,
+				exitCode: null,
+				signalCode: null,
+				kill: () => true,
+				once: () => undefined,
+			},
+			10,
+		);
+		await new Promise((resolve) => setTimeout(resolve, 30));
+	} finally {
+		process.kill = originalKill;
+	}
+	assert.deepEqual(signals, [
+		{ pid: -4321, signal: "SIGTERM" },
+		{ pid: -4321, signal: "SIGKILL" },
+	]);
+});
+
+test("the owner guard refuses values that would make it useless", () => {
+	assert.equal(startOwnerGuard(undefined), undefined);
+	assert.equal(startOwnerGuard(""), undefined);
+	assert.equal(startOwnerGuard("0"), undefined);
+	assert.equal(startOwnerGuard("-1"), undefined);
+	assert.equal(startOwnerGuard("not a number"), undefined);
+	// Guarding against yourself never fires and would look like protection that is not there.
+	assert.equal(startOwnerGuard(String(process.pid)), undefined);
+	// The positive case, without which every assertion above holds for a stub that returns undefined
+	// unconditionally — and would keep holding with the whole guard deleted. process.ppid is alive,
+	// is not us, and the timer is unref'd, so this starts and disposes nothing else.
+	const guard = startOwnerGuard(String(process.ppid));
+	assert.equal(typeof guard?.dispose, "function", "a live owner that is not us must produce a guard");
+	guard?.dispose();
 });
 
 test("parseBoundedInt accepts only integers inside the range", () => {
@@ -1389,6 +1635,96 @@ test("a coordinator receives an envelope naming exactly its resolved delegates",
 		assert.ok(optionValue(args, "--tools")?.split(",").includes("subagent"));
 	} finally {
 		delete process.env.FAKE_PI_ENV_CAPTURE;
+	}
+});
+
+test("an ordinary child stays in the root's process group", linuxOnly, async () => {
+	const capture = path.join(tempRoot(), "ordinary-pgrp-env.jsonl");
+	process.env.FAKE_PI_ENV_CAPTURE = capture;
+	setFakeMode("normal", path.join(tempRoot(), "ordinary-pgrp-argv.jsonl"));
+	try {
+		await runSubagent({ agent: "general-purpose", task: "anything" });
+		const seen = capturedEnvironment(capture)[0];
+		assert.equal(seen.pgrp, ownPgrp(), "an ordinary child shares the dispatching process's group");
+		assert.notEqual(seen.pgrp, seen.pid, "and is therefore not a group leader");
+	} finally {
+		delete process.env.FAKE_PI_ENV_CAPTURE;
+	}
+});
+
+test("a coordinator leads its own process group", linuxOnly, async () => {
+	writeCoordinatorFixtures();
+	const capture = path.join(tempRoot(), "coordinator-pgrp-env.jsonl");
+	process.env.FAKE_PI_ENV_CAPTURE = capture;
+	setFakeMode("normal", path.join(tempRoot(), "coordinator-pgrp-argv.jsonl"));
+	try {
+		await runSubagent({ agent: "reviewer", task: "review" });
+		const seen = capturedEnvironment(capture)[0];
+		assert.notEqual(seen.pgrp, ownPgrp(), "a coordinator must leave the root's group to signal its own");
+		assert.equal(seen.pgrp, seen.pid, "a coordinator must be its own group leader");
+	} finally {
+		delete process.env.FAKE_PI_ENV_CAPTURE;
+	}
+});
+
+test("aborting a coordinator run leaves no grandchild alive", { skip: process.platform === "win32" }, async () => {
+	const pidFile = path.join(tempRoot(), "grandchild.pid");
+	// A fixture grandchild records its pid and waits; the root call is then aborted.
+	const controller = new AbortController();
+	const running = runCoordinatorWithGrandchild(pidFile, controller.signal);
+	await waitForFile(pidFile);
+	const pid = Number(readFileSync(pidFile, "utf8").trim());
+	try {
+		assert.ok(isProcessAlive(pid), "the grandchild must be alive before the abort");
+		controller.abort();
+		await running;
+		await waitUntil(() => !isProcessAlive(pid), 10_000);
+	} finally {
+		controller.abort();
+		if (isProcessAlive(pid)) process.kill(pid, "SIGKILL");
+		await running;
+	}
+});
+
+test("a grandchild exits on its own when its coordinator dies abruptly", { skip: process.platform === "win32" }, async () => {
+	// The owner guard, not the signal path: nothing signals this grandchild.
+	const pidFile = path.join(tempRoot(), "orphan.pid");
+	const coordinatorPid = await startCoordinatorThenSigkillIt(pidFile);
+	const pid = Number(readFileSync(pidFile, "utf8").trim());
+	try {
+		assert.notEqual(pid, coordinatorPid);
+		await waitUntil(() => !isProcessAlive(pid), 10_000);
+	} finally {
+		if (isProcessAlive(pid)) process.kill(pid, "SIGKILL");
+	}
+});
+
+test("session shutdown disposes the owner guard", { skip: process.platform === "win32" }, async () => {
+	const pidFile = path.join(tempRoot(), "disposed-grandchild.pid");
+	const coordinatorPidFile = path.join(tempRoot(), "disposed-coordinator.pid");
+	const shutdownFile = path.join(tempRoot(), "guard-disposed");
+	const running = runCoordinatorWithGrandchild(
+		pidFile,
+		new AbortController().signal,
+		true,
+		coordinatorPidFile,
+		shutdownFile,
+	);
+	await waitForFile(shutdownFile);
+	await waitForFile(coordinatorPidFile);
+	await waitForFile(pidFile);
+	const coordinatorPid = Number(readFileSync(coordinatorPidFile, "utf8").trim());
+	const grandchildPid = Number(readFileSync(pidFile, "utf8").trim());
+	assert.ok(isProcessAlive(grandchildPid), "the guarded grandchild must be alive before shutdown");
+	try {
+		process.kill(coordinatorPid, "SIGKILL");
+		await running;
+		await new Promise((resolve) => setTimeout(resolve, 750));
+		assert.ok(isProcessAlive(grandchildPid), "a disposed guard must not kill its child after owner death");
+	} finally {
+		if (isProcessAlive(coordinatorPid)) process.kill(coordinatorPid, "SIGKILL");
+		if (isProcessAlive(grandchildPid)) process.kill(grandchildPid, "SIGKILL");
+		await running;
 	}
 });
 
