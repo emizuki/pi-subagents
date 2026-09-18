@@ -353,6 +353,12 @@ process id is recycled by the operating system within the lifetime of a run, tha
 the difference and the child will not exit on its own. There is no portable fix: a process's start
 time, which would disambiguate, is readable on Linux and not on macOS.
 
+Termination has a narrower version of the same limitation: the escalation that follows an unresponsive
+`SIGTERM` re-checks the process group rather than the coordinator itself, since the coordinator can
+exit while a descendant lingers, so within that grace window a process-group id recycled by the
+operating system could receive the escalation `SIGKILL` instead of the tree it was aimed at; the
+window is negligible on Linux and accepted.
+
 ## Frontmatter
 
 | Field | Default | Effect |
