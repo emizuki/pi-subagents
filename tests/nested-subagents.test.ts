@@ -352,6 +352,15 @@ function resultText(result: unknown): string {
 		.join("\n");
 }
 
+type NestedUsageDetails = { results: Array<{ usage: { input: number; output: number } }> };
+
+function detailsOf(result: unknown): NestedUsageDetails {
+	assert.ok(typeof result === "object" && result !== null);
+	const details = (result as { details?: unknown }).details;
+	assert.ok(typeof details === "object" && details !== null);
+	return details as NestedUsageDetails;
+}
+
 function runIdOf(result: unknown): string {
 	if (typeof result !== "object" || result === null) throw new Error("subagent result is not an object");
 	const details = (result as { details?: unknown }).details;
@@ -545,6 +554,66 @@ before(async () => {
 	harness = new NestedHarness();
 	context = makeContext();
 	await harness.register(context);
+});
+
+test("a nested result's usage reaches the root's rendered total", async () => {
+	setFakeMode("nested-usage", path.join(tempRoot(), "argv.jsonl"));
+	try {
+		const result = await runSubagent({ agent: "general-purpose", task: "delegate" });
+		const details = detailsOf(result);
+		assert.equal(details.results[0].usage.input, 100 + 7, "grandchild input must be added to the coordinator's own");
+		assert.equal(details.results[0].usage.output, 50 + 3);
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
+test("a non-subagent tool result does not inflate the total", async () => {
+	setFakeMode("other-tool-usage", path.join(tempRoot(), "argv.jsonl"));
+	try {
+		const result = await runSubagent({ agent: "general-purpose", task: "use a tool" });
+		assert.equal(detailsOf(result).results[0].usage.input, 7);
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
+test("a coordinator publishes nested usage and its probe count", async () => {
+	writeAgentFile("recon", { tools: "read" });
+	setFakeMode("nested-usage", path.join(tempRoot(), "coordinator-usage.jsonl"));
+	try {
+		const result = await executeNested({ agent: "recon", task: "probe" });
+		const usage = (result as {
+			usage?: { input: number; output: number; totalTokens: number; cost: { total: number } };
+		}).usage;
+		assert.ok(usage);
+		assert.equal(usage.input, 100 + 7);
+		assert.equal(usage.output, 50 + 3);
+		assert.equal(usage.totalTokens, 0);
+		assert.equal(usage.cost.total, 0);
+		assert.match(resultText(result), /Ran 1 nested probe\./);
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
+test("a coordinator publishes aggregate usage for parallel probes", async () => {
+	setFakeMode("nested-usage", path.join(tempRoot(), "parallel-coordinator-usage.jsonl"));
+	try {
+		const result = await executeNested({
+			tasks: [
+				{ agent: "recon", task: "probe one" },
+				{ agent: "recon", task: "probe two" },
+			],
+		});
+		const usage = (result as { usage?: { input: number; output: number } }).usage;
+		assert.ok(usage);
+		assert.equal(usage.input, 2 * (100 + 7));
+		assert.equal(usage.output, 2 * (50 + 3));
+		assert.match(resultText(result), /Ran 2 nested probes\./);
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+	}
 });
 
 after(async () => {

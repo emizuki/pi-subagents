@@ -8,6 +8,8 @@ import {
 	createAssistantMessageEventStream,
 	type AssistantMessage,
 	type Model,
+	type ToolResultMessage,
+	type Usage,
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import extension from "../extensions/subagents/index.ts";
@@ -415,6 +417,91 @@ test("Pi agent-core emits and serializes the bridged structural error", async ()
 	assert.equal(persisted.isError, true);
 	assert.match(persisted.content[0].text, /No run/);
 	assert.equal(persisted.details.__piSubagents.failed, true);
+});
+
+test("Pi agent-core preserves usage on bridged tool results", async () => {
+	const ctx = makeContext(root);
+	await harness.refresh(ctx);
+	const nested: Usage = {
+		input: 100,
+		output: 50,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.25 },
+	};
+	const loopModel = {
+		id: "fake",
+		name: "Fake",
+		api: "openai-completions",
+		provider: "fake",
+		baseUrl: "",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 4096,
+		maxTokens: 256,
+	} satisfies Model<"openai-completions">;
+	const parameters = Type.Object({});
+	const tool: AgentTool<typeof parameters, undefined> = {
+		name: "subagent",
+		label: "Subagent",
+		description: "test usage bridge",
+		parameters,
+		execute: async () => ({
+			content: [{ type: "text", text: "ok" }],
+			details: undefined,
+			usage: nested,
+			terminate: true,
+		}),
+	};
+	const streamFn = async () => {
+		const stream = createAssistantMessageEventStream();
+		const start: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: "openai-completions",
+			provider: "fake",
+			model: "fake",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "pending",
+			timestamp: Date.now(),
+		};
+		const toolCall = { type: "toolCall" as const, id: "core-call", name: "subagent", arguments: {} };
+		const completed: AssistantMessage = { ...start, content: [toolCall], stopReason: "toolUse" };
+		stream.push({ type: "start", partial: start });
+		stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial: completed });
+		stream.push({ type: "done", reason: "toolUse", message: completed });
+		return stream;
+	};
+	const messages: ToolResultMessage[] = [];
+	const coreAgent = new Agent({
+		initialState: { model: loopModel, thinkingLevel: "off", tools: [tool] },
+		streamFn,
+		afterToolCall: async ({ result }) => {
+			const event = await harness.applyToolResult(result, ctx);
+			return {
+				content: event.content,
+				details: event.details,
+				isError: event.isError,
+				terminate: true,
+			};
+		},
+	});
+	coreAgent.subscribe((event) => {
+		if (event.type === "message_end" && event.message.role === "toolResult") messages.push(event.message);
+	});
+	await coreAgent.prompt("run the tool");
+	assert.equal(messages.length, 1);
+	assert.equal(messages[0].toolName, "subagent");
+	assert.deepEqual(messages[0].usage, nested);
 });
 
 test("untrusted project settings cannot force fork context", async () => {

@@ -93,12 +93,22 @@ if (process.env.FAKE_PI_MODE === "multi-text") {
 } else {
   content = [{ type: "text", text: process.env.FAKE_PI_TEXT ?? "ok" }];
 }
-const events = process.env.FAKE_PI_MODE === "empty-final"
+const usageToolName = process.env.FAKE_PI_MODE === "nested-usage"
+  ? "subagent"
+  : process.env.FAKE_PI_MODE === "other-tool-usage"
+    ? "read"
+    : undefined;
+const events = usageToolName
   ? [
-      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "stale" }], stopReason: "toolUse" } },
-      { type: "message_end", message: { role: "assistant", content: [], stopReason: "end" } },
+      { type: "message_end", message: { role: "assistant", content, usage: { input: 7, output: 3 }, stopReason: "end" } },
+      { type: "message_end", message: { role: "toolResult", toolName: usageToolName, content: [], usage: { input: 100, output: 50 } } },
     ]
-  : [{ type: "message_end", message: { role: "assistant", content, stopReason: "end" } }];
+  : process.env.FAKE_PI_MODE === "empty-final"
+    ? [
+        { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "stale" }], stopReason: "toolUse" } },
+        { type: "message_end", message: { role: "assistant", content: [], stopReason: "end" } },
+      ]
+    : [{ type: "message_end", message: { role: "assistant", content, stopReason: "end" } }];
 const bytes = Buffer.from(events.map((event) => JSON.stringify(event)).join("\\n") + "\\n", "utf8");
 const emit = () => {
   if (process.env.FAKE_PI_CONCURRENCY_CAPTURE) appendFileSync(process.env.FAKE_PI_CONCURRENCY_CAPTURE, "end\\n");

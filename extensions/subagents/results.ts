@@ -1,5 +1,5 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { Message } from "@earendil-works/pi-ai";
+import type { Message, Usage } from "@earendil-works/pi-ai";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead } from "@earendil-works/pi-coding-agent";
 import type { AgentScope, AgentSource } from "./agents.ts";
 
@@ -38,6 +38,33 @@ export interface SubagentDetails {
 	agentScope: AgentScope;
 	projectAgentsDir: string | null;
 	results: SingleResult[];
+}
+
+export const aggregateUsage = (results: SingleResult[]) => {
+	const total = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+	for (const r of results) {
+		total.input += r.usage.input;
+		total.output += r.usage.output;
+		total.cacheRead += r.usage.cacheRead;
+		total.cacheWrite += r.usage.cacheWrite;
+		total.cost += r.usage.cost;
+		total.turns += r.usage.turns;
+	}
+	return total;
+};
+
+/** Only `cost.total` is read back by the parent's rollup; the per-channel costs are not
+ * reconstructible from a usage total and are reported as zero rather than invented.
+ * Parameter typed structurally, not as UsageStats: aggregateUsage has no contextTokens. */
+export function toUsage(stats: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }): Usage {
+	return {
+		input: stats.input,
+		output: stats.output,
+		cacheRead: stats.cacheRead,
+		cacheWrite: stats.cacheWrite,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: stats.cost },
+	};
 }
 
 export const TOOL_RESULT_META_KEY = "__piSubagents";

@@ -12,7 +12,7 @@ import {
 	withinToolCeiling,
 } from "./nested-runtime.ts";
 import { renderSubagentCall, renderSubagentResult } from "./render.ts";
-import { finalizeToolResult, getFinalOutput, getResultOutput, isFailedResult, isRunningResult, type SingleResult, type SubagentDetails, type ToolResultDraft } from "./results.ts";
+import { aggregateUsage, finalizeToolResult, getFinalOutput, getResultOutput, isFailedResult, isRunningResult, toUsage, type SingleResult, type SubagentDetails, type ToolResultDraft } from "./results.ts";
 import { type DispatchDefaults, mapWithConcurrencyLimit, type OnUpdateCallback, runSingleAgent } from "./run-agent.ts";
 import { type AsyncRun, asyncRuns, describeAsyncRun, newRunId, type RetainedRun, retainedRuns, runsInFlight, truncateForListing } from "./runs.ts";
 import { buildGuidelines, makeNestedSubagentParams, makeSubagentParams } from "./schema.ts";
@@ -549,11 +549,14 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 					content: [
 						{
 							type: "text",
-							text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}`,
+							text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}${
+								runtime ? `\n\nRan ${results.length} nested probe${results.length === 1 ? "" : "s"}.` : ""
+							}`,
 						},
 					],
 					details: makeDetails("parallel")(results),
 					failed: successCount !== results.length,
+					...(runtime ? { usage: toUsage(aggregateUsage(results)) } : {}),
 				};
 			}
 
@@ -758,14 +761,16 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 						failed: true,
 					};
 				}
+				const results = [result];
 				return {
 					content: [
 						{
 							type: "text",
-							text: `${getResultOutput(result)}${result.runId ? `\n\n(run ${result.runId})` : ""}`,
+							text: `${getResultOutput(result)}${runtime ? `\n\nRan ${results.length} nested probe${results.length === 1 ? "" : "s"}.` : ""}${result.runId ? `\n\n(run ${result.runId})` : ""}`,
 						},
 					],
-					details: makeDetails("single")([result]),
+					details: makeDetails("single")(results),
+					...(runtime ? { usage: toUsage(aggregateUsage(results)) } : {}),
 				};
 			}
 

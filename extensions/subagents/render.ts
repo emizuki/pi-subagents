@@ -2,7 +2,7 @@ import { getMarkdownTheme, type ToolDefinition } from "@earendil-works/pi-coding
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import type { AgentScope } from "./agents.ts";
 import { formatToolCall, formatUsageStats } from "./format.ts";
-import { type DisplayItem, getDisplayItems, getFailureText, getFinalOutput, isFailedResult, isRunningResult, type SingleResult, type SubagentDetails, type SubagentToolDetails } from "./results.ts";
+import { aggregateUsage, type DisplayItem, getDisplayItems, getFailureText, getFinalOutput, isFailedResult, isRunningResult, type SingleResult, type SubagentDetails, type SubagentToolDetails } from "./results.ts";
 import type { makeSubagentParams } from "./schema.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
@@ -146,19 +146,6 @@ export const renderSubagentResult: NonNullable<SubagentTool["renderResult"]> = (
 		if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
 		return new Text(text, 0, 0);
 	}
-
-	const aggregateUsage = (results: SingleResult[]) => {
-		const total = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
-		for (const r of results) {
-			total.input += r.usage.input;
-			total.output += r.usage.output;
-			total.cacheRead += r.usage.cacheRead;
-			total.cacheWrite += r.usage.cacheWrite;
-			total.cost += r.usage.cost;
-			total.turns += r.usage.turns;
-		}
-		return total;
-	};
 
 	if (details.mode === "chain") {
 		const successCount = details.results.filter((r) => !isFailedResult(r)).length;

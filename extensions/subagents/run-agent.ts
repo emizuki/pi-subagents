@@ -467,6 +467,17 @@ export async function runSingleAgent(
 						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
 						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
 					}
+					// A nested subagent's tokens are spent in a process this one never sees; they arrive
+					// here, on the coordinator's own tool result. Only the subagent tool rolls up —
+					// counting every tool's usage would change the number reported for the many agents
+					// that never delegate.
+					if (msg.role === "toolResult" && msg.toolName === "subagent" && msg.usage) {
+						currentResult.usage.input += msg.usage.input || 0;
+						currentResult.usage.output += msg.usage.output || 0;
+						currentResult.usage.cacheRead += msg.usage.cacheRead || 0;
+						currentResult.usage.cacheWrite += msg.usage.cacheWrite || 0;
+						currentResult.usage.cost += msg.usage.cost?.total || 0;
+					}
 					emitUpdate();
 				}
 
