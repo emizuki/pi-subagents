@@ -13,8 +13,9 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { currentDepth, MAX_SUBAGENT_DEPTH } from "./depth.ts";
+import { currentDepth } from "./depth.ts";
 import { registerSubagentTool } from "./dispatch.ts";
+import { readNestedRuntime } from "./nested-runtime.ts";
 import { toolResultMetadata } from "./results.ts";
 import { asyncRuns, abortAllAsyncRuns, clearRetainedRuns, sweepStaleTempDirs } from "./runs.ts";
 import { registerContactSupervisorTool, SUPERVISOR_TOOL } from "./supervisor.ts";
@@ -27,14 +28,19 @@ export default function (pi: ExtensionAPI) {
 		if (toolResultMetadata(event.details)?.failed) return { isError: true };
 	});
 
-	// Inside a spawned child the tool to offer is the one pointing back up, not the one pointing
-	// further down: delegation stops at one level, but asking the operator does not.
+	// Depth decides which direction the tool points; the envelope only decides whether a depth-1
+	// child may also point downward. A depth-2 process never reads the envelope at all, so a
+	// forged one cannot manufacture a third level.
 	const register = (ctx: ExtensionContext) => {
-		if (currentDepth() >= MAX_SUBAGENT_DEPTH) {
-			registerContactSupervisorTool(pi);
+		const depth = currentDepth();
+		if (depth > 0) registerContactSupervisorTool(pi);
+		if (depth === 0) {
+			registerSubagentTool(pi, ctx);
 			return;
 		}
-		registerSubagentTool(pi, ctx);
+		if (depth > 1) return;
+		const runtime = readNestedRuntime();
+		if (runtime && runtime.allowedAgents.length > 0) registerSubagentTool(pi, ctx, runtime);
 	};
 	// The model enum is baked into the tool schema, so rebuild it whenever the catalogue behind it
 	// can change: session start (also fires for /new, /resume and /fork) and model selection.

@@ -4,6 +4,7 @@ import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionContext, getAgentDir 
 import { describeAgent, findAgent, isRepoControlledAgent, repoControlledSource } from "./agent-select.ts";
 import { type AgentScope, discoverAgents } from "./agents.ts";
 import { modelChoices, modelKey, splitModelKey } from "./models.ts";
+import type { NestedRuntimeV1 } from "./nested-runtime.ts";
 import { renderSubagentCall, renderSubagentResult } from "./render.ts";
 import { finalizeToolResult, getFinalOutput, getResultOutput, isFailedResult, isRunningResult, type SingleResult, type SubagentDetails, type ToolResultDraft } from "./results.ts";
 import { type DispatchDefaults, mapWithConcurrencyLimit, type OnUpdateCallback, runSingleAgent } from "./run-agent.ts";
@@ -11,7 +12,10 @@ import { type AsyncRun, asyncRuns, describeAsyncRun, newRunId, type RetainedRun,
 import { buildGuidelines, makeSubagentParams } from "./schema.ts";
 import { readSubagentSettings, trustedProjectSettings } from "./settings.ts";
 
-export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext) {
+export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, runtime?: NestedRuntimeV1) {
+	// `runtime` is accepted here and consumed in Task 6, which narrows the schema and intersects
+	// the model enum. Registration must gate on it before the schema can depend on it.
+	void runtime;
 	const current = ctx.model ? modelKey(ctx.model) : undefined;
 	const choices = modelChoices(ctx);
 	const discoveryOptions = { projectTrusted: ctx.isProjectTrusted() };
