@@ -1,6 +1,6 @@
 {
   "name": "@emizuki/pi-subagents",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Delegate tasks to subagents with isolated context, choosing the model and thinking level per call.",
   "keywords": [
     "pi-package"
@@ -10,6 +10,7 @@
     "extensions",
     "agents",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "repository": {
