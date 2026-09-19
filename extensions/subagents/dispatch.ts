@@ -66,6 +66,16 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
+		// Pi runs a turn's tool calls in parallel unless some tool in that batch is marked sequential
+		// (pi-agent-core's agent-loop: hasSequentialToolCall). maxNestedConcurrency is enforced inside
+		// this tool's own execute(), so without this, several simultaneous single-probe calls in one
+		// assistant turn each see the concurrency budget independently — a coordinator emitting four
+		// single calls gets four live probes under maxNestedConcurrency: 2, because each execute() only
+		// ever sees itself. Forcing the coordinator's tool sequential makes maxNestedConcurrency a real
+		// per-turn ceiling instead of a per-call one; a single parallel dispatch already serializes
+		// itself internally via mapWithConcurrencyLimit and is unaffected. Scoped to the coordinator
+		// only: depth 0 has no nested budget to protect, and this must leave it byte-identical.
+		...(runtime ? { executionMode: "sequential" as const } : {}),
 		description: runtime
 			? [
 					"Delegate a bounded verification probe to a leaf subagent.",

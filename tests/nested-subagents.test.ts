@@ -1349,6 +1349,39 @@ test("depth 2 refuses the very envelope depth 1 accepts", () => {
 	assert.ok(!registerAt("2", gateEnvelope).has("subagent"));
 });
 
+test("a coordinator's tool registers executionMode: sequential; depth 0 stays unset", async () => {
+	// Pi's default is parallel tool execution, and the concurrency budget is enforced inside each
+	// execute() call. Without executionMode: "sequential" on the coordinator's own tool, four
+	// simultaneous single-probe calls each see maxNestedConcurrency independently, so the model can
+	// get N times the intended ceiling by fanning the calls out across one assistant turn instead of
+	// putting them in one parallel dispatch. Depth 0 has no coordinator budget to protect and must
+	// stay byte-identical.
+	const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+	const previousRuntime = process.env[RUNTIME_ENV_VAR];
+	try {
+		delete process.env.PI_SUBAGENT_DEPTH;
+		delete process.env[RUNTIME_ENV_VAR];
+		const rootHarness = new NestedHarness();
+		await rootHarness.register(makeContext());
+		const rootTool = rootHarness.tools.get("subagent") as { executionMode?: string } | undefined;
+		assert.ok(rootTool, "depth 0 must still register the subagent tool");
+		assert.equal(rootTool.executionMode, undefined, "depth 0 registration must stay byte-identical: no executionMode");
+
+		process.env.PI_SUBAGENT_DEPTH = "1";
+		process.env[RUNTIME_ENV_VAR] = nestedGuardRuntime;
+		const coordinatorHarness = new NestedHarness();
+		await coordinatorHarness.register(makeContext());
+		const coordinatorTool = coordinatorHarness.tools.get("subagent") as { executionMode?: string } | undefined;
+		assert.ok(coordinatorTool, "a coordinator with a valid envelope must register the subagent tool");
+		assert.equal(coordinatorTool.executionMode, "sequential");
+	} finally {
+		if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+		else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+		if (previousRuntime === undefined) delete process.env[RUNTIME_ENV_VAR];
+		else process.env[RUNTIME_ENV_VAR] = previousRuntime;
+	}
+});
+
 test("an envelope with no allowed agents registers no subagent tool", () => {
 	const empty = encodeNestedRuntime({
 		version: 1,
