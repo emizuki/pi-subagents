@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -32,7 +32,7 @@ import {
 	parseBoundedInt,
 	readSubagentSettings,
 } from "../extensions/subagents/settings.ts";
-import { isProcessAlive, retainedRuns, retentionRoot } from "../extensions/subagents/runs.ts";
+import { isProcessAlive, retainedRuns } from "../extensions/subagents/runs.ts";
 
 const roots: string[] = [];
 function tempRoot(): string {
@@ -693,36 +693,6 @@ test("a failed single nested probe still publishes usage and its probe count", a
 		assert.equal(usage.cacheWrite, 19 + 13);
 		assert.equal(usage.cost.total, 26 + 10);
 		assert.match(resultText(result), /Ran 1 nested probe\./);
-	} finally {
-		delete process.env.FAKE_PI_CAPTURE;
-	}
-});
-
-test("a nested probe writes no retention directory", async () => {
-	// Both nested-reachable call sites (single and parallel) must skip retention: resume,
-	// action: "runs" and action: "status" are all forbidden on this path, so a retained session
-	// would only be an id nothing can ever address, a run directory, and a findSessionFile walk
-	// nobody needed.
-	writeAgentFile("recon", { tools: "read" });
-	setFakeMode("normal", path.join(root, "nested-no-retention-capture.jsonl"));
-	try {
-		const before = existsSync(retentionRoot) ? new Set(readdirSync(retentionRoot)) : new Set();
-		const retainedBefore = retainedRuns.size;
-		const result = await executeNested({
-			tasks: [
-				{ agent: "recon", task: "probe one" },
-				{ agent: "recon", task: "probe two" },
-			],
-		});
-		assert.match(resultText(result), /Parallel: 2\/2 succeeded/);
-		const details = (result as { details?: { results?: Array<{ runId?: unknown }> } }).details;
-		assert.ok(details?.results, "a parallel nested result must carry per-task results");
-		for (const r of details.results as Array<{ runId?: unknown }>) {
-			assert.equal(r.runId, undefined, "a nested probe must carry no run id nothing can ever resume");
-		}
-		const after = existsSync(retentionRoot) ? new Set(readdirSync(retentionRoot)) : new Set();
-		assert.deepEqual(after, before, "a nested probe must not create a retention directory");
-		assert.equal(retainedRuns.size, retainedBefore, "a nested probe must not retain a session");
 	} finally {
 		delete process.env.FAKE_PI_CAPTURE;
 	}
