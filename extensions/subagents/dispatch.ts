@@ -542,7 +542,11 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 							context: t.context ?? params.context,
 						},
 						undefined,
-						{ id: newRunId() },
+						// A nested probe resolves to an id nothing can ever address: resume, action: "runs"
+						// and action: "status" are all forbidden on this path, so retaining a session here
+						// would only pay for a run directory, a findSessionFile walk and a transcript nobody
+						// can reach.
+						runtime ? undefined : { id: newRunId() },
 						signal,
 						// Per-task update callback
 						(partial) => {
@@ -770,7 +774,10 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 					resumeTarget ? resumeTarget.cwd : params.cwd,
 					{ model: params.model, thinking: params.thinking, context: params.context },
 					undefined,
-					{ id: singleRunId, resume: resumeTarget },
+					// Same reasoning as the parallel branch above: resume is forbidden on the nested path,
+					// so resumeTarget is always undefined here too, and retaining would only leak a
+					// session nothing can address.
+					runtime ? undefined : { id: singleRunId, resume: resumeTarget },
 					signal,
 					onUpdate,
 					makeDetails("single"),
