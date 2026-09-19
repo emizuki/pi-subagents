@@ -360,6 +360,12 @@ concurrency cap — **1 + 4 + 8 = 13 concurrent `pi` processes**, up from 5 with
 feature ships enabled by default, so that multiplier is worth knowing before raising either
 fan-out limit or either nested limit.
 
+That 13 is the ceiling for **one** `subagent` tool call, not for the session. A coordinator's tool
+registers `executionMode: "sequential"`, so its own probes cannot multiply across simultaneous
+calls; the root's tool deliberately does not, preserving existing behaviour. A model that emits
+several root `subagent` calls in one turn therefore gets a separate fan-out budget for each, and
+the true process ceiling is correspondingly higher. Neither limit is a global semaphore.
+
 Authority is pinned at first launch, not at any launch. A run first launched while
 `maxNestedSpawns` was `0` stores no contract, so re-enabling nesting later never grants it
 delegation on resume — only a fresh launch can.
