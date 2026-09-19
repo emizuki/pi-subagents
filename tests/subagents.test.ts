@@ -613,6 +613,16 @@ test("default settings keep at most four children running at once", async () => 
 		await harness.refresh(ctx);
 		const result = await harness.execute({ tasks: parallelTasks(6, "default concurrency") }, ctx);
 		assert.equal(result.details.results.length, 6);
+		// Root-side guard rail for dispatch.ts's parallel per-task summary: this output is far under
+		// the truncation threshold, so the per-task " run <id>" mention is the only thing that can put
+		// each task's run id into the text -- resumableRunSummary never runs without truncation.
+		for (const r of result.details.results) {
+			assert.match(
+				resultText(result),
+				new RegExp(r.runId),
+				"each parallel task's run id must appear, so a root caller can resume any one of them",
+			);
+		}
 		const peak = peakConcurrency(probe);
 		assert.ok(peak > 1, `expected parallel execution, saw peak ${peak}`);
 		assert.ok(peak <= 4, `expected the default cap to hold, saw peak ${peak}`);
@@ -1102,6 +1112,14 @@ test("final output includes every text block from the last assistant message", a
 	await harness.refresh(ctx);
 	const result = await harness.execute({ agent: "general-purpose", task: "multi" }, ctx);
 	assert.match(resultText(result), /^firstsecond/);
+	// Root-side guard rail for dispatch.ts's single-success run-id suffix: unlike the nested case,
+	// a root caller needs this id to resume the child, and this output is short enough that it is
+	// not truncated -- so, unlike the byte-limit test below, nothing but this suffix can supply it.
+	assert.match(
+		resultText(result),
+		new RegExp(result.details.results[0].runId),
+		"a non-truncated single dispatch must still show its run id, so a root caller can resume it",
+	);
 });
 
 test("an empty final assistant message does not resurrect stale output", async () => {
