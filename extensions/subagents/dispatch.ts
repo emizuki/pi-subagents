@@ -15,7 +15,7 @@ import { renderSubagentCall, renderSubagentResult } from "./render.ts";
 import { aggregateUsage, finalizeToolResult, getFinalOutput, getResultOutput, isFailedResult, isRunningResult, toUsage, type SingleResult, type SubagentDetails, type ToolResultDraft } from "./results.ts";
 import { type DispatchDefaults, mapWithConcurrencyLimit, type OnUpdateCallback, runSingleAgent } from "./run-agent.ts";
 import { type AsyncRun, asyncRuns, describeAsyncRun, newRunId, type RetainedRun, retainedRuns, runsInFlight, truncateForListing } from "./runs.ts";
-import { buildGuidelines, makeNestedSubagentParams, makeSubagentParams } from "./schema.ts";
+import { buildGuidelines, makeNestedSubagentParams, makeSubagentParams, NESTED_FORBIDDEN_KEYS } from "./schema.ts";
 import { readSubagentSettings, trustedProjectSettings } from "./settings.ts";
 
 /**
@@ -47,12 +47,17 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 	if (runtime && !nestedRegistrationAllowed({ localChoices, ceiling: runtime.modelCeiling })) return;
 	const discoveryOptions = { projectTrusted: runtime ? false : ctx.isProjectTrusted() };
 	const agents = discoverAgents(ctx.cwd, "user", discoveryOptions).agents;
-	// Declared wide, registered narrow. Pi validates against what it was handed, so on the nested
-	// path the extra keys are always undefined at runtime — which is precisely what Step 5's
-	// defence-in-depth guard already assumes. Without this pin, the shared execute body that reads
-	// params.action and friends cannot typecheck against the narrowed schema. The direct cast is
+	// Declared wide, registered narrow — but that narrowing is cosmetic, not a security boundary.
+	// Pi's Value.Check validates against the schema it is handed, but does not strip unknown
+	// properties (Type.Object here sets no additionalProperties: false), so a call carrying a key
+	// the narrow schema omits still reaches `execute` with that key intact at runtime. The
+	// NESTED_FORBIDDEN_KEYS check below — not this schema, and not this cast — is the sole control
+	// rejecting it; treat that check as load-bearing and this cast as having no security role. The
+	// cast itself exists only so the shared execute body — written once for both schemas and
+	// reading params.action and friends — can typecheck against a single parameter type. It is
 	// intentionally structurally unchecked: TypeBox's opaque TSchema cannot prove nested-schema
-	// shape compatibility, so this pins only the shared execute parameter type, not the schema shape.
+	// shape compatibility, so this pins only the shared execute parameter type, never the schema
+	// shape, and never which keys an incoming call actually carries.
 	const SubagentParams = (
 		runtime ? makeNestedSubagentParams(choices, current) : makeSubagentParams(choices, current)
 	) as ReturnType<typeof makeSubagentParams>;
@@ -134,11 +139,15 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 			const agents = discovery.agents;
 
 			if (runtime) {
-				const forbidden = ["chain", "async", "action", "id", "resume", "agentScope", "confirmProjectAgents", "cwd"] as const;
-				const used = forbidden.filter((key) => (params as Record<string, unknown>)[key] !== undefined);
+				// NESTED_FORBIDDEN_KEYS is derived from the schema difference (schema.ts), not
+				// hand-copied here: a key added to makeSubagentParams alone joins this set with no
+				// second list to remember, closing the gap where a future field `execute` honours could
+				// otherwise reach a coordinator silently. The schema test ties this exact set to its
+				// documented values, for the human-review trip wire that derivation alone cannot give.
+				const used = NESTED_FORBIDDEN_KEYS.filter((key) => (params as Record<string, unknown>)[key] !== undefined);
 				for (const task of params.tasks ?? []) {
 					const taskParams = task as Record<string, unknown>;
-					for (const key of forbidden) {
+					for (const key of NESTED_FORBIDDEN_KEYS) {
 						if (taskParams[key] !== undefined && !used.includes(key)) used.push(key);
 					}
 				}

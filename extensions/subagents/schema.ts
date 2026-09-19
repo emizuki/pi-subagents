@@ -142,3 +142,16 @@ export function makeNestedSubagentParams(choices: ModelLike[], current: string |
 		context,
 	});
 }
+
+/**
+ * Keys the wide, coordinator-facing root schema declares that the nested schema omits — the
+ * complete set a nested call must never carry. Derived from the two schemas themselves rather
+ * than hand-copied: a key added to `makeSubagentParams` alone (a future `timeout`, `env`,
+ * `sandboxRoot`) joins this set automatically, with no second list to remember to update and no
+ * window where it is silently reachable from a coordinator. `[]` and `undefined` are enough for
+ * both calls below: only property *names* are read here, and neither builder's top-level key set
+ * depends on `choices` or `current`.
+ */
+export const NESTED_FORBIDDEN_KEYS: string[] = Object.keys(makeSubagentParams([], undefined).properties).filter(
+	(key) => !(key in makeNestedSubagentParams([], undefined).properties),
+);
