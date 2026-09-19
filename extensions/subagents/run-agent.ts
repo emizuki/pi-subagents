@@ -413,9 +413,11 @@ export async function runSingleAgent(
 					// Cleared for everyone who is not an authorized coordinator. A grandchild inheriting
 					// its parent's envelope is precisely how depth 2 would become depth 3.
 					[RUNTIME_ENV_VAR]: envelope,
-					// An owner guard only for processes inside a coordinator subtree. Ordinary children
-					// keep today's behaviour, including surviving a root crash.
-					...(envelope || currentDepth() > 0 ? { [OWNER_PID_ENV_VAR]: String(process.pid) } : {}),
+					// An owner guard only for processes inside a coordinator subtree. Explicitly cleared
+					// otherwise, like its two siblings above: an inherited stale value here is worse than
+					// theirs, since startOwnerGuard treats a dead owner as process.exit(0) — a silent
+					// success with truncated output — rather than merely losing a channel nobody polls.
+					[OWNER_PID_ENV_VAR]: envelope || currentDepth() > 0 ? String(process.pid) : "",
 				},
 			});
 			if (ipcDir && dispatchDefaults.supervise) {

@@ -2046,7 +2046,11 @@ test("an ordinary depth-1 child gets no envelope and no owner pid", async () => 
 		const seen = capturedEnvironment(capture)[0];
 		assert.equal(seen.depth, "1");
 		assert.equal(seen.runtime, "", "the envelope must be explicitly cleared, not merely absent");
-		assert.equal(seen.owner, null, "an ordinary child is not owned and survives a root crash today");
+		assert.equal(
+			seen.owner,
+			"",
+			"an ordinary child is not owned and survives a root crash today, and the owner pid must be explicitly cleared like its two siblings, not merely absent",
+		);
 		assert.equal(seen.agent, "general-purpose");
 		const args = capturedArgs(argvCapture)[0];
 		assert.equal(optionValue(args, "--tools"), undefined);
@@ -2056,6 +2060,30 @@ test("an ordinary depth-1 child gets no envelope and no owner pid", async () => 
 		delete process.env.FAKE_PI_ENV_CAPTURE;
 		if (previousRuntime === undefined) delete process.env[RUNTIME_ENV_VAR];
 		else process.env[RUNTIME_ENV_VAR] = previousRuntime;
+	}
+});
+
+test("a stale owner pid in this process's own environment is not passed to an ordinary child", async () => {
+	const capture = path.join(root, "stale-owner-env.jsonl");
+	const argvCapture = path.join(root, "stale-owner-argv.jsonl");
+	const previousOwner = process.env[OWNER_PID_ENV_VAR];
+	// A value naming no process this test ever starts: the point is only that it must not survive
+	// the `...process.env` spread into an ordinary child's own environment, not that it is live.
+	process.env[OWNER_PID_ENV_VAR] = "999999";
+	process.env.FAKE_PI_ENV_CAPTURE = capture;
+	setFakeMode("normal", argvCapture);
+	try {
+		await runSubagent({ agent: "general-purpose", task: "anything" });
+		const seen = capturedEnvironment(capture)[0];
+		assert.equal(
+			seen.owner,
+			"",
+			"an ordinary child must not inherit a stale owner pid from this process's own environment",
+		);
+	} finally {
+		delete process.env.FAKE_PI_ENV_CAPTURE;
+		if (previousOwner === undefined) delete process.env[OWNER_PID_ENV_VAR];
+		else process.env[OWNER_PID_ENV_VAR] = previousOwner;
 	}
 });
 
@@ -2231,7 +2259,7 @@ test("maxNestedSpawns: 0 emits no envelope at all", async () => {
 		await runSubagent({ agent: "reviewer", task: "review this" });
 		const seen = capturedEnvironment(capture)[0];
 		assert.equal(seen.runtime, "");
-		assert.equal(seen.owner, null, "with nesting off there is no coordinator subtree to own");
+		assert.equal(seen.owner, "", "with nesting off there is no coordinator subtree to own");
 	} finally {
 		clearUserSettings();
 		delete process.env.FAKE_PI_ENV_CAPTURE;
