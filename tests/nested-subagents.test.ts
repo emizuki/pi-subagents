@@ -32,7 +32,7 @@ import {
 	parseBoundedInt,
 	readSubagentSettings,
 } from "../extensions/subagents/settings.ts";
-import { isProcessAlive, retainedRuns } from "../extensions/subagents/runs.ts";
+import { isProcessAlive, retainedRuns, retentionRoot } from "../extensions/subagents/runs.ts";
 
 const roots: string[] = [];
 function tempRoot(): string {
@@ -1796,6 +1796,50 @@ test("a forbidden nested call consumes no budget", async () => {
 		assert.match(resultText(await executeNested({ agent: "recon", task: "probe" }, runtime)), /ok/);
 		assert.equal(spawnCount(capture), 1, "the forbidden call must not reach spawn");
 	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
+test("an explicit context: \"fork\" on the nested path forks and retains under the /tmp retention root", async () => {
+	// --fork and --session-dir are both pushed only inside runSingleAgent's `else if (retain)`
+	// branch, so a nested-path change that skips retention (to stop retaining an unaddressable
+	// session, say) silently drops forking too, with no error and no signal anything changed. This
+	// pins both together so that regression cannot come back unnoticed.
+	writeAgentFile("recon", { tools: "read" });
+	const project = path.join(root, "fork-nested-project");
+	mkdirSync(project, { recursive: true });
+	const sessionFile = path.join(project, "parent-session.jsonl");
+	writeFileSync(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: "parent" })}\n`);
+	const coordinatorContext = makeContext(project);
+	const contextValue = coordinatorContext as unknown as TestContext;
+	contextValue.sessionManager = { getSessionFile: () => sessionFile };
+	const capture = path.join(root, "fork-nested-capture.jsonl");
+	const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+	const previousRuntime = process.env[RUNTIME_ENV_VAR];
+	process.env.PI_SUBAGENT_DEPTH = "1";
+	process.env[RUNTIME_ENV_VAR] = nestedGuardRuntime;
+	setFakeMode("normal", capture);
+	try {
+		await harness.refresh(coordinatorContext);
+		const result = await harness.execute({ agent: "recon", task: "probe", context: "fork" }, coordinatorContext);
+		assert.match(resultText(result), /ok/);
+		const args = capturedArgs(capture)[0];
+		assert.ok(args.includes("--fork"), 'an explicit context: "fork" must still fork on the nested path');
+		const forkSource = optionValue(args, "--fork");
+		const sessionDir = optionValue(args, "--session-dir");
+		assert.ok(
+			forkSource?.startsWith(retentionRoot),
+			"the fork source must live under this process's /tmp retention root, never the operator's session directory",
+		);
+		assert.ok(
+			sessionDir?.startsWith(retentionRoot),
+			"the probe's session directory must live under /tmp, not fall through to pi's default session store",
+		);
+	} finally {
+		if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+		else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+		if (previousRuntime === undefined) delete process.env[RUNTIME_ENV_VAR];
+		else process.env[RUNTIME_ENV_VAR] = previousRuntime;
 		delete process.env.FAKE_PI_CAPTURE;
 	}
 });
