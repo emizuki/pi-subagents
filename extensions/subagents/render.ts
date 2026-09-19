@@ -198,6 +198,8 @@ export const renderSubagentResult: NonNullable<SubagentTool["renderResult"]> = (
 						0,
 					),
 				);
+				const stepNotes = renderOutputNotes(r);
+				if (stepNotes) container.addChild(new Text(stepNotes, 0, 0));
 				container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
 				if (rFailure) container.addChild(new Text(theme.fg("error", `Error: ${rFailure}`), 0, 0));
 
@@ -246,6 +248,8 @@ export const renderSubagentResult: NonNullable<SubagentTool["renderResult"]> = (
 					: theme.fg("success", "✓");
 			const displayItems = getDisplayItems(r.messages);
 			text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
+			const stepNotes = renderOutputNotes(r);
+			if (stepNotes) text += `\n${stepNotes}`;
 			const stepFailure = getFailureText(r);
 			if (stepFailure) text += `\n${theme.fg("error", `Error: ${stepFailure}`)}`;
 			else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;

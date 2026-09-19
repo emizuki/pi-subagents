@@ -2391,6 +2391,23 @@ test("a coordinator whose allowlist resolves empty launches as an ordinary child
 	}
 });
 
+// D2 (model half): the chain success path used to read getFinalOutput(messages) directly instead
+// of getResultOutput(result), so a successful last step's outputNotes never reached the model —
+// unlike the chain failure path a few lines above it, and unlike single/parallel success.
+test("a chain's final success text carries the last step's delegation notes", async () => {
+	writeAgentFile("lonely", { allowNestedSubagents: true, allowedSubagents: "nobody", tools: "read" });
+	const argvCapture = path.join(root, "chain-notes-argv.jsonl");
+	setFakeMode("normal", argvCapture);
+	try {
+		const result = await runSubagent({ chain: [{ agent: "lonely", task: "go" }] });
+		const output = resultText(result);
+		assert.match(output, /\[Nested delegation notes\]/, "the chain's success text must carry the last step's delegation notes");
+		assert.match(output, /nothing survived, running as an ordinary agent/);
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
 test("a failed child's delegation note does not hide its own output", async () => {
 	writeAgentFile("lonely", { allowNestedSubagents: true, allowedSubagents: "nobody", tools: "read" });
 	const capture = path.join(root, "failed-note-capture.jsonl");

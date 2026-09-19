@@ -478,11 +478,18 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 					.map((r) => (r.runId ? `step ${r.step}: run ${r.runId} (${r.agent})` : undefined))
 					.filter(Boolean)
 					.join("\n");
+				// getResultOutput, not getFinalOutput: the loop above returns above on the first
+				// isFailedResult(result), so by the time execution reaches here every pushed result --
+				// including this last one -- was already confirmed not failed. getResultOutput's
+				// `errorMessage || stderr` failure-precedence branch is therefore unreachable at this call
+				// site; the only behavioural change from the swap is that outputNotes (dropped-delegation
+				// diagnostics) are appended, matching the chain failure path above and the single/parallel
+				// success paths elsewhere in this function.
 				return {
 					content: [
 						{
 							type: "text",
-							text: `${getFinalOutput(results[results.length - 1].messages) || "(no output)"}${chainIds ? `\n\nResumable runs:\n${chainIds}` : ""}`,
+							text: `${getResultOutput(results[results.length - 1])}${chainIds ? `\n\nResumable runs:\n${chainIds}` : ""}`,
 						},
 					],
 					details: makeDetails("chain")(results),

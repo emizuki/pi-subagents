@@ -93,3 +93,23 @@ test("a parallel result with no delegation notes renders with no warning marker"
 	const component = renderSubagentResult(toolResult(details), collapsed, fakeTheme(), unusedContext);
 	assert.doesNotMatch(renderText(component), /⚠|<warning>/);
 });
+
+test("a delegation drop note renders in the warning colour on a collapsed chain result", () => {
+	const r = singleResult({ agent: "lonely", step: 1, outputNotes: ["Nested delegation: nothing survived, running as an ordinary agent."] });
+	const details: SubagentDetails = { mode: "chain", agentScope: "user", projectAgentsDir: null, results: [r] };
+	const component = renderSubagentResult(toolResult(details), collapsed, fakeTheme(), unusedContext);
+	assert.match(
+		renderText(component),
+		/<warning>⚠ Nested delegation: nothing survived, running as an ordinary agent\.<\/warning>/,
+	);
+});
+
+test("a delegation drop note renders in the warning colour on an expanded chain result", () => {
+	const r = singleResult({ agent: "lonely", step: 1, outputNotes: ["Nested delegation: nothing survived, running as an ordinary agent."] });
+	const details: SubagentDetails = { mode: "chain", agentScope: "user", projectAgentsDir: null, results: [r] };
+	const component = renderSubagentResult(toolResult(details), expanded, fakeTheme(), unusedContext);
+	assert.match(
+		renderText(component),
+		/<warning>⚠ Nested delegation: nothing survived, running as an ordinary agent\.<\/warning>/,
+	);
+});
