@@ -347,8 +347,10 @@ launch, so edits after root validation cannot widen the run.
 
 A user-installed package that declares an agent with the same name as a delegate — the builtin
 `recon`, say — takes precedence over it: agent discovery resolves builtins first and package
-agents after, so the package's file wins outright. The coordinator's tool description names the
-provenance of any non-builtin delegate for exactly this reason; a builtin needs no such note.
+agents after, so the package's file wins outright. A plain file under the user's own agent
+directory takes precedence over both, for the same reason — it is resolved last of all. The
+coordinator's tool description names the provenance of any non-builtin delegate for exactly this
+reason; a builtin needs no such note.
 
 The two nested settings live under `subagents` in user settings. `maxNestedSpawns` accepts an
 integer from `0` through `16`, defaults to `4`, and `0` disables nesting entirely.
