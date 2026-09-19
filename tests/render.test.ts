@@ -71,6 +71,22 @@ test("a successful single result with no delegation notes renders with no warnin
 	assert.doesNotMatch(renderText(component), /⚠|<warning>/);
 });
 
+test("a delegation drop note renders in the warning colour on an expanded parallel result", () => {
+	const dropped = singleResult({
+		agent: "reviewer",
+		outputNotes: [`Nested delegation: dropped "recon" — model not found.`],
+	});
+	const clean = singleResult({ agent: "general-purpose" });
+	const details: SubagentDetails = {
+		mode: "parallel",
+		agentScope: "user",
+		projectAgentsDir: null,
+		results: [dropped, clean],
+	};
+	const component = renderSubagentResult(toolResult(details), expanded, fakeTheme(), unusedContext);
+	assert.match(renderText(component), /<warning>⚠ Nested delegation: dropped "recon" — model not found\.<\/warning>/);
+});
+
 test("a delegation drop note renders in the warning colour on a collapsed parallel result", () => {
 	const dropped = singleResult({
 		agent: "reviewer",
