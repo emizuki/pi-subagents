@@ -144,14 +144,43 @@ export function makeNestedSubagentParams(choices: ModelLike[], current: string |
 }
 
 /**
- * Keys the wide, coordinator-facing root schema declares that the nested schema omits — the
- * complete set a nested call must never carry. Derived from the two schemas themselves rather
- * than hand-copied: a key added to `makeSubagentParams` alone (a future `timeout`, `env`,
- * `sandboxRoot`) joins this set automatically, with no second list to remember to update and no
- * window where it is silently reachable from a coordinator. `[]` and `undefined` are enough for
- * both calls below: only property *names* are read here, and neither builder's top-level key set
- * depends on `choices` or `current`.
+ * The keys of `wide.properties` that `narrow.properties` omits. Shared by both derived sets below
+ * so a top-level comparison and a per-task-item comparison can never be computed two different
+ * ways. Typed structurally rather than against the builders' own TypeBox return types: only
+ * `.properties` and its key names are read here, never a value's shape.
  */
-export const NESTED_FORBIDDEN_KEYS: string[] = Object.keys(makeSubagentParams([], undefined).properties).filter(
-	(key) => !(key in makeNestedSubagentParams([], undefined).properties),
-);
+function forbiddenKeys(
+	wide: { properties: Record<string, unknown> },
+	narrow: { properties: Record<string, unknown> },
+): string[] {
+	return Object.keys(wide.properties).filter((key) => !(key in narrow.properties));
+}
+
+// `[]` and `undefined` are enough for both calls: only property *names* are read below, and
+// neither builder's key set — top level or per task item — depends on `choices` or `current`.
+const wideParams = makeSubagentParams([], undefined);
+const narrowParams = makeNestedSubagentParams([], undefined);
+
+/**
+ * Keys the wide, coordinator-facing root schema declares at the top level that the nested schema
+ * omits — the complete set a nested call must never carry outside `tasks[]`. Derived from the two
+ * schemas themselves rather than hand-copied: a key added to `makeSubagentParams` alone (a future
+ * `timeout`, `env`) joins this set automatically, with no second list to remember to update and no
+ * window where it is silently reachable from a coordinator.
+ *
+ * This reads only the two objects' own `.properties` — a key added solely inside `TaskItem` (a
+ * future `sandboxRoot` on a per-task position, say) does not appear here no matter how closely its
+ * name reads like a top-level control. NESTED_FORBIDDEN_TASK_KEYS below is the same comparison one
+ * level down, for exactly that case; the two sets are independent derivations, not one covering
+ * the other by accident.
+ */
+export const NESTED_FORBIDDEN_KEYS: string[] = forbiddenKeys(wideParams, narrowParams);
+
+/**
+ * The same comparison, one level down: keys the wide `TaskItem` declares that the nested
+ * `TaskItem` omits. `cwd` is the only member today, and it is caught here independently of
+ * NESTED_FORBIDDEN_KEYS finding it too at the top level — remove `cwd` from the wide schema's top
+ * level alone (leaving it on `TaskItem`) and this set still flags it on every task, because this
+ * derivation never consulted the top-level one to begin with.
+ */
+export const NESTED_FORBIDDEN_TASK_KEYS: string[] = forbiddenKeys(wideParams.properties.tasks.items, narrowParams.properties.tasks.items);

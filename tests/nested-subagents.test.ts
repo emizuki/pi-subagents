@@ -22,7 +22,7 @@ import {
 	RUNTIME_ENV_VAR,
 	withinToolCeiling,
 } from "../extensions/subagents/nested-runtime.ts";
-import { makeNestedSubagentParams, NESTED_FORBIDDEN_KEYS } from "../extensions/subagents/schema.ts";
+import { makeNestedSubagentParams, NESTED_FORBIDDEN_KEYS, NESTED_FORBIDDEN_TASK_KEYS } from "../extensions/subagents/schema.ts";
 import { coordinatorSpawnOptions, startOwnerGuard, terminateOwnedTree, windowsTreeKillCommand } from "../extensions/subagents/process-tree.ts";
 import {
 	DEFAULT_MAX_NESTED_CONCURRENCY,
@@ -1516,8 +1516,12 @@ test("the coordinator schema cannot express the modes it must not use", () => {
 		assert.ok(!keys.includes(forbidden), `${forbidden} must be absent from the nested schema`);
 	for (const required of ["agent", "task", "tasks", "model", "thinking", "context"])
 		assert.ok(keys.includes(required), `${required} must remain available`);
-	// A nested task item must not reintroduce cwd through the back door.
-	assert.ok(!Object.keys(params.properties.tasks.items.properties).includes("cwd"));
+	// A nested task item must not reintroduce cwd, or anything else the wide TaskItem declares and
+	// the nested one omits, through the back door. Compare the derived set, not one hand-picked key:
+	// NESTED_FORBIDDEN_KEYS above is a top-level-only comparison and would miss a key added solely
+	// inside TaskItem, however similar its name reads to a top-level control.
+	const expectedForbiddenTaskKeys = ["cwd"];
+	assert.deepEqual([...NESTED_FORBIDDEN_TASK_KEYS].sort(), [...expectedForbiddenTaskKeys].sort());
 	// dispatch.ts's runtime guard imports NESTED_FORBIDDEN_KEYS instead of hand-copying this set a
 	// third time, so the two can never independently drift. This assertion is the trip wire
 	// derivation alone cannot provide: if a key is ever added to makeSubagentParams alone, the

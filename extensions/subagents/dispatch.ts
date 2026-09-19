@@ -15,7 +15,7 @@ import { renderSubagentCall, renderSubagentResult } from "./render.ts";
 import { aggregateUsage, finalizeToolResult, getFinalOutput, getResultOutput, isFailedResult, isRunningResult, toUsage, type SingleResult, type SubagentDetails, type ToolResultDraft } from "./results.ts";
 import { type DispatchDefaults, mapWithConcurrencyLimit, type OnUpdateCallback, runSingleAgent } from "./run-agent.ts";
 import { type AsyncRun, asyncRuns, describeAsyncRun, newRunId, type RetainedRun, retainedRuns, runsInFlight, truncateForListing } from "./runs.ts";
-import { buildGuidelines, makeNestedSubagentParams, makeSubagentParams, NESTED_FORBIDDEN_KEYS } from "./schema.ts";
+import { buildGuidelines, makeNestedSubagentParams, makeSubagentParams, NESTED_FORBIDDEN_KEYS, NESTED_FORBIDDEN_TASK_KEYS } from "./schema.ts";
 import { readSubagentSettings, trustedProjectSettings } from "./settings.ts";
 
 /**
@@ -139,15 +139,17 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 			const agents = discovery.agents;
 
 			if (runtime) {
-				// NESTED_FORBIDDEN_KEYS is derived from the schema difference (schema.ts), not
-				// hand-copied here: a key added to makeSubagentParams alone joins this set with no
-				// second list to remember, closing the gap where a future field `execute` honours could
-				// otherwise reach a coordinator silently. The schema test ties this exact set to its
-				// documented values, for the human-review trip wire that derivation alone cannot give.
+				// NESTED_FORBIDDEN_KEYS and NESTED_FORBIDDEN_TASK_KEYS are derived from the schema
+				// difference (schema.ts), not hand-copied here: a key added to makeSubagentParams alone,
+				// at the top level or only inside its TaskItem, joins the matching set with no second list
+				// to remember, closing the gap where a future field `execute` honours could otherwise
+				// reach a coordinator silently through either position. The schema test ties both exact
+				// sets to their documented values, for the human-review trip wire that derivation alone
+				// cannot give.
 				const used = NESTED_FORBIDDEN_KEYS.filter((key) => (params as Record<string, unknown>)[key] !== undefined);
 				for (const task of params.tasks ?? []) {
 					const taskParams = task as Record<string, unknown>;
-					for (const key of NESTED_FORBIDDEN_KEYS) {
+					for (const key of NESTED_FORBIDDEN_TASK_KEYS) {
 						if (taskParams[key] !== undefined && !used.includes(key)) used.push(key);
 					}
 				}
