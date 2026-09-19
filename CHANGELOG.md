@@ -6,6 +6,32 @@ This project uses [semantic versioning](https://semver.org/). While the version
 is below `1.0.0`, minor releases may contain breaking changes; those are always
 listed first under **Breaking**.
 
+## [0.4.1] - 2026-09-19
+
+Follow-up fixes to the nested delegation shipped in 0.4.0. No breaking changes.
+
+### Fixed
+
+- **Run ids no longer leak into a coordinator's context.** A coordinator cannot
+  use them — `resume`, `action` and `id` are all forbidden on the nested path —
+  so `(run abc12345)` and `Resumable: run …` were noise a live coordinator
+  reported as "unexplained metadata". Root dispatches still show run ids, which
+  is what makes them resumable.
+- **Chain-mode delegation drops are no longer invisible.** The chain success
+  path built its text from the final assistant message, which skipped the
+  delegation notes, and the chain renderer never displayed them — so a dropped
+  delegate was silent in both the model's channel and the operator's. Both
+  halves are fixed.
+- **The coordinator's tool description now names a delegate's provenance.**
+  Agent discovery resolves builtins first, then packages, then user files, with
+  later entries winning, so a user-installed package — or a plain user file —
+  declaring an agent named `recon` silently replaced the builtin. Non-builtin
+  delegates are now named in the description.
+
+### Internal
+
+- Pinned the parallel-expanded delegation-note render, which no test covered.
+
 ## [0.4.0] - 2026-09-19
 
 Bounded nested subagents: an authorized depth-1 coordinator may now delegate
@@ -83,4 +109,5 @@ verification probes to depth-2 leaves. Ships enabled by default for the
 
 Released before this changelog was started; see the git history.
 
+[0.4.1]: https://github.com/emizuki/pi-subagents/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/emizuki/pi-subagents/compare/8c4f3c0...v0.4.0
