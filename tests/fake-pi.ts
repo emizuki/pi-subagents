@@ -13,6 +13,7 @@ export function writeFakePi(binDir: string): string {
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 const args = process.argv.slice(2);
+if (process.env.FAKE_PI_STDERR_TEXT) process.stderr.write(process.env.FAKE_PI_STDERR_TEXT);
 if (process.env.FAKE_PI_CAPTURE) appendFileSync(process.env.FAKE_PI_CAPTURE, JSON.stringify(args) + "\\n");
 if (process.env.FAKE_PI_CWD_CAPTURE) appendFileSync(process.env.FAKE_PI_CWD_CAPTURE, process.cwd() + "\\n");
 if (process.env.FAKE_PI_ENV_CAPTURE) appendFileSync(process.env.FAKE_PI_ENV_CAPTURE, JSON.stringify({

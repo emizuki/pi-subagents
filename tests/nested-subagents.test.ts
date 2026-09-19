@@ -2322,6 +2322,27 @@ test("a failed child's delegation note does not hide its own output", async () =
 	}
 });
 
+test("a failed child's delegation note survives alongside non-empty native stderr", async () => {
+	// getResultOutput's failure precedence is errorMessage || stderr || output: a child that exits
+	// non-zero with real native stderr text picks the stderr branch, not the output branch that
+	// outputNotes was folded into. Folding notes in before that choice (the shape of the bug this
+	// pins) means they are only visible when output itself wins the precedence — exactly the empty-
+	// stderr case the sibling test above covers, and not this one.
+	writeAgentFile("lonely", { allowNestedSubagents: true, allowedSubagents: "nobody", tools: "read" });
+	const capture = path.join(root, "failed-note-stderr-capture.jsonl");
+	setFakeMode("nested-usage-failure", capture);
+	process.env.FAKE_PI_STDERR_TEXT = "native stderr crash text";
+	try {
+		const result = await runSubagent({ agent: "lonely", task: "go" });
+		const output = resultText(result);
+		assert.match(output, /native stderr crash text/, "a failed child's own native stderr must survive alongside the delegation note");
+		assert.match(output, /\[Nested delegation notes\]/, "the delegation note must still be visible next to non-empty stderr");
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+		delete process.env.FAKE_PI_STDERR_TEXT;
+	}
+});
+
 test("a grandchild's environment carries no authority at all", async () => {
 	writeCoordinatorFixtures();
 	const capture = path.join(root, "grandchild-env.jsonl");

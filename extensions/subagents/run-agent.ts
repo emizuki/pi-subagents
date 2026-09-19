@@ -540,11 +540,13 @@ export async function runSingleAgent(
 
 		currentResult.exitCode = exitCode;
 		if (delegationNotes.length > 0) {
-			// appendOutputNotes (results.ts) already folds these into `output`, which
-			// getResultOutput shows whenever a result has no errorMessage and no stderr of its own.
-			// Appending them to stderr too used to outrank that: a child that exits non-zero with
-			// empty native stderr and no errorMessage would then show only this note, discarding
-			// getFinalOutput(messages) — the actual reason it failed.
+			// getResultOutput (results.ts) appends these to whichever text its errorMessage || stderr ||
+			// output precedence picks, on both the success and failure paths, so they survive next to
+			// the real reason a child failed instead of only showing up when that precedence happens to
+			// land on `output`. Appending them to stderr as well used to outrank that same precedence
+			// from this side: a child that exits non-zero with empty native stderr and no errorMessage
+			// would then show only this note, discarding getFinalOutput(messages) — the actual reason it
+			// failed.
 			currentResult.outputNotes = delegationNotes;
 		}
 		if (wasAborted) {

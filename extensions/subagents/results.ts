@@ -248,11 +248,17 @@ function appendOutputNotes(output: string, notes: string[] | undefined): string 
 }
 
 export function getResultOutput(result: SingleResult): string {
-	const output = appendOutputNotes(getFinalOutput(result.messages), result.outputNotes);
+	const output = getFinalOutput(result.messages);
+	// Notes are folded in after the failure precedence picks a primary text, not before: folding
+	// them into `output` first only helped when `output` itself won that precedence. A child that
+	// exits non-zero with a real errorMessage or native stderr would still pick that branch and the
+	// notes appended only to `output` would never be reached, silently dropping them. Appending here
+	// instead means every branch — errorMessage, stderr, and output — carries the notes when there
+	// are any, so they survive from the same source regardless of which one had non-empty text.
 	if (isFailedResult(result)) {
-		return result.errorMessage || result.stderr || output || "(no output)";
+		return appendOutputNotes(result.errorMessage || result.stderr || output, result.outputNotes) || "(no output)";
 	}
-	return output || "(no output)";
+	return appendOutputNotes(output, result.outputNotes) || "(no output)";
 }
 
 /**
