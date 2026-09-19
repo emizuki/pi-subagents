@@ -310,11 +310,22 @@ on session shutdown. Retention is per parent session and does not survive a rest
 A root process starts at depth 0. An ordinary depth-1 child gets the existing supervisor channel
 but no delegation tool. An authorized coordinator is a depth-1 child with a valid runtime
 contract; it may use that contract to make bounded, synchronous probes. Every grandchild is depth
-2 and cannot register `subagent`: depth 2 is a hard ceiling, not a configurable setting. The gate
-uses exact depth and envelope validity, so a malformed, absent, or inherited envelope cannot add a
-third level.
+2 and cannot register `subagent`: depth 2 is a hard ceiling on what the tool will register, not a
+configurable setting. The gate uses exact depth and envelope validity, so a malformed, absent, or
+inherited envelope cannot add a third level.
 
 ## Nested delegation
+
+The depth gate above, the allowlist, the tool and model ceilings, and the spawn budget below are
+enforcement for the `subagent` tool, not a guarantee about the coordinator process. They cover the
+realistic failure modes: model confusion, runaway fan-out, misconfiguration, and prompt injection
+that acts through the tool. They are not a sandbox: a coordinator whose own tools include `bash`
+(or any other way to run a process) can read its depth and runtime envelope out of its environment
+and launch `pi` directly with both rewritten, reaching a real depth 3, a forged budget, or a reset
+spawn counter, none of which consults this gate. That was already true of any agent with shell
+access before this feature existed, and remains true with it. For a coordinator without shell
+access, every bound described here is real enforcement — that is the configuration to choose if
+you need it to hold.
 
 Delegation is opt-in per agent. The shipped `reviewer` is the coordinator example: it may send a
 specific verification lookup to the builtin `recon` agent while keeping the review and its final
