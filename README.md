@@ -340,6 +340,15 @@ integer from `0` through `16`, defaults to `4`, and `0` disables nesting entirel
 project may lower either limit but cannot raise it; user settings are the authority for raising
 them.
 
+Nobody composes these with the parallel fan-out limits above, so here is the number that matters:
+with every default left in place (`maxParallelTasks: 8`, `maxConcurrency: 4`, `maxNestedSpawns: 4`,
+`maxNestedConcurrency: 2`), the worst case is the root process, plus up to 4 depth-1 children
+running at once, plus up to 4 × 2 = 8 depth-2 grandchildren running at once if every one of those
+depth-1 children happens to be a coordinator running its own parallel probes at its own
+concurrency cap — **1 + 4 + 8 = 13 concurrent `pi` processes**, up from 5 without nesting. This
+feature ships enabled by default, so that multiplier is worth knowing before raising either
+fan-out limit or either nested limit.
+
 Authority is pinned at first launch, not at any launch. A run first launched while
 `maxNestedSpawns` was `0` stores no contract, so re-enabling nesting later never grants it
 delegation on resume — only a fresh launch can.
@@ -348,6 +357,15 @@ Coordinators run synchronously: `{ agent: "reviewer", task: "...", async: true }
 its nested tree remains owned by the root call. Leaf agents such as `recon` still support detached
 runs with `async: true`.
 
+A coordinator is spawned with `detached: true` on POSIX, which makes it the leader of a new
+process group and session rather than a member of the root's. Its whole subtree therefore sits
+outside whatever process group or session the root belongs to: a terminal's Ctrl+C, a
+`kill -- -$PGID` aimed at the root's group, or a process manager tearing a job down by process
+group (systemd's `KillMode=control-group`, for example) will not reach it. The owner guard
+described next is what makes that safe — every process in the subtree polls its owner and exits
+on its own once the owner is gone, instead of relying on being reachable through the group or
+session it left.
+
 A nested child exits when the process that owns it disappears, detected by polling. If the owner's
 process id is recycled by the operating system within the lifetime of a run, that check cannot tell
 the difference and the child will not exit on its own. There is no portable fix: a process's start
@@ -355,9 +373,13 @@ time, which would disambiguate, is readable on Linux and not on macOS.
 
 Termination has a narrower version of the same limitation: the escalation that follows an unresponsive
 `SIGTERM` re-checks the process group rather than the coordinator itself, since the coordinator can
-exit while a descendant lingers, so within that grace window a process-group id recycled by the
-operating system could receive the escalation `SIGKILL` instead of the tree it was aimed at; the
-window is negligible on Linux and accepted.
+exit while a descendant lingers. On Linux this is narrower than it sounds: the kernel keeps a
+process-group id allocated, and unavailable for reuse as anyone's pid, for as long as any member of
+that group is still alive, so `kill(-pid, 0)` succeeding during the escalation is itself evidence
+the group is still non-empty — and nothing outside this coordinator's own subtree ever joins that
+group, so a non-empty result is still the original tree, not an unrelated one that happens to share
+the number. The residual window this leaves is narrower than a plain reused-pid risk, and is
+accepted.
 
 ## Frontmatter
 
@@ -548,6 +570,7 @@ ignored until pi reports the project trusted.
 - Agents are rediscovered on each invocation, so they can be edited mid-session.
 - Parallel mode defaults to 8 tasks, 4 concurrent; raise or remove both in user settings.
 - Removing the limits does not remove the depth limit: only an authorized depth-1 coordinator can dispatch nested probes; a grandchild cannot dispatch further.
+- `maxNestedSpawns` counts nested probes inside one coordinator process, not across a logical unit of work: `resume` launches a new process with a fresh counter, so dispatching `reviewer` and then resuming it N more times can run up to `(N + 1) × maxNestedSpawns` probes in total rather than sharing one budget across the whole conversation.
 
 ## Checks
 
