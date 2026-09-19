@@ -2286,6 +2286,24 @@ test("a coordinator whose allowlist resolves empty launches as an ordinary child
 	}
 });
 
+test("a failed child's delegation note does not hide its own output", async () => {
+	writeAgentFile("lonely", { allowNestedSubagents: true, allowedSubagents: "nobody", tools: "read" });
+	const capture = path.join(root, "failed-note-capture.jsonl");
+	setFakeMode("nested-usage-failure", capture);
+	// setFakeMode always resets FAKE_PI_TEXT to "ok"; override afterward so the assertion below can
+	// tell the model's real output apart from the delegation note it must not be hidden behind.
+	process.env.FAKE_PI_TEXT = "the real failure output";
+	try {
+		const result = await runSubagent({ agent: "lonely", task: "go" });
+		const output = resultText(result);
+		assert.match(output, /the real failure output/, "a failed child's own output must survive alongside the delegation note");
+		assert.match(output, /\[Nested delegation notes\]/, "the delegation note must still be visible");
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+		delete process.env.FAKE_PI_TEXT;
+	}
+});
+
 test("a grandchild's environment carries no authority at all", async () => {
 	writeCoordinatorFixtures();
 	const capture = path.join(root, "grandchild-env.jsonl");

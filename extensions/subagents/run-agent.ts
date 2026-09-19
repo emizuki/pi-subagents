@@ -540,8 +540,12 @@ export async function runSingleAgent(
 
 		currentResult.exitCode = exitCode;
 		if (delegationNotes.length > 0) {
+			// appendOutputNotes (results.ts) already folds these into `output`, which
+			// getResultOutput shows whenever a result has no errorMessage and no stderr of its own.
+			// Appending them to stderr too used to outrank that: a child that exits non-zero with
+			// empty native stderr and no errorMessage would then show only this note, discarding
+			// getFinalOutput(messages) — the actual reason it failed.
 			currentResult.outputNotes = delegationNotes;
-			currentResult.stderr += `${delegationNotes.join("\n")}\n`;
 		}
 		if (wasAborted) {
 			currentResult.stopReason = "aborted";
