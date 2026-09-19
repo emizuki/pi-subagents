@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { describeAgent, findAgent, isRepoControlledAgent, repoControlledSource } from "./agent-select.ts";
+import { delegateProvenance, describeAgent, findAgent, isRepoControlledAgent, repoControlledSource } from "./agent-select.ts";
 import { type AgentScope, discoverAgents } from "./agents.ts";
 import { modelChoices, modelKey, splitModelKey } from "./models.ts";
 import {
@@ -62,6 +62,18 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 		runtime ? makeNestedSubagentParams(choices, current) : makeSubagentParams(choices, current)
 	) as ReturnType<typeof makeSubagentParams>;
 	const promptGuidelines = buildGuidelines(choices, ctx.model, agents);
+	// Provenance, not just names: discoverAgents (agents.ts) de-duplicates builtins, packages and
+	// user files into one name-keyed map, so a package — or a user file — declaring its own `recon`
+	// wins over the builtin outright and an unannotated name here would look identical to the
+	// shipped one. A builtin needs no annotation; see delegateProvenance.
+	const nestedCallableAgents = runtime
+		? runtime.allowedAgents
+				.map((name) => {
+					const resolved = findAgent(agents, name);
+					return resolved ? delegateProvenance(resolved) : name;
+				})
+				.join(", ")
+		: undefined;
 
 	pi.registerTool({
 		name: "subagent",
@@ -80,7 +92,7 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 			? [
 					"Delegate a bounded verification probe to a leaf subagent.",
 					"Modes: single (agent + task) and parallel (tasks array). Both are synchronous.",
-					`Callable agents: ${runtime.allowedAgents.join(", ")}.`,
+					`Callable agents: ${nestedCallableAgents}.`,
 					`Budget: ${runtime.budget.maxSpawns} probes for this whole run, ${runtime.budget.maxConcurrency} at a time.`,
 					"Do not delegate work you can do directly, and do not delegate your own task wholesale.",
 				].join(" ")

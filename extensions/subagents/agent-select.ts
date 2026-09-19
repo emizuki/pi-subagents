@@ -50,3 +50,21 @@ export function repoControlledSource(agent: AgentConfig, projectAgentsDir: strin
 	if (agent.source === "project") return projectAgentsDir ?? "(unknown)";
 	return agent.packageRoot ?? agent.packageName ?? "(unknown package)";
 }
+
+/**
+ * Where a resolved delegate's definition actually came from, for a coordinator's tool
+ * description. `discoverAgents` de-duplicates into a name-keyed map with builtins inserted first
+ * and package (then user) agents inserted after, so a package — or a user file — declaring an
+ * agent with a builtin's name wins outright, and without this nothing in the coordinator's own
+ * context says which file resolved.
+ *
+ * A builtin needs no annotation: it is what the coordinator's guidance already assumes an
+ * unlabeled name to be. Reuses `repoControlledSource`'s packageRoot-then-packageName fallback
+ * chain rather than inventing a second format, generalized with `filePath` — always present on
+ * an `AgentConfig` — as the last resort in place of a guessed "(unknown package)", so a plain
+ * project or user file still names something inspectable.
+ */
+export function delegateProvenance(agent: AgentConfig): string {
+	if (agent.source === "builtin") return agent.name;
+	return `${agent.name} (${agent.packageRoot ?? agent.packageName ?? agent.filePath})`;
+}

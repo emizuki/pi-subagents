@@ -2215,6 +2215,59 @@ test("a coordinator receives an envelope naming exactly its resolved delegates",
 	}
 });
 
+// D4: discoverAgents (agents.ts) de-duplicates into a name-keyed map with builtins inserted
+// first and package agents inserted after, so a package declaring its own "recon" wins outright
+// with nothing saying which file resolved. The coordinator's tool description must name it.
+test("a coordinator's tool description names a package agent's provenance when it shadows a builtin", async () => {
+	const userAgentsDir = path.join(agentDir, "agents");
+	// Clear any user-scope override a previous test left behind so "recon" and "reviewer" both
+	// start from their shipped builtins, and only the package fixture below shadows either of them.
+	rmSync(path.join(userAgentsDir, "recon.md"), { force: true });
+	rmSync(path.join(userAgentsDir, "reviewer.md"), { force: true });
+	const packageRoot = path.join(root, "recon-shadow-pkg");
+	mkdirSync(path.join(packageRoot, "agents"), { recursive: true });
+	writeFileSync(
+		path.join(packageRoot, "package.json"),
+		JSON.stringify({ name: "recon-shadow-pkg", pi: { subagents: { agents: ["./agents"] } } }),
+	);
+	writeFileSync(
+		path.join(packageRoot, "agents", "recon.md"),
+		"---\nname: recon\ndescription: a package's own recon, shadowing the builtin\n---\nYou are a shadow recon.\n",
+	);
+	writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ packages: [packageRoot] }));
+	const runtime = encodeNestedRuntime({
+		version: 1,
+		depth: 1,
+		agent: "reviewer",
+		allowedAgents: ["recon", "reviewer"],
+		toolCeiling: null,
+		modelCeiling: null,
+		budget: { maxSpawns: 4, maxConcurrency: 2 },
+	});
+	const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+	const previousRuntime = process.env[RUNTIME_ENV_VAR];
+	process.env.PI_SUBAGENT_DEPTH = "1";
+	process.env[RUNTIME_ENV_VAR] = runtime;
+	try {
+		await harness.refresh(context);
+		const registered = harness.tools.get("subagent") as { description?: string } | undefined;
+		const description = registered?.description ?? "";
+		assert.match(description, /bounded verification probe/);
+		assert.match(
+			description,
+			/recon \([^)]*recon-shadow-pkg[^)]*\)/,
+			"a package agent shadowing a builtin must show its provenance",
+		);
+		assert.ok(!description.includes("reviewer ("), "a builtin delegate needs no provenance annotation");
+	} finally {
+		if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+		else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+		if (previousRuntime === undefined) delete process.env[RUNTIME_ENV_VAR];
+		else process.env[RUNTIME_ENV_VAR] = previousRuntime;
+		rmSync(path.join(agentDir, "settings.json"), { force: true });
+	}
+});
+
 test("an ordinary child stays in the root's process group", linuxOnly, async () => {
 	const capture = path.join(tempRoot(), "ordinary-pgrp-env.jsonl");
 	process.env.FAKE_PI_ENV_CAPTURE = capture;
