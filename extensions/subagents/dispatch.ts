@@ -97,6 +97,8 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 		parameters: SubagentParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			// `nested: Boolean(runtime)` keeps a coordinator's own dead run ids out of its
+			// model-visible text once output is large enough to truncate; see results.ts.
 			return finalizeToolResult(
 				await (async (): Promise<ToolResultDraft<unknown>> => {
 			const agentScope: AgentScope = params.agentScope ?? "user";
@@ -576,9 +578,12 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 					const status = isFailedResult(r)
 						? `failed${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
 						: "completed";
-					// Without the id a caller cannot resume one of several identical-looking tasks,
-					// which is the whole point of retaining them.
-					const id = r.runId ? ` run ${r.runId}` : "";
+					// Without the id a caller cannot resume one of several identical-looking tasks, which
+					// is the whole point of retaining them — unless this is a coordinator's own dispatch,
+					// which can never resume anything (`resume` is in NESTED_FORBIDDEN_KEYS): the id would
+					// only be unexplained metadata in its context, so it is left out exactly like the
+					// single-mode success text below.
+					const id = !runtime && r.runId ? ` run ${r.runId}` : "";
 					return `### [${r.agent}]${id} ${status}\n\n${output}`;
 				});
 				const extras = nestedExtras(results);
@@ -808,7 +813,10 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 					content: [
 						{
 							type: "text",
-							text: `${getResultOutput(result)}${extras.text}${result.runId ? `\n\n(run ${result.runId})` : ""}`,
+							// Gated on `runtime` exactly like nestedExtras above: `resume` (the only way to act
+							// on a run id) is in NESTED_FORBIDDEN_KEYS, so a coordinator can never use one and
+							// printing it here would just be unexplained metadata in its context.
+							text: `${getResultOutput(result)}${extras.text}${!runtime && result.runId ? `\n\n(run ${result.runId})` : ""}`,
 						},
 					],
 					details: makeDetails("single")(results),
@@ -823,6 +831,7 @@ export function registerSubagentTool(pi: ExtensionAPI, ctx: ExtensionContext, ru
 				details: makeDetails("single")([]),
 			};
 				})(),
+				{ nested: Boolean(runtime) },
 			);
 		},
 

@@ -136,7 +136,16 @@ function truncateWithLongLineFallback(text: string, maxBytes: number, maxLines: 
 	};
 }
 
-function resumableRunSummary(details: unknown): string | undefined {
+/**
+ * `options.nested` is set only for a coordinator's own tool result. `resume`, `action` and `id`
+ * are all absent from the nested schema (schema.ts's NESTED_FORBIDDEN_KEYS), so a coordinator can
+ * never act on a run id — printing one is just unexplained metadata in its context, the same
+ * failure mode the two inline gates in dispatch.ts's `execute` exist to prevent for the
+ * unbounded-output case. Suppressing the whole summary, not just the ids inside it, keeps this in
+ * step with those two gates.
+ */
+function resumableRunSummary(details: unknown, options: { nested?: boolean } = {}): string | undefined {
+	if (options.nested) return undefined;
 	if (!isRecord(details) || !Array.isArray(details.results)) return undefined;
 	const runIds = details.results.flatMap((value: unknown) =>
 		isRecord(value) && typeof value.runId === "string" ? [value.runId] : [],
@@ -151,13 +160,18 @@ function textLineCount(text: string): number {
 	return text ? text.split("\n").length : 0;
 }
 
-export function truncateModelText(text: string, details: unknown): { text: string; fullOutput?: string } {
+export function truncateModelText(
+	text: string,
+	details: unknown,
+	options: { nested?: boolean } = {},
+): { text: string; fullOutput?: string } {
 	const probe = truncateWithLongLineFallback(text, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES);
 	if (!probe.truncated) return { text };
 
 	// Keep run ids model-visible because they are needed to resume a child and normally appear at
 	// the tail that head truncation removes. The summary is bounded independently of agent names.
-	const runs = resumableRunSummary(details);
+	// `options.nested` suppresses it instead of bounding it further; see resumableRunSummary.
+	const runs = resumableRunSummary(details, options);
 	let payloadBytes = DEFAULT_MAX_BYTES - OUTPUT_NOTICE_RESERVE_BYTES;
 	let payloadLines = DEFAULT_MAX_LINES - 2;
 	let lastNotice = "";
@@ -187,9 +201,14 @@ export function truncateModelText(text: string, details: unknown): { text: strin
  * Pi deliberately ignores an `isError` property returned by execute(); the tool_result bridge
  * below reads our details marker and sets the real event flag while preserving rich details.
  */
-export function finalizeToolResult<T>(draft: ToolResultDraft<T>): AgentToolResult<DetailsWithMetadata<T> | MetadataOnlyDetails | undefined> {
+export function finalizeToolResult<T>(
+	draft: ToolResultDraft<T>,
+	/** `{ nested: true }` from the coordinator's single call site in dispatch.ts only; supervisor.ts's
+	 * five call sites pass none and are unaffected. */
+	options: { nested?: boolean } = {},
+): AgentToolResult<DetailsWithMetadata<T> | MetadataOnlyDetails | undefined> {
 	const originalText = draft.content.map((part) => part.text).join("\n");
-	const bounded = truncateModelText(originalText, draft.details);
+	const bounded = truncateModelText(originalText, draft.details, options);
 	const metadata: ToolResultMetadata = {
 		...(draft.failed ? { failed: true as const } : {}),
 		...(bounded.fullOutput === undefined ? {} : { fullOutput: bounded.fullOutput }),

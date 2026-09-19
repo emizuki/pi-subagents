@@ -759,6 +759,60 @@ test("a root parallel dispatch does not publish nested usage or a probe count", 
 	}
 });
 
+// D1 regressions: a coordinator can never resume a run (`resume` is in NESTED_FORBIDDEN_KEYS), so
+// a run id in its model-visible text is dead metadata — the shape of bug a live coordinator hit as
+// "(run e8355b2f)" with no explanation. Three independent sites can leak one; each gets its own test.
+
+test("a nested single dispatch's success text does not leak its run id", async () => {
+	writeAgentFile("recon", { tools: "read" });
+	setFakeMode("normal", path.join(tempRoot(), "nested-runid-single.jsonl"));
+	try {
+		const result = await executeNested({ agent: "recon", task: "probe" });
+		const id = runIdOf(result);
+		assert.doesNotMatch(resultText(result), new RegExp(id), "a coordinator cannot resume, so its own run id must not appear");
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
+test("a nested parallel dispatch's per-task summaries do not leak run ids", async () => {
+	writeAgentFile("recon", { tools: "read" });
+	setFakeMode("normal", path.join(tempRoot(), "nested-runid-parallel.jsonl"));
+	try {
+		const result = await executeNested({
+			tasks: [
+				{ agent: "recon", task: "probe one" },
+				{ agent: "recon", task: "probe two" },
+			],
+		});
+		const details = (result as { details?: { results?: Array<{ runId?: string }> } }).details;
+		const ids = (details?.results ?? []).map((r) => r.runId).filter((value): value is string => typeof value === "string");
+		assert.equal(ids.length, 2, "both tasks must have retained run ids, or this test proves nothing");
+		for (const id of ids) assert.doesNotMatch(resultText(result), new RegExp(id));
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+	}
+});
+
+test("a nested single dispatch's truncation notice does not leak its run id", async () => {
+	// The root-mode counterpart to this test (subagents.test.ts, "single output is capped to Pi's
+	// byte limit") asserts the opposite: the run id IS present there. That is the guard rail this
+	// fix must not break — it stays green throughout because this gate is keyed on `runtime`, which
+	// a root dispatch never carries.
+	writeAgentFile("recon", { tools: "read" });
+	setFakeMode("normal", path.join(tempRoot(), "nested-runid-truncated.jsonl"));
+	process.env.FAKE_PI_TEXT = "x".repeat(70 * 1024);
+	try {
+		const result = await executeNested({ agent: "recon", task: "large probe" });
+		const id = runIdOf(result);
+		assert.match(resultText(result), /Output truncated/, "the scenario must actually trigger truncation");
+		assert.doesNotMatch(resultText(result), new RegExp(id));
+	} finally {
+		delete process.env.FAKE_PI_CAPTURE;
+		delete process.env.FAKE_PI_TEXT;
+	}
+});
+
 after(async () => {
 	process.argv[1] = originalArgv1;
 	process.env.PATH = originalPath;
